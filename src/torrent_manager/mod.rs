@@ -9,6 +9,7 @@ pub mod state;
 
 use crate::errors::StorageError;
 use crate::Settings;
+pub use crate::dht_service::DhtHandle;
 
 use std::collections::HashMap;
 
@@ -28,15 +29,10 @@ use std::sync::Arc;
 
 use tokio::net::TcpStream;
 
-#[cfg(feature = "dht")]
-use mainline::async_dht::AsyncDht;
-#[cfg(not(feature = "dht"))]
-type AsyncDht = ();
-
 use crate::resource_manager::ResourceManagerClient;
 
 pub struct TorrentParameters {
-    pub dht_handle: AsyncDht,
+    pub dht_handle: DhtHandle,
     pub incoming_peer_rx: Receiver<(TcpStream, Vec<u8>)>,
     pub metrics_tx: watch::Sender<TorrentMetrics>,
     pub torrent_validation_status: bool,
@@ -174,9 +170,6 @@ pub enum ManagerCommand {
         file_priorities: HashMap<usize, FilePriority>,
         container_name: Option<String>,
     },
-
-    #[cfg(feature = "dht")]
-    UpdateDhtHandle(AsyncDht),
 }
 
 pub use manager::TorrentManager;

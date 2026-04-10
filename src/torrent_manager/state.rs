@@ -10763,11 +10763,13 @@ mod integration_tests {
             dht_handle: {
                 #[cfg(feature = "dht")]
                 {
-                    mainline::Dht::builder().port(0).build().unwrap().as_async()
+                    crate::dht_service::DhtHandle::from_async(
+                        mainline::Dht::builder().port(0).build().unwrap().as_async(),
+                    )
                 }
                 #[cfg(not(feature = "dht"))]
                 {
-                    ()
+                    crate::dht_service::DhtHandle::disabled()
                 }
             },
             incoming_peer_rx,
