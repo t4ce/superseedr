@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use super::persist::{PersistenceConfig, PersistenceManager};
+use super::scheduler::DemandScheduler;
+pub use super::scheduler::DhtDemandState;
 use super::types::{AddressFamily, InfoHash, LookupId, NodeId};
 use super::{Runtime, RuntimeConfig};
 use crate::config::{self, Settings};
 use rand::random;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
@@ -22,8 +24,13 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 const DHT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
-const DHT_LOOKUP_REFRESH_INTERVAL: Duration = DHT_MAINTENANCE_INTERVAL;
+const DHT_ROUTINE_LOOKUP_REFRESH_INTERVAL: Duration = DHT_MAINTENANCE_INTERVAL;
+const DHT_NO_CONNECTED_PEERS_BASE_INTERVAL: Duration = Duration::from_secs(8);
+const DHT_NO_CONNECTED_PEERS_MAX_INTERVAL: Duration = DHT_ROUTINE_LOOKUP_REFRESH_INTERVAL;
+const DHT_AWAITING_METADATA_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const DHT_HEALTH_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const DHT_DEMAND_SCHEDULER_INTERVAL: Duration = Duration::from_millis(250);
+const DHT_DEMAND_LOOKUPS_PER_TICK: usize = 4;
 const DHT_PERSISTENCE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const DHT_STARTUP_BOOTSTRAP_DELAY: Duration = Duration::from_secs(5);
 const DHT_IPV6_HEDGE_DELAY: Duration = Duration::from_millis(750);
@@ -192,6 +199,54 @@ impl ManagedLookupReceiver {
     }
 }
 
+#[derive(Debug)]
+enum DhtDemandSubscriptionInner {
+    Service {
+        command_tx: mpsc::UnboundedSender<DhtCommand>,
+        info_hash: InfoHash,
+        subscriber_id: u64,
+    },
+    #[cfg(test)]
+    Recorder,
+    Disabled,
+}
+
+#[derive(Debug)]
+pub struct DhtDemandSubscription {
+    receiver: mpsc::UnboundedReceiver<Vec<SocketAddr>>,
+    inner: DhtDemandSubscriptionInner,
+}
+
+impl DhtDemandSubscription {
+    fn empty() -> Self {
+        let (_tx, receiver) = mpsc::unbounded_channel();
+        Self {
+            receiver,
+            inner: DhtDemandSubscriptionInner::Disabled,
+        }
+    }
+
+    pub async fn recv(&mut self) -> Option<Vec<SocketAddr>> {
+        self.receiver.recv().await
+    }
+}
+
+impl Drop for DhtDemandSubscription {
+    fn drop(&mut self) {
+        if let DhtDemandSubscriptionInner::Service {
+            command_tx,
+            info_hash,
+            subscriber_id,
+        } = &self.inner
+        {
+            let _ = command_tx.send(DhtCommand::UnregisterDemand {
+                info_hash: *info_hash,
+                subscriber_id: *subscriber_id,
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TestDhtRecorder {
@@ -211,6 +266,27 @@ impl TestDhtRecorder {
 #[derive(Debug)]
 enum DhtCommand {
     Reconfigure(DhtServiceConfig),
+    RegisterDemand {
+        info_hash: InfoHash,
+        demand: DhtDemandState,
+        subscriber_tx: mpsc::UnboundedSender<Vec<SocketAddr>>,
+        response_tx: oneshot::Sender<Option<u64>>,
+    },
+    UpdateDemand {
+        info_hash: InfoHash,
+        demand: DhtDemandState,
+    },
+    UnregisterDemand {
+        info_hash: InfoHash,
+        subscriber_id: u64,
+    },
+    DemandPeers {
+        info_hash: InfoHash,
+        peers: Vec<SocketAddr>,
+    },
+    DemandLookupFinished {
+        info_hash: InfoHash,
+    },
     StartGetPeers {
         info_hash: InfoHash,
         response_tx: oneshot::Sender<Result<StartedLookup, String>>,
@@ -236,6 +312,7 @@ enum DhtCommand {
 enum LoopEvent {
     Shutdown,
     Command(DhtCommand),
+    DemandTick,
     MaintenanceTick,
     HealthTick,
     RuntimeStep(Result<bool, String>),
@@ -479,40 +556,34 @@ impl DhtHandle {
     pub fn spawn_lookup_task(
         &self,
         info_hash: Vec<u8>,
+        initial_demand: DhtDemandState,
         dht_tx: Sender<Vec<SocketAddr>>,
         mut shutdown_rx: broadcast::Receiver<()>,
-        mut dht_trigger_rx: watch::Receiver<()>,
     ) -> Option<JoinHandle<()>> {
         let info_hash = InfoHash::from(<[u8; 20]>::try_from(info_hash).ok()?);
         match &self.inner {
             DhtHandleInner::Service { .. } => {
                 let handle = self.clone();
                 Some(tokio::spawn(async move {
+                    let mut subscription = match handle
+                        .register_demand(info_hash.as_ref().to_vec(), initial_demand)
+                        .await
+                    {
+                        Some(subscription) => subscription,
+                        None => return,
+                    };
+
                     loop {
-                        let mut peers_rx = match handle.start_lookup_receiver(info_hash).await {
-                            Some(peers_rx) => peers_rx,
-                            None => break,
-                        };
-
                         tokio::select! {
                             _ = shutdown_rx.recv() => break,
-                            _ = async {
-                                while let Some(peers) = peers_rx.recv().await {
-                                    if dht_tx.send(peers).await.is_err() {
-                                        return;
-                                    }
-                                }
-                            } => {}
-                        }
-
-                        tokio::select! {
-                            _ = shutdown_rx.recv() => break,
-                            changed = dht_trigger_rx.changed() => {
-                                if changed.is_err() {
+                            maybe_peers = subscription.recv() => {
+                                let Some(peers) = maybe_peers else {
+                                    break;
+                                };
+                                if dht_tx.send(peers).await.is_err() {
                                     break;
                                 }
                             }
-                            _ = tokio::time::sleep(DHT_LOOKUP_REFRESH_INTERVAL) => {}
                         }
                     }
                 }))
@@ -523,12 +594,7 @@ impl DhtHandle {
                     loop {
                         tokio::select! {
                             _ = shutdown_rx.recv() => break,
-                            changed = dht_trigger_rx.changed() => {
-                                if changed.is_err() {
-                                    break;
-                                }
-                            }
-                            _ = tokio::time::sleep(DHT_LOOKUP_REFRESH_INTERVAL) => {}
+                            _ = std::future::pending::<()>() => {}
                         }
                     }
                 }))
@@ -538,12 +604,7 @@ impl DhtHandle {
                 loop {
                     tokio::select! {
                         _ = shutdown_rx.recv() => break,
-                        changed = dht_trigger_rx.changed() => {
-                            if changed.is_err() {
-                                break;
-                            }
-                        }
-                        _ = tokio::time::sleep(DHT_LOOKUP_REFRESH_INTERVAL) => {}
+                        _ = std::future::pending::<()>() => {}
                     }
                 }
             })),
@@ -605,6 +666,66 @@ impl DhtHandle {
         }
     }
 
+    pub async fn register_demand(
+        &self,
+        info_hash: Vec<u8>,
+        demand: DhtDemandState,
+    ) -> Option<DhtDemandSubscription> {
+        let Ok(info_hash) = <[u8; 20]>::try_from(info_hash) else {
+            return None;
+        };
+
+        match &self.inner {
+            DhtHandleInner::Service { command_tx, .. } => {
+                let (subscriber_tx, receiver) = mpsc::unbounded_channel();
+                let (response_tx, response_rx) = oneshot::channel();
+                let command = DhtCommand::RegisterDemand {
+                    info_hash: InfoHash::from(info_hash),
+                    demand,
+                    subscriber_tx,
+                    response_tx,
+                };
+                if command_tx.send(command).is_err() {
+                    return None;
+                }
+
+                let subscriber_id = response_rx.await.ok().flatten()?;
+                Some(DhtDemandSubscription {
+                    receiver,
+                    inner: DhtDemandSubscriptionInner::Service {
+                        command_tx: command_tx.clone(),
+                        info_hash: InfoHash::from(info_hash),
+                        subscriber_id,
+                    },
+                })
+            }
+            #[cfg(test)]
+            DhtHandleInner::Recorder { .. } => Some(DhtDemandSubscription {
+                receiver: mpsc::unbounded_channel().1,
+                inner: DhtDemandSubscriptionInner::Recorder,
+            }),
+            DhtHandleInner::Disabled { .. } => Some(DhtDemandSubscription::empty()),
+        }
+    }
+
+    pub fn update_demand(&self, info_hash: Vec<u8>, demand: DhtDemandState) -> bool {
+        let Ok(info_hash) = <[u8; 20]>::try_from(info_hash) else {
+            return false;
+        };
+
+        match &self.inner {
+            DhtHandleInner::Service { command_tx, .. } => command_tx
+                .send(DhtCommand::UpdateDemand {
+                    info_hash: InfoHash::from(info_hash),
+                    demand,
+                })
+                .is_ok(),
+            #[cfg(test)]
+            DhtHandleInner::Recorder { .. } => true,
+            DhtHandleInner::Disabled { .. } => true,
+        }
+    }
+
     async fn start_lookup_receiver(&self, info_hash: InfoHash) -> Option<ManagedLookupReceiver> {
         let status_rx = self.status_rx();
         match &self.inner {
@@ -662,9 +783,23 @@ async fn run_service(
     mut command_rx: mpsc::UnboundedReceiver<DhtCommand>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
+    let mut demand_tick = tokio::time::interval(DHT_DEMAND_SCHEDULER_INTERVAL);
+    demand_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut maintenance_interval = tokio::time::interval(DHT_MAINTENANCE_INTERVAL);
     let mut health_interval = tokio::time::interval(DHT_HEALTH_REFRESH_INTERVAL);
     let mut generation = status_tx.borrow().generation;
+    let mut demand_scheduler = DemandScheduler::new(
+        DHT_ROUTINE_LOOKUP_REFRESH_INTERVAL,
+        DHT_NO_CONNECTED_PEERS_BASE_INTERVAL,
+        DHT_NO_CONNECTED_PEERS_MAX_INTERVAL,
+        DHT_AWAITING_METADATA_REFRESH_INTERVAL,
+    );
+    let mut demand_subscribers: HashMap<
+        InfoHash,
+        HashMap<u64, mpsc::UnboundedSender<Vec<SocketAddr>>>,
+    > = HashMap::new();
+    let mut demand_lookup_ids: HashMap<InfoHash, Arc<StdMutex<Vec<LookupId>>>> = HashMap::new();
+    let mut next_subscriber_id = 1u64;
 
     loop {
         if let Some(active) = active_runtime.as_mut() {
@@ -687,6 +822,7 @@ async fn run_service(
                 biased;
                 _ = shutdown_rx.recv() => LoopEvent::Shutdown,
                 maybe_command = command_rx.recv() => maybe_command.map_or(LoopEvent::CommandClosed, LoopEvent::Command),
+                _ = demand_tick.tick() => LoopEvent::DemandTick,
                 _ = maintenance_interval.tick() => LoopEvent::MaintenanceTick,
                 _ = health_interval.tick() => LoopEvent::HealthTick,
                 step_result = active.runtime.step() => LoopEvent::RuntimeStep(step_result.map_err(|error| error.to_string())),
@@ -695,6 +831,7 @@ async fn run_service(
             tokio::select! {
                 _ = shutdown_rx.recv() => LoopEvent::Shutdown,
                 maybe_command = command_rx.recv() => maybe_command.map_or(LoopEvent::CommandClosed, LoopEvent::Command),
+                _ = demand_tick.tick() => LoopEvent::DemandTick,
                 _ = maintenance_interval.tick() => LoopEvent::MaintenanceTick,
                 _ = health_interval.tick() => LoopEvent::HealthTick,
             }
@@ -722,6 +859,8 @@ async fn run_service(
                         warning = Some(error);
                     }
                 }
+                demand_scheduler.reset_active(Instant::now());
+                demand_lookup_ids.clear();
                 publish_status(
                     &status_tx,
                     active_runtime.as_ref(),
@@ -729,6 +868,97 @@ async fn run_service(
                     generation,
                     config.preferred_backend,
                 );
+                start_due_demands(
+                    active_runtime.as_mut(),
+                    &command_tx,
+                    &mut demand_scheduler,
+                    &mut demand_lookup_ids,
+                )
+                .await;
+            }
+            LoopEvent::Command(DhtCommand::RegisterDemand {
+                info_hash,
+                demand,
+                subscriber_tx,
+                response_tx,
+            }) => {
+                let subscriber_id = next_subscriber_id;
+                next_subscriber_id = next_subscriber_id.saturating_add(1);
+                demand_subscribers
+                    .entry(info_hash)
+                    .or_default()
+                    .insert(subscriber_id, subscriber_tx);
+                demand_scheduler.register(info_hash, demand, Instant::now());
+                let _ = response_tx.send(Some(subscriber_id));
+                start_due_demands(
+                    active_runtime.as_mut(),
+                    &command_tx,
+                    &mut demand_scheduler,
+                    &mut demand_lookup_ids,
+                )
+                .await;
+            }
+            LoopEvent::Command(DhtCommand::UpdateDemand { info_hash, demand }) => {
+                demand_scheduler.update(info_hash, demand, Instant::now());
+                start_due_demands(
+                    active_runtime.as_mut(),
+                    &command_tx,
+                    &mut demand_scheduler,
+                    &mut demand_lookup_ids,
+                )
+                .await;
+            }
+            LoopEvent::Command(DhtCommand::UnregisterDemand {
+                info_hash,
+                subscriber_id,
+            }) => {
+                let mut removed = false;
+                if let Some(subscribers) = demand_subscribers.get_mut(&info_hash) {
+                    removed = subscribers.remove(&subscriber_id).is_some();
+                    if subscribers.is_empty() {
+                        demand_subscribers.remove(&info_hash);
+                    }
+                }
+                if removed && demand_scheduler.unregister(info_hash) {
+                    if let Some(lookup_ids) = demand_lookup_ids.remove(&info_hash) {
+                        cancel_lookup_ids(&command_tx, lookup_ids);
+                    }
+                }
+            }
+            LoopEvent::Command(DhtCommand::DemandPeers { info_hash, peers }) => {
+                let Some(subscribers) = demand_subscribers.get_mut(&info_hash) else {
+                    continue;
+                };
+
+                let subscriber_count_before = subscribers.len();
+                subscribers.retain(|_, subscriber_tx| subscriber_tx.send(peers.clone()).is_ok());
+                let removed = subscriber_count_before.saturating_sub(subscribers.len());
+                let mut drained = false;
+                for _ in 0..removed {
+                    if demand_scheduler.unregister(info_hash) {
+                        drained = true;
+                        break;
+                    }
+                }
+                if subscribers.is_empty() {
+                    demand_subscribers.remove(&info_hash);
+                    if drained {
+                        if let Some(lookup_ids) = demand_lookup_ids.remove(&info_hash) {
+                            cancel_lookup_ids(&command_tx, lookup_ids);
+                        }
+                    }
+                }
+            }
+            LoopEvent::Command(DhtCommand::DemandLookupFinished { info_hash }) => {
+                demand_lookup_ids.remove(&info_hash);
+                demand_scheduler.finish(info_hash, Instant::now());
+                start_due_demands(
+                    active_runtime.as_mut(),
+                    &command_tx,
+                    &mut demand_scheduler,
+                    &mut demand_lookup_ids,
+                )
+                .await;
             }
             LoopEvent::Command(DhtCommand::StartGetPeers {
                 info_hash,
@@ -769,6 +999,15 @@ async fn run_service(
             }) => {
                 let success = announce_peer(active_runtime.as_mut(), info_hash, port).await;
                 let _ = response_tx.send(success);
+            }
+            LoopEvent::DemandTick => {
+                start_due_demands(
+                    active_runtime.as_mut(),
+                    &command_tx,
+                    &mut demand_scheduler,
+                    &mut demand_lookup_ids,
+                )
+                .await;
             }
             LoopEvent::MaintenanceTick => {
                 if let Some(active) = active_runtime.as_mut() {
@@ -891,6 +1130,50 @@ async fn start_get_peers_lookup(
         lookup_ids,
         receiver: merged_rx,
     })
+}
+
+fn cancel_lookup_ids(
+    command_tx: &mpsc::UnboundedSender<DhtCommand>,
+    lookup_ids: Arc<StdMutex<Vec<LookupId>>>,
+) {
+    let mut lookup_ids = lookup_ids.lock().expect("managed dht lookup ids lock");
+    if lookup_ids.is_empty() {
+        return;
+    }
+    let _ = command_tx.send(DhtCommand::CancelLookups {
+        lookup_ids: std::mem::take(&mut *lookup_ids),
+    });
+}
+
+async fn start_due_demands(
+    active_runtime: Option<&mut ActiveRuntime>,
+    command_tx: &mpsc::UnboundedSender<DhtCommand>,
+    demand_scheduler: &mut DemandScheduler,
+    demand_lookup_ids: &mut HashMap<InfoHash, Arc<StdMutex<Vec<LookupId>>>>,
+) {
+    let Some(active_runtime) = active_runtime else {
+        return;
+    };
+
+    let due = demand_scheduler.take_due(Instant::now(), DHT_DEMAND_LOOKUPS_PER_TICK);
+    for info_hash in due {
+        match start_get_peers_lookup(Some(active_runtime), command_tx, info_hash).await {
+            Ok(started) => {
+                demand_lookup_ids.insert(info_hash, started.lookup_ids.clone());
+                let mut receiver = started.receiver;
+                let command_tx = command_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(peers) = receiver.recv().await {
+                        let _ = command_tx.send(DhtCommand::DemandPeers { info_hash, peers });
+                    }
+                    let _ = command_tx.send(DhtCommand::DemandLookupFinished { info_hash });
+                });
+            }
+            Err(_) => {
+                demand_scheduler.finish(info_hash, Instant::now());
+            }
+        }
+    }
 }
 
 async fn ensure_lookup_routes(

@@ -13,6 +13,7 @@ pub mod lookup;
 pub mod peer_store;
 pub mod persist;
 pub mod routing;
+mod scheduler;
 pub mod service;
 pub mod test_support;
 pub mod token;

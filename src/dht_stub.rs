@@ -102,6 +102,12 @@ pub mod service {
         pub first_ipv6_batch_ms: Option<u64>,
     }
 
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct DhtDemandState {
+        pub awaiting_metadata: bool,
+        pub connected_peers: usize,
+    }
+
     #[derive(Debug)]
     pub struct DhtService {
         handle: DhtHandle,
@@ -291,23 +297,22 @@ pub mod service {
         pub fn spawn_lookup_task(
             &self,
             _info_hash: Vec<u8>,
+            _initial_demand: DhtDemandState,
             _dht_tx: Sender<Vec<SocketAddr>>,
             mut shutdown_rx: broadcast::Receiver<()>,
-            mut dht_trigger_rx: watch::Receiver<()>,
         ) -> Option<JoinHandle<()>> {
             Some(tokio::spawn(async move {
                 loop {
                     tokio::select! {
                         _ = shutdown_rx.recv() => break,
-                        changed = dht_trigger_rx.changed() => {
-                            if changed.is_err() {
-                                break;
-                            }
-                        }
                         _ = tokio::time::sleep(DHT_LOOKUP_REFRESH_INTERVAL) => {}
                     }
                 }
             }))
+        }
+
+        pub fn update_demand(&self, _info_hash: Vec<u8>, _demand: DhtDemandState) -> bool {
+            true
         }
 
         pub async fn lookup_once(

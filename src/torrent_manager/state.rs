@@ -263,7 +263,6 @@ pub enum Effect {
         files: Vec<PathBuf>,
         directories: Vec<PathBuf>,
     },
-    TriggerDhtSearch,
     PrepareShutdown {
         tracker_urls: Vec<String>,
         left: usize,
@@ -2009,7 +2008,7 @@ impl TorrentState {
                     return vec![Effect::DoNothing];
                 }
 
-                let mut effects = vec![Effect::TriggerDhtSearch];
+                let mut effects = Vec::new();
 
                 effects.extend(self.update(Action::ConnectToWebSeeds));
 

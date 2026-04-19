@@ -42,6 +42,8 @@ use crate::storage::MultiFileInfo;
 
 use crate::command::TorrentCommand;
 use crate::command::TorrentCommandSummary;
+#[cfg(feature = "dht")]
+use crate::dht_service::DhtDemandState;
 
 use crate::networking::session::PeerSessionParameters;
 use crate::networking::BlockInfo;
@@ -145,17 +147,17 @@ pub struct TorrentManager {
 
     #[cfg(feature = "dht")]
     #[allow(dead_code)]
-    dht_trigger_tx: watch::Sender<()>,
-    #[cfg(feature = "dht")]
-    #[allow(dead_code)]
     dht_task_handle: Option<JoinHandle<()>>,
+
+    #[cfg(feature = "dht")]
+    dht_demand_state: Option<DhtDemandState>,
 
     #[cfg(not(feature = "dht"))]
     #[allow(dead_code)]
-    dht_trigger_tx: (),
-    #[cfg(not(feature = "dht"))]
-    #[allow(dead_code)]
     dht_task_handle: (),
+
+    #[cfg(not(feature = "dht"))]
+    dht_demand_state: (),
 
     #[allow(dead_code)]
     dht_handle: crate::dht_service::DhtHandle,
@@ -165,12 +167,41 @@ pub struct TorrentManager {
     global_dl_bucket: Arc<TokenBucket>,
     global_ul_bucket: Arc<TokenBucket>,
     telemetry: ManagerTelemetry,
+    run_loop_started: bool,
 }
 
 impl TorrentManager {
     fn should_accept_new_peers(&self) -> bool {
         !self.state.is_paused && self.state.accepting_new_peers
     }
+
+    #[cfg(feature = "dht")]
+    fn current_dht_demand_state(&self) -> DhtDemandState {
+        DhtDemandState {
+            awaiting_metadata: self.state.torrent_status == TorrentStatus::AwaitingMetadata,
+            connected_peers: self.state.peers.len(),
+        }
+    }
+
+    #[cfg(feature = "dht")]
+    fn sync_dht_demand(&mut self) {
+        if !self.run_loop_started || self.dht_task_handle.is_none() {
+            return;
+        }
+
+        let desired_demand = self.current_dht_demand_state();
+        if self.dht_demand_state == Some(desired_demand) {
+            return;
+        }
+
+        let _ = self
+            .dht_handle
+            .update_demand(self.state.info_hash.clone(), desired_demand);
+        self.dht_demand_state = Some(desired_demand);
+    }
+
+    #[cfg(not(feature = "dht"))]
+    fn sync_dht_demand(&mut self) {}
 
     fn init_base(
         torrent_parameters: TorrentParameters,
@@ -206,11 +237,10 @@ impl TorrentManager {
         let dht_task_handle = None;
         #[cfg(not(feature = "dht"))]
         let dht_task_handle = ();
-
         #[cfg(feature = "dht")]
-        let (dht_trigger_tx, _) = watch::channel(());
+        let dht_demand_state = None;
         #[cfg(not(feature = "dht"))]
-        let dht_trigger_tx = ();
+        let dht_demand_state = ();
 
         // Initialize empty state (AwaitingMetadata)
         let state = TorrentState::new(
@@ -231,6 +261,7 @@ impl TorrentManager {
             dht_tx,
             dht_rx,
             dht_task_handle,
+            dht_demand_state,
             shutdown_tx,
             incoming_peer_rx,
             metrics_tx,
@@ -238,12 +269,12 @@ impl TorrentManager {
             manager_event_tx,
             in_flight_uploads: HashMap::new(),
             in_flight_writes: HashMap::new(),
-            dht_trigger_tx,
             settings,
             resource_manager,
             global_dl_bucket,
             global_ul_bucket,
             telemetry: ManagerTelemetry::default(),
+            run_loop_started: false,
         }
     }
 
@@ -371,6 +402,8 @@ impl TorrentManager {
         for effect in effects {
             self.handle_effect(effect);
         }
+        self.sync_dht_lookup_task();
+        self.sync_dht_demand();
     }
 
     // Handles the aftermath of the mutate effects
@@ -1020,11 +1053,6 @@ impl TorrentManager {
                 }
             }
 
-            Effect::TriggerDhtSearch => {
-                #[cfg(feature = "dht")]
-                let _ = self.dht_trigger_tx.send(());
-            }
-
             Effect::DeleteFiles { files, directories } => {
                 let info_hash = self.state.info_hash.clone();
                 let tx = self.manager_event_tx.clone();
@@ -1072,6 +1100,7 @@ impl TorrentManager {
                 downloaded,
             } => {
                 let _ = self.shutdown_tx.send(());
+                self.stop_dht_lookup_task();
 
                 event!(Level::DEBUG, "Aborting in-flight upload/write tasks...");
                 for (_, handles) in self.in_flight_uploads.drain() {
@@ -1659,25 +1688,56 @@ impl TorrentManager {
     }
 
     #[cfg(feature = "dht")]
-    fn spawn_dht_lookup_task(&mut self) {
+    fn start_dht_lookup_task(&mut self, demand_state: DhtDemandState) {
         if let Some(handle) = self.dht_task_handle.take() {
             handle.abort();
         }
 
         let dht_tx_clone = self.dht_tx.clone();
         let dht_handle_clone = self.dht_handle.clone();
-        let dht_trigger_rx = self.dht_trigger_tx.subscribe();
         let shutdown_rx = self.shutdown_tx.subscribe();
 
         if let Some(handle) = dht_handle_clone.spawn_lookup_task(
             self.state.info_hash.clone(),
+            demand_state,
             dht_tx_clone,
             shutdown_rx,
-            dht_trigger_rx,
         ) {
             self.dht_task_handle = Some(handle);
+            self.dht_demand_state = Some(demand_state);
         }
     }
+
+    #[cfg(feature = "dht")]
+    fn stop_dht_lookup_task(&mut self) {
+        if let Some(handle) = self.dht_task_handle.take() {
+            handle.abort();
+        }
+        self.dht_demand_state = None;
+    }
+
+    #[cfg(feature = "dht")]
+    fn sync_dht_lookup_task(&mut self) {
+        if !self.run_loop_started {
+            return;
+        }
+
+        if self.state.is_paused {
+            self.stop_dht_lookup_task();
+            return;
+        }
+
+        let demand_state = self.current_dht_demand_state();
+        if self.dht_task_handle.is_none() {
+            self.start_dht_lookup_task(demand_state);
+        }
+    }
+
+    #[cfg(not(feature = "dht"))]
+    fn sync_dht_lookup_task(&mut self) {}
+
+    #[cfg(not(feature = "dht"))]
+    fn stop_dht_lookup_task(&mut self) {}
 
     fn generate_bitfield(&mut self) -> Vec<u8> {
         let num_pieces = self.state.piece_manager.bitfield.len();
@@ -2380,8 +2440,8 @@ impl TorrentManager {
             }
         }
 
-        #[cfg(feature = "dht")]
-        self.spawn_dht_lookup_task();
+        self.run_loop_started = true;
+        self.sync_dht_lookup_task();
 
         let mut data_rate_ms = 1000;
         let mut tick = tokio::time::interval(Duration::from_millis(data_rate_ms));
@@ -3207,6 +3267,61 @@ mod resource_tests {
             global_ul_bucket: Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY)),
             file_priorities: HashMap::new(),
         }
+    }
+
+    #[cfg(feature = "dht")]
+    #[tokio::test]
+    async fn test_current_dht_demand_state_prioritizes_metadata() {
+        let magnet_link = "magnet:?xt=urn:btih:0000000000000000000000000000000000000000";
+        let magnet = Magnet::new(magnet_link).unwrap();
+        let manager =
+            TorrentManager::from_magnet(build_test_params(), magnet, magnet_link).unwrap();
+
+        assert_eq!(
+            manager.current_dht_demand_state(),
+            DhtDemandState {
+                awaiting_metadata: true,
+                connected_peers: 0,
+            }
+        );
+    }
+
+    #[cfg(feature = "dht")]
+    #[tokio::test]
+    async fn test_current_dht_demand_state_uses_no_connected_peers_after_metadata() {
+        let mut manager =
+            TorrentManager::from_torrent(build_test_params(), create_dummy_torrent(4))
+                .expect("manager from torrent");
+        manager.state.peers.clear();
+
+        assert_eq!(
+            manager.current_dht_demand_state(),
+            DhtDemandState {
+                awaiting_metadata: false,
+                connected_peers: 0,
+            }
+        );
+    }
+
+    #[cfg(feature = "dht")]
+    #[tokio::test]
+    async fn test_current_dht_demand_state_relaxes_with_active_peers() {
+        let mut manager =
+            TorrentManager::from_torrent(build_test_params(), create_dummy_torrent(4))
+                .expect("manager from torrent");
+        let (peer_tx, _peer_rx) = mpsc::channel(1);
+        manager.state.update(Action::RegisterPeer {
+            peer_id: "peer-a".into(),
+            tx: peer_tx,
+        });
+
+        assert_eq!(
+            manager.current_dht_demand_state(),
+            DhtDemandState {
+                awaiting_metadata: false,
+                connected_peers: 1,
+            }
+        );
     }
 
     #[tokio::test]
