@@ -2976,18 +2976,7 @@ mod tests {
         let dl_bucket = Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY));
         let ul_bucket = Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY));
 
-        let dht_handle = {
-            #[cfg(feature = "dht")]
-            {
-                crate::dht_service::DhtHandle::from_async(
-                    mainline::Dht::builder().port(0).build().unwrap().as_async(),
-                )
-            }
-            #[cfg(not(feature = "dht"))]
-            {
-                crate::dht_service::DhtHandle::disabled()
-            }
-        };
+        let dht_handle = crate::dht_service::DhtHandle::disabled();
 
         // We use a dummy magnet link to initialize the state machine correctly.
         let magnet_link = "magnet:?xt=urn:btih:0000000000000000000000000000000000000000";
@@ -3182,16 +3171,7 @@ mod resource_tests {
     }
 
     fn build_test_dht_handle() -> crate::dht_service::DhtHandle {
-        #[cfg(feature = "dht")]
-        {
-            crate::dht_service::DhtHandle::from_async(
-                mainline::Dht::builder().port(0).build().unwrap().as_async(),
-            )
-        }
-        #[cfg(not(feature = "dht"))]
-        {
-            crate::dht_service::DhtHandle::disabled()
-        }
+        crate::dht_service::DhtHandle::disabled()
     }
 
     fn build_test_params() -> TorrentParameters {

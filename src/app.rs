@@ -3121,7 +3121,9 @@ impl App {
     where
         I: IntoIterator<Item = Vec<u8>>,
     {
-        let Some(port) = (self.client_configs.client_port > 0).then_some(self.client_configs.client_port) else {
+        let Some(port) =
+            (self.client_configs.client_port > 0).then_some(self.client_configs.client_port)
+        else {
             return;
         };
 
@@ -6559,12 +6561,11 @@ mod tests {
         persisted_validation_status_from_metrics, prune_rss_feed_errors, queue_persistence_payload,
         resolve_magnet_torrent_name, rss_settings_changed, should_load_persisted_torrent,
         should_persist_network_history_on_interval, sort_and_filter_torrent_list_state,
-        torrent_completion_percent, torrent_is_effectively_incomplete, App, AppClusterRole,
-        AppCommand, AppMode, AppRuntimeMode, AppState, CommandIngestResult, FilePriority,
-        IngestSource, ListenerSet, PeerInfo, PersistPayload, SelectedHeader, SortDirection,
-        TorrentControlState, TorrentDisplayState, TorrentMetrics, TorrentPreviewPayload,
-        TorrentSortColumn, UiState, BITTORRENT_PROTOCOL_STR,
-        watched_parent_matches,
+        torrent_completion_percent, torrent_is_effectively_incomplete, watched_parent_matches, App,
+        AppClusterRole, AppCommand, AppMode, AppRuntimeMode, AppState, CommandIngestResult,
+        FilePriority, IngestSource, ListenerSet, PeerInfo, PersistPayload, SelectedHeader,
+        SortDirection, TorrentControlState, TorrentDisplayState, TorrentMetrics,
+        TorrentPreviewPayload, TorrentSortColumn, UiState, BITTORRENT_PROTOCOL_STR,
     };
     use crate::config::{
         clear_shared_config_state_for_tests, set_app_paths_override_for_tests, TorrentSettings,

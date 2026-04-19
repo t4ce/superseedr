@@ -10760,18 +10760,7 @@ mod integration_tests {
         };
 
         let params = TorrentParameters {
-            dht_handle: {
-                #[cfg(feature = "dht")]
-                {
-                    crate::dht_service::DhtHandle::from_async(
-                        mainline::Dht::builder().port(0).build().unwrap().as_async(),
-                    )
-                }
-                #[cfg(not(feature = "dht"))]
-                {
-                    crate::dht_service::DhtHandle::disabled()
-                }
-            },
+            dht_handle: crate::dht_service::DhtHandle::disabled(),
             incoming_peer_rx,
             metrics_tx,
             torrent_validation_status: false,

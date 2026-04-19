@@ -5,6 +5,11 @@ mod app;
 mod command;
 mod config;
 mod control_service;
+#[cfg(feature = "dht")]
+mod dht;
+#[cfg(not(feature = "dht"))]
+#[path = "dht_stub.rs"]
+mod dht;
 mod dht_service;
 mod errors;
 mod fs_atomic;
