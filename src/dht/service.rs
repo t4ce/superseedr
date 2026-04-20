@@ -31,10 +31,13 @@ const DHT_NO_CONNECTED_PEERS_MAX_INTERVAL: Duration = DHT_ROUTINE_LOOKUP_REFRESH
 const DHT_AWAITING_METADATA_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const DHT_HEALTH_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const DHT_DEMAND_SCHEDULER_INTERVAL: Duration = Duration::from_millis(250);
-const DHT_DEMAND_LOOKUP_SLOT_COUNT: usize = 8;
+const DHT_DEMAND_LOOKUP_BASE_SLOT_COUNT: usize = 8;
+const DHT_DEMAND_LOOKUP_OLDEST_RESERVE_SLOT_COUNT: usize = 1;
+const DHT_DEMAND_LOOKUP_SLOT_COUNT: usize =
+    DHT_DEMAND_LOOKUP_BASE_SLOT_COUNT + DHT_DEMAND_LOOKUP_OLDEST_RESERVE_SLOT_COUNT;
 const DHT_DEMAND_LOOKUP_SLOT_FILL_PER_TICK: usize = 4;
 const DHT_AWAITING_METADATA_SLOT_CAP: usize = DHT_DEMAND_LOOKUP_SLOT_COUNT;
-const DHT_NO_CONNECTED_PEERS_SLOT_CAP: usize = 6;
+const DHT_NO_CONNECTED_PEERS_SLOT_CAP: usize = 7;
 const DHT_ROUTINE_LOOKUP_SLOT_CAP: usize = 2;
 const DHT_PERSISTENCE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const DHT_STARTUP_BOOTSTRAP_DELAY: Duration = Duration::from_secs(5);
@@ -231,6 +234,28 @@ struct ActiveDemandLookup {
     slice_class: DemandSliceClass,
 }
 
+#[derive(Debug, Clone, Default)]
+struct DemandPlannerState {
+    last_started_at: Option<Instant>,
+    last_finished_at: Option<Instant>,
+    last_useful_yield_at: Option<Instant>,
+    last_unique_peers: usize,
+}
+
+impl DemandPlannerState {
+    fn note_start(&mut self, now: Instant) {
+        self.last_started_at = Some(now);
+    }
+
+    fn note_finish(&mut self, now: Instant, unique_peers: usize) {
+        self.last_finished_at = Some(now);
+        self.last_unique_peers = unique_peers;
+        if unique_peers > 0 {
+            self.last_useful_yield_at = Some(now);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct DemandSlotCounts {
     awaiting_metadata: usize,
@@ -245,6 +270,12 @@ impl DemandSlotCounts {
             DemandSliceClass::NoConnectedPeers => self.no_connected_peers,
             DemandSliceClass::RoutineRefresh => self.routine_refresh,
         }
+    }
+
+    fn total(self) -> usize {
+        self.awaiting_metadata
+            .saturating_add(self.no_connected_peers)
+            .saturating_add(self.routine_refresh)
     }
 
     fn record(&mut self, class: DemandSliceClass) {
@@ -473,10 +504,20 @@ enum DemandCrawlResetReason {
     LowQuality,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DemandSelectionReason {
+    ReusableParked,
+    UsefulYieldHistory,
+    OverdueScarce,
+}
+
 #[derive(Debug, Clone, Default)]
 struct DemandSliceClassMetrics {
     fresh_starts: u64,
     resumed_starts: u64,
+    selected_reusable_parked: u64,
+    selected_useful_yield_history: u64,
+    selected_overdue_scarce: u64,
     natural_finishes: u64,
     wall_time_stops: u64,
     idle_timeout_stops: u64,
@@ -519,6 +560,23 @@ impl DemandSliceMetrics {
             metrics.resumed_starts = metrics.resumed_starts.saturating_add(1);
         } else {
             metrics.fresh_starts = metrics.fresh_starts.saturating_add(1);
+        }
+    }
+
+    fn record_selection(&mut self, class: DemandSliceClass, reason: DemandSelectionReason) {
+        let metrics = self.class_mut(class);
+        match reason {
+            DemandSelectionReason::ReusableParked => {
+                metrics.selected_reusable_parked =
+                    metrics.selected_reusable_parked.saturating_add(1)
+            }
+            DemandSelectionReason::UsefulYieldHistory => {
+                metrics.selected_useful_yield_history =
+                    metrics.selected_useful_yield_history.saturating_add(1)
+            }
+            DemandSelectionReason::OverdueScarce => {
+                metrics.selected_overdue_scarce = metrics.selected_overdue_scarce.saturating_add(1)
+            }
         }
     }
 
@@ -577,6 +635,9 @@ impl DemandSliceMetrics {
             let metrics = self.class_ref(class);
             if metrics.fresh_starts > 0
                 || metrics.resumed_starts > 0
+                || metrics.selected_reusable_parked > 0
+                || metrics.selected_useful_yield_history > 0
+                || metrics.selected_overdue_scarce > 0
                 || metrics.natural_finishes > 0
                 || metrics.wall_time_stops > 0
                 || metrics.idle_timeout_stops > 0
@@ -597,9 +658,12 @@ impl DemandSliceMetrics {
     fn summary(&self) -> String {
         fn fmt(label: &str, metrics: &DemandSliceClassMetrics) -> String {
             format!(
-                "{label}(fresh={} resumed={} natural={} wall={} idle={} first={} cap={} peers={} unique={} reset_stale={} reset_class={} reset_quality={})",
+                "{label}(fresh={} resumed={} sel_reuse={} sel_yield={} sel_due={} natural={} wall={} idle={} first={} cap={} peers={} unique={} reset_stale={} reset_class={} reset_quality={})",
                 metrics.fresh_starts,
                 metrics.resumed_starts,
+                metrics.selected_reusable_parked,
+                metrics.selected_useful_yield_history,
+                metrics.selected_overdue_scarce,
                 metrics.natural_finishes,
                 metrics.wall_time_stops,
                 metrics.idle_timeout_stops,
@@ -1341,6 +1405,7 @@ async fn run_service(
     > = HashMap::new();
     let mut demand_lookup_ids: HashMap<InfoHash, ActiveDemandLookup> = HashMap::new();
     let mut parked_crawls: HashMap<InfoHash, DemandCrawlState> = HashMap::new();
+    let mut planner_state: HashMap<InfoHash, DemandPlannerState> = HashMap::new();
     let mut slice_metrics = DemandSliceMetrics::default();
     let mut recent_unique_peers = RecentUniquePeers::new(DHT_UNIQUE_PEERS_FOUND_WINDOW);
     let mut next_subscriber_id = 1u64;
@@ -1406,6 +1471,7 @@ async fn run_service(
                 demand_scheduler.reset_active(Instant::now());
                 demand_lookup_ids.clear();
                 parked_crawls.clear();
+                planner_state.clear();
                 publish_status(
                     &status_tx,
                     active_runtime.as_ref(),
@@ -1419,6 +1485,7 @@ async fn run_service(
                     &mut demand_scheduler,
                     &mut demand_lookup_ids,
                     &mut parked_crawls,
+                    &mut planner_state,
                     &mut slice_metrics,
                 )
                 .await;
@@ -1443,6 +1510,7 @@ async fn run_service(
                     &mut demand_scheduler,
                     &mut demand_lookup_ids,
                     &mut parked_crawls,
+                    &mut planner_state,
                     &mut slice_metrics,
                 )
                 .await;
@@ -1455,6 +1523,7 @@ async fn run_service(
                     &mut demand_scheduler,
                     &mut demand_lookup_ids,
                     &mut parked_crawls,
+                    &mut planner_state,
                     &mut slice_metrics,
                 )
                 .await;
@@ -1532,6 +1601,10 @@ async fn run_service(
                 unique_peers,
             }) => {
                 demand_lookup_ids.remove(&info_hash);
+                planner_state
+                    .entry(info_hash)
+                    .or_default()
+                    .note_finish(Instant::now(), unique_peers);
                 slice_metrics.record_stop(
                     slice_class,
                     DemandSliceStopReason::NaturalFinish,
@@ -1545,6 +1618,7 @@ async fn run_service(
                     &mut demand_scheduler,
                     &mut demand_lookup_ids,
                     &mut parked_crawls,
+                    &mut planner_state,
                     &mut slice_metrics,
                 )
                 .await;
@@ -1607,6 +1681,10 @@ async fn run_service(
                 lookup_ids,
             }) => {
                 demand_lookup_ids.remove(&info_hash);
+                planner_state
+                    .entry(info_hash)
+                    .or_default()
+                    .note_finish(Instant::now(), unique_peers);
                 slice_metrics.record_stop(slice_class, stop_reason, total_peers, unique_peers);
                 park_lookup_ids(
                     active_runtime.as_mut(),
@@ -1624,6 +1702,7 @@ async fn run_service(
                     &mut demand_scheduler,
                     &mut demand_lookup_ids,
                     &mut parked_crawls,
+                    &mut planner_state,
                     &mut slice_metrics,
                 )
                 .await;
@@ -1643,6 +1722,7 @@ async fn run_service(
                     &mut demand_scheduler,
                     &mut demand_lookup_ids,
                     &mut parked_crawls,
+                    &mut planner_state,
                     &mut slice_metrics,
                 )
                 .await;
@@ -1933,26 +2013,157 @@ fn demand_lookup_class_slot_cap(class: DemandSliceClass) -> usize {
     }
 }
 
+fn demand_lookup_planner_classes() -> [DemandSliceClass; 3] {
+    [
+        DemandSliceClass::AwaitingMetadata,
+        DemandSliceClass::NoConnectedPeers,
+        DemandSliceClass::RoutineRefresh,
+    ]
+}
+
+fn due_candidate_has_reusable_parked_crawl(
+    parked_crawls: &HashMap<InfoHash, DemandCrawlState>,
+    candidate: DueDemandCandidate,
+    now: Instant,
+) -> bool {
+    let class = DemandSliceClass::from_demand(candidate.demand);
+    parked_crawls
+        .get(&candidate.info_hash)
+        .is_some_and(|crawl| !crawl.is_empty() && !crawl.should_reset_for(class, now))
+}
+
+fn select_oldest_due_candidate(
+    due_candidates: &[DueDemandCandidate],
+) -> Option<DueDemandCandidate> {
+    due_candidates.iter().copied().min_by(|left, right| {
+        left.next_eligible_at
+            .cmp(&right.next_eligible_at)
+            .then_with(|| {
+                left.demand
+                    .connected_peers
+                    .cmp(&right.demand.connected_peers)
+            })
+            .then_with(|| right.subscriber_count.cmp(&left.subscriber_count))
+    })
+}
+
+fn candidate_last_useful_yield_age(
+    planner_state: &HashMap<InfoHash, DemandPlannerState>,
+    info_hash: InfoHash,
+    now: Instant,
+) -> Option<Duration> {
+    planner_state
+        .get(&info_hash)
+        .and_then(|state| state.last_useful_yield_at)
+        .map(|at| now.saturating_duration_since(at))
+}
+
+fn candidate_last_unique_peers(
+    planner_state: &HashMap<InfoHash, DemandPlannerState>,
+    info_hash: InfoHash,
+) -> usize {
+    planner_state
+        .get(&info_hash)
+        .map(|state| state.last_unique_peers)
+        .unwrap_or(0)
+}
+
+fn candidate_has_useful_yield_history(
+    planner_state: &HashMap<InfoHash, DemandPlannerState>,
+    info_hash: InfoHash,
+    now: Instant,
+) -> bool {
+    candidate_last_useful_yield_age(planner_state, info_hash, now).is_some()
+        && candidate_last_unique_peers(planner_state, info_hash) > 0
+}
+
+fn candidate_selection_reason(
+    candidate: DueDemandCandidate,
+    parked_crawls: &HashMap<InfoHash, DemandCrawlState>,
+    planner_state: &HashMap<InfoHash, DemandPlannerState>,
+    now: Instant,
+) -> DemandSelectionReason {
+    if candidate_has_useful_yield_history(planner_state, candidate.info_hash, now) {
+        DemandSelectionReason::UsefulYieldHistory
+    } else if due_candidate_has_reusable_parked_crawl(parked_crawls, candidate, now) {
+        DemandSelectionReason::ReusableParked
+    } else {
+        DemandSelectionReason::OverdueScarce
+    }
+}
+
 fn select_due_demand_launches(
     due_candidates: &[DueDemandCandidate],
     active_counts: DemandSlotCounts,
+    parked_crawls: &HashMap<InfoHash, DemandCrawlState>,
+    planner_state: &HashMap<InfoHash, DemandPlannerState>,
+    now: Instant,
     total_budget: usize,
 ) -> Vec<DueDemandCandidate> {
     let mut selected = Vec::new();
     let mut planned_counts = active_counts;
+    let mut remaining_candidates = due_candidates.to_vec();
 
-    for candidate in due_candidates {
+    if total_budget > 0 && active_counts.total() >= DHT_DEMAND_LOOKUP_BASE_SLOT_COUNT {
+        if let Some(oldest) = select_oldest_due_candidate(&remaining_candidates) {
+            selected.push(oldest);
+            remaining_candidates.retain(|candidate| candidate.info_hash != oldest.info_hash);
+        }
+    }
+
+    for class in demand_lookup_planner_classes() {
         if selected.len() >= total_budget {
             break;
         }
 
-        let class = DemandSliceClass::from_demand(candidate.demand);
-        if planned_counts.count(class) >= demand_lookup_class_slot_cap(class) {
+        let remaining_global = total_budget.saturating_sub(selected.len());
+        let remaining_class =
+            demand_lookup_class_slot_cap(class).saturating_sub(planned_counts.count(class));
+        if remaining_global == 0 || remaining_class == 0 {
             continue;
         }
 
-        planned_counts.record(class);
-        selected.push(*candidate);
+        let mut class_candidates = remaining_candidates
+            .iter()
+            .copied()
+            .filter(|candidate| DemandSliceClass::from_demand(candidate.demand) == class)
+            .collect::<Vec<_>>();
+
+        class_candidates.sort_by(|left, right| {
+            let left_reusable = due_candidate_has_reusable_parked_crawl(parked_crawls, *left, now);
+            let right_reusable =
+                due_candidate_has_reusable_parked_crawl(parked_crawls, *right, now);
+            let left_useful_age =
+                candidate_last_useful_yield_age(planner_state, left.info_hash, now);
+            let right_useful_age =
+                candidate_last_useful_yield_age(planner_state, right.info_hash, now);
+            let left_last_unique = candidate_last_unique_peers(planner_state, left.info_hash);
+            let right_last_unique = candidate_last_unique_peers(planner_state, right.info_hash);
+            match (left_useful_age, right_useful_age) {
+                (Some(left_age), Some(right_age)) => left_age.cmp(&right_age),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+            .then_with(|| right_last_unique.cmp(&left_last_unique))
+            .then_with(|| right_reusable.cmp(&left_reusable))
+            .then_with(|| {
+                now.saturating_duration_since(right.next_eligible_at)
+                    .cmp(&now.saturating_duration_since(left.next_eligible_at))
+            })
+            .then_with(|| {
+                left.demand
+                    .connected_peers
+                    .cmp(&right.demand.connected_peers)
+            })
+            .then_with(|| right.subscriber_count.cmp(&left.subscriber_count))
+        });
+
+        let take_count = remaining_global.min(remaining_class);
+        for candidate in class_candidates.into_iter().take(take_count) {
+            planned_counts.record(class);
+            selected.push(candidate);
+        }
     }
 
     selected
@@ -1964,6 +2175,7 @@ async fn start_due_demands(
     demand_scheduler: &mut DemandScheduler,
     demand_lookup_ids: &mut HashMap<InfoHash, ActiveDemandLookup>,
     parked_crawls: &mut HashMap<InfoHash, DemandCrawlState>,
+    planner_state: &mut HashMap<InfoHash, DemandPlannerState>,
     slice_metrics: &mut DemandSliceMetrics,
 ) {
     let Some(active_runtime) = active_runtime else {
@@ -1980,6 +2192,9 @@ async fn start_due_demands(
     let due = select_due_demand_launches(
         &demand_scheduler.due_candidates(now),
         active_counts,
+        parked_crawls,
+        planner_state,
+        now,
         launch_budget,
     );
     for candidate in due {
@@ -1988,6 +2203,10 @@ async fn start_due_demands(
         }
         let info_hash = candidate.info_hash;
         let plan = DemandLookupPlan::for_demand(candidate.demand);
+        let selection_reason =
+            candidate_selection_reason(candidate, parked_crawls, planner_state, now);
+        slice_metrics.record_selection(plan.class, selection_reason);
+        planner_state.entry(info_hash).or_default().note_start(now);
         match start_get_peers_lookup(
             Some(active_runtime),
             command_tx,
@@ -2764,6 +2983,18 @@ mod tests {
 
         metrics.record_start(DemandSliceClass::AwaitingMetadata, false);
         metrics.record_start(DemandSliceClass::AwaitingMetadata, true);
+        metrics.record_selection(
+            DemandSliceClass::AwaitingMetadata,
+            DemandSelectionReason::ReusableParked,
+        );
+        metrics.record_selection(
+            DemandSliceClass::NoConnectedPeers,
+            DemandSelectionReason::UsefulYieldHistory,
+        );
+        metrics.record_selection(
+            DemandSliceClass::RoutineRefresh,
+            DemandSelectionReason::OverdueScarce,
+        );
         metrics.record_stop(
             DemandSliceClass::AwaitingMetadata,
             DemandSliceStopReason::WallTime,
@@ -2792,6 +3023,9 @@ mod tests {
         assert!(metrics.has_activity());
         assert_eq!(metrics.awaiting_metadata.fresh_starts, 1);
         assert_eq!(metrics.awaiting_metadata.resumed_starts, 1);
+        assert_eq!(metrics.awaiting_metadata.selected_reusable_parked, 1);
+        assert_eq!(metrics.no_connected_peers.selected_useful_yield_history, 1);
+        assert_eq!(metrics.routine_refresh.selected_overdue_scarce, 1);
         assert_eq!(metrics.awaiting_metadata.wall_time_stops, 1);
         assert_eq!(metrics.awaiting_metadata.peers_yielded, 12);
         assert_eq!(metrics.awaiting_metadata.unique_peers_yielded, 7);
@@ -2800,6 +3034,9 @@ mod tests {
         assert_eq!(metrics.routine_refresh.stale_resets, 1);
         assert_eq!(metrics.routine_refresh.low_quality_resets, 1);
         assert!(metrics.summary().contains("awaiting("));
+        assert!(metrics.summary().contains("sel_reuse=1"));
+        assert!(metrics.summary().contains("sel_yield=1"));
+        assert!(metrics.summary().contains("sel_due=1"));
         assert!(metrics.summary().contains("reset_quality=1"));
     }
 
@@ -2823,7 +3060,7 @@ mod tests {
                 },
             );
         }
-        assert_eq!(demand_lookup_launch_budget(&active), 2);
+        assert_eq!(demand_lookup_launch_budget(&active), 3);
 
         for byte in 6..10u8 {
             active.insert(
@@ -2887,10 +3124,239 @@ mod tests {
                 no_connected_peers: DHT_NO_CONNECTED_PEERS_SLOT_CAP,
                 routine_refresh: DHT_ROUTINE_LOOKUP_SLOT_CAP,
             },
+            &HashMap::new(),
+            &HashMap::new(),
+            now,
             4,
         );
 
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].info_hash, hash(1));
+    }
+
+    #[test]
+    fn select_due_demand_launches_prefers_reusable_parked_crawls_within_class() {
+        let hash = |byte: u8| InfoHash::from([byte; InfoHash::LEN]);
+        let now = Instant::now();
+        let due = vec![
+            DueDemandCandidate {
+                info_hash: hash(1),
+                demand: DhtDemandState {
+                    awaiting_metadata: false,
+                    connected_peers: 0,
+                },
+                next_eligible_at: now - Duration::from_secs(30),
+                subscriber_count: 1,
+            },
+            DueDemandCandidate {
+                info_hash: hash(2),
+                demand: DhtDemandState {
+                    awaiting_metadata: false,
+                    connected_peers: 0,
+                },
+                next_eligible_at: now - Duration::from_secs(10),
+                subscriber_count: 1,
+            },
+        ];
+
+        let mut parked_crawls = HashMap::new();
+        let mut crawl = DemandCrawlState::new(now, DemandSliceClass::NoConnectedPeers);
+        let manager =
+            crate::dht::lookup::LookupManager::new(crate::dht::lookup::LookupConfig::default());
+        let routing = crate::dht::routing::RoutingSnapshot {
+            family: AddressFamily::Ipv4,
+            buckets: Vec::new(),
+            nodes: Vec::new(),
+            replacement_count: 0,
+            refresh_due_count: 0,
+        };
+        crawl.ipv4 = Some(manager.start(
+            crate::dht::lookup::LookupRequest {
+                lookup_id: LookupId(1),
+                kind: crate::dht::lookup::LookupKind::GetPeers,
+                target: crate::dht::lookup::LookupTarget::InfoHash(hash(2)),
+            },
+            AddressFamily::Ipv4,
+            &routing,
+            &[],
+            &[],
+            now,
+        ));
+        parked_crawls.insert(hash(2), crawl);
+
+        let selected = select_due_demand_launches(
+            &due,
+            DemandSlotCounts::default(),
+            &parked_crawls,
+            &HashMap::new(),
+            now,
+            1,
+        );
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].info_hash, hash(2));
+    }
+
+    #[test]
+    fn select_due_demand_launches_prefers_recently_productive_crawls_within_class() {
+        let hash = |byte: u8| InfoHash::from([byte; InfoHash::LEN]);
+        let now = Instant::now();
+        let due = vec![
+            DueDemandCandidate {
+                info_hash: hash(1),
+                demand: DhtDemandState {
+                    awaiting_metadata: false,
+                    connected_peers: 0,
+                },
+                next_eligible_at: now - Duration::from_secs(30),
+                subscriber_count: 1,
+            },
+            DueDemandCandidate {
+                info_hash: hash(2),
+                demand: DhtDemandState {
+                    awaiting_metadata: false,
+                    connected_peers: 0,
+                },
+                next_eligible_at: now - Duration::from_secs(10),
+                subscriber_count: 1,
+            },
+        ];
+
+        let mut planner_state = HashMap::new();
+        planner_state.insert(
+            hash(2),
+            DemandPlannerState {
+                last_started_at: Some(now - Duration::from_secs(20)),
+                last_finished_at: Some(now - Duration::from_secs(5)),
+                last_useful_yield_at: Some(now - Duration::from_secs(5)),
+                last_unique_peers: 8,
+            },
+        );
+
+        let selected = select_due_demand_launches(
+            &due,
+            DemandSlotCounts::default(),
+            &HashMap::new(),
+            &planner_state,
+            now,
+            1,
+        );
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].info_hash, hash(2));
+    }
+
+    #[test]
+    fn select_due_demand_launches_uses_reserve_slot_for_oldest_candidate() {
+        let hash = |byte: u8| InfoHash::from([byte; InfoHash::LEN]);
+        let now = Instant::now();
+        let due = vec![
+            DueDemandCandidate {
+                info_hash: hash(1),
+                demand: DhtDemandState {
+                    awaiting_metadata: false,
+                    connected_peers: 1,
+                },
+                next_eligible_at: now - Duration::from_secs(120),
+                subscriber_count: 1,
+            },
+            DueDemandCandidate {
+                info_hash: hash(2),
+                demand: DhtDemandState {
+                    awaiting_metadata: true,
+                    connected_peers: 0,
+                },
+                next_eligible_at: now - Duration::from_secs(10),
+                subscriber_count: 1,
+            },
+        ];
+
+        let selected = select_due_demand_launches(
+            &due,
+            DemandSlotCounts {
+                awaiting_metadata: 6,
+                no_connected_peers: 1,
+                routine_refresh: 1,
+            },
+            &HashMap::new(),
+            &HashMap::new(),
+            now,
+            1,
+        );
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].info_hash, hash(1));
+    }
+
+    #[test]
+    fn candidate_selection_reason_prefers_yield_then_reuse_then_due() {
+        let hash = |byte: u8| InfoHash::from([byte; InfoHash::LEN]);
+        let now = Instant::now();
+        let candidate = DueDemandCandidate {
+            info_hash: hash(1),
+            demand: DhtDemandState {
+                awaiting_metadata: false,
+                connected_peers: 0,
+            },
+            next_eligible_at: now,
+            subscriber_count: 1,
+        };
+
+        let mut parked_crawls = HashMap::new();
+        let manager =
+            crate::dht::lookup::LookupManager::new(crate::dht::lookup::LookupConfig::default());
+        let routing = crate::dht::routing::RoutingSnapshot {
+            family: AddressFamily::Ipv4,
+            buckets: Vec::new(),
+            nodes: Vec::new(),
+            replacement_count: 0,
+            refresh_due_count: 0,
+        };
+        let mut crawl = DemandCrawlState::new(now, DemandSliceClass::NoConnectedPeers);
+        crawl.ipv4 = Some(manager.start(
+            crate::dht::lookup::LookupRequest {
+                lookup_id: LookupId(1),
+                kind: crate::dht::lookup::LookupKind::GetPeers,
+                target: crate::dht::lookup::LookupTarget::InfoHash(hash(1)),
+            },
+            AddressFamily::Ipv4,
+            &routing,
+            &[],
+            &[],
+            now,
+        ));
+        parked_crawls.insert(hash(1), crawl);
+
+        assert_eq!(
+            candidate_selection_reason(candidate, &parked_crawls, &HashMap::new(), now),
+            DemandSelectionReason::ReusableParked
+        );
+
+        let mut planner_state = HashMap::new();
+        planner_state.insert(
+            hash(1),
+            DemandPlannerState {
+                last_started_at: Some(now - Duration::from_secs(10)),
+                last_finished_at: Some(now - Duration::from_secs(5)),
+                last_useful_yield_at: Some(now - Duration::from_secs(5)),
+                last_unique_peers: 3,
+            },
+        );
+        assert_eq!(
+            candidate_selection_reason(candidate, &parked_crawls, &planner_state, now),
+            DemandSelectionReason::UsefulYieldHistory
+        );
+
+        parked_crawls.clear();
+        assert_eq!(
+            candidate_selection_reason(candidate, &parked_crawls, &planner_state, now),
+            DemandSelectionReason::UsefulYieldHistory
+        );
+
+        planner_state.clear();
+        assert_eq!(
+            candidate_selection_reason(candidate, &parked_crawls, &planner_state, now),
+            DemandSelectionReason::OverdueScarce
+        );
     }
 }
