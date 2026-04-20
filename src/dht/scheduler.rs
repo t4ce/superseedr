@@ -11,6 +11,14 @@ pub struct DhtDemandState {
     pub connected_peers: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DueDemandCandidate {
+    pub info_hash: InfoHash,
+    pub demand: DhtDemandState,
+    pub next_eligible_at: Instant,
+    pub subscriber_count: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum DemandClass {
     RoutineRefresh,
@@ -152,7 +160,7 @@ impl DemandScheduler {
         self.entries.get(&info_hash).map(|entry| entry.demand)
     }
 
-    pub(super) fn take_due(&mut self, now: Instant, limit: usize) -> Vec<InfoHash> {
+    pub(super) fn due_candidates(&self, now: Instant) -> Vec<DueDemandCandidate> {
         let mut due = self
             .entries
             .iter()
@@ -161,10 +169,13 @@ impl DemandScheduler {
             })
             .map(|(info_hash, entry)| {
                 (
-                    *info_hash,
+                    DueDemandCandidate {
+                        info_hash: *info_hash,
+                        demand: entry.demand,
+                        next_eligible_at: entry.next_eligible_at,
+                        subscriber_count: entry.subscriber_count,
+                    },
                     DemandClass::from_demand(entry.demand),
-                    entry.next_eligible_at,
-                    entry.subscriber_count,
                 )
             })
             .collect::<Vec<_>>();
@@ -173,20 +184,34 @@ impl DemandScheduler {
             right
                 .1
                 .cmp(&left.1)
-                .then_with(|| left.2.cmp(&right.2))
-                .then_with(|| right.3.cmp(&left.3))
+                .then_with(|| left.0.next_eligible_at.cmp(&right.0.next_eligible_at))
+                .then_with(|| right.0.subscriber_count.cmp(&left.0.subscriber_count))
         });
-        due.truncate(limit);
 
-        let info_hashes = due
+        due.into_iter().map(|(candidate, _)| candidate).collect()
+    }
+
+    pub(super) fn mark_in_progress(&mut self, info_hash: InfoHash) -> bool {
+        let Some(entry) = self.entries.get_mut(&info_hash) else {
+            return false;
+        };
+        if entry.subscriber_count == 0 || entry.in_progress {
+            return false;
+        }
+        entry.in_progress = true;
+        entry.retrigger_pending = false;
+        true
+    }
+
+    pub(super) fn take_due(&mut self, now: Instant, limit: usize) -> Vec<InfoHash> {
+        let info_hashes = self
+            .due_candidates(now)
             .into_iter()
-            .map(|(info_hash, _, _, _)| info_hash)
+            .take(limit)
+            .map(|candidate| candidate.info_hash)
             .collect::<Vec<_>>();
         for info_hash in &info_hashes {
-            if let Some(entry) = self.entries.get_mut(info_hash) {
-                entry.in_progress = true;
-                entry.retrigger_pending = false;
-            }
+            let _ = self.mark_in_progress(*info_hash);
         }
 
         info_hashes

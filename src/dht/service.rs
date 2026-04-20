@@ -3,8 +3,8 @@
 
 use super::lookup::LookupQualitySnapshot;
 use super::persist::{PersistenceConfig, PersistenceManager};
-use super::scheduler::DemandScheduler;
 pub use super::scheduler::DhtDemandState;
+use super::scheduler::{DemandScheduler, DueDemandCandidate};
 use super::types::{AddressFamily, InfoHash, LookupId, NodeId};
 use super::{LookupState, Runtime, RuntimeConfig};
 use crate::config::{self, Settings};
@@ -33,6 +33,9 @@ const DHT_HEALTH_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const DHT_DEMAND_SCHEDULER_INTERVAL: Duration = Duration::from_millis(250);
 const DHT_DEMAND_LOOKUP_SLOT_COUNT: usize = 8;
 const DHT_DEMAND_LOOKUP_SLOT_FILL_PER_TICK: usize = 4;
+const DHT_AWAITING_METADATA_SLOT_CAP: usize = DHT_DEMAND_LOOKUP_SLOT_COUNT;
+const DHT_NO_CONNECTED_PEERS_SLOT_CAP: usize = 6;
+const DHT_ROUTINE_LOOKUP_SLOT_CAP: usize = 2;
 const DHT_PERSISTENCE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const DHT_STARTUP_BOOTSTRAP_DELAY: Duration = Duration::from_secs(5);
 const DHT_IPV6_HEDGE_DELAY: Duration = Duration::from_millis(750);
@@ -220,6 +223,43 @@ pub struct DhtLookupRun {
 struct StartedLookup {
     lookup_ids: Arc<StdMutex<Vec<LookupId>>>,
     receiver: mpsc::UnboundedReceiver<Vec<SocketAddr>>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveDemandLookup {
+    lookup_ids: Arc<StdMutex<Vec<LookupId>>>,
+    slice_class: DemandSliceClass,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DemandSlotCounts {
+    awaiting_metadata: usize,
+    no_connected_peers: usize,
+    routine_refresh: usize,
+}
+
+impl DemandSlotCounts {
+    fn count(self, class: DemandSliceClass) -> usize {
+        match class {
+            DemandSliceClass::AwaitingMetadata => self.awaiting_metadata,
+            DemandSliceClass::NoConnectedPeers => self.no_connected_peers,
+            DemandSliceClass::RoutineRefresh => self.routine_refresh,
+        }
+    }
+
+    fn record(&mut self, class: DemandSliceClass) {
+        match class {
+            DemandSliceClass::AwaitingMetadata => {
+                self.awaiting_metadata = self.awaiting_metadata.saturating_add(1);
+            }
+            DemandSliceClass::NoConnectedPeers => {
+                self.no_connected_peers = self.no_connected_peers.saturating_add(1);
+            }
+            DemandSliceClass::RoutineRefresh => {
+                self.routine_refresh = self.routine_refresh.saturating_add(1);
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1299,7 +1339,7 @@ async fn run_service(
         InfoHash,
         HashMap<u64, mpsc::UnboundedSender<Vec<SocketAddr>>>,
     > = HashMap::new();
-    let mut demand_lookup_ids: HashMap<InfoHash, Arc<StdMutex<Vec<LookupId>>>> = HashMap::new();
+    let mut demand_lookup_ids: HashMap<InfoHash, ActiveDemandLookup> = HashMap::new();
     let mut parked_crawls: HashMap<InfoHash, DemandCrawlState> = HashMap::new();
     let mut slice_metrics = DemandSliceMetrics::default();
     let mut recent_unique_peers = RecentUniquePeers::new(DHT_UNIQUE_PEERS_FOUND_WINDOW);
@@ -1435,7 +1475,7 @@ async fn run_service(
                     }
                 }
                 if removed && demand_scheduler.unregister(info_hash) {
-                    if let Some(lookup_ids) = demand_lookup_ids.remove(&info_hash) {
+                    if let Some(lookup) = demand_lookup_ids.remove(&info_hash) {
                         park_lookup_ids(
                             active_runtime.as_mut(),
                             &mut parked_crawls,
@@ -1443,7 +1483,7 @@ async fn run_service(
                             slice_class,
                             None,
                             0,
-                            lookup_ids,
+                            lookup.lookup_ids,
                         );
                     }
                 }
@@ -1471,7 +1511,7 @@ async fn run_service(
                 if subscribers.is_empty() {
                     demand_subscribers.remove(&info_hash);
                     if drained {
-                        if let Some(lookup_ids) = demand_lookup_ids.remove(&info_hash) {
+                        if let Some(lookup) = demand_lookup_ids.remove(&info_hash) {
                             park_lookup_ids(
                                 active_runtime.as_mut(),
                                 &mut parked_crawls,
@@ -1479,7 +1519,7 @@ async fn run_service(
                                 slice_class,
                                 None,
                                 0,
-                                lookup_ids,
+                                lookup.lookup_ids,
                             );
                         }
                     }
@@ -1864,24 +1904,65 @@ fn evict_stale_parked_crawls(
 }
 
 fn active_demand_lookup_slot_count(
-    demand_lookup_ids: &HashMap<InfoHash, Arc<StdMutex<Vec<LookupId>>>>,
+    demand_lookup_ids: &HashMap<InfoHash, ActiveDemandLookup>,
 ) -> usize {
     demand_lookup_ids.len()
 }
 
-fn demand_lookup_launch_budget(
-    demand_lookup_ids: &HashMap<InfoHash, Arc<StdMutex<Vec<LookupId>>>>,
-) -> usize {
+fn active_demand_lookup_slot_counts(
+    demand_lookup_ids: &HashMap<InfoHash, ActiveDemandLookup>,
+) -> DemandSlotCounts {
+    let mut counts = DemandSlotCounts::default();
+    for lookup in demand_lookup_ids.values() {
+        counts.record(lookup.slice_class);
+    }
+    counts
+}
+
+fn demand_lookup_launch_budget(demand_lookup_ids: &HashMap<InfoHash, ActiveDemandLookup>) -> usize {
     let available_slots = DHT_DEMAND_LOOKUP_SLOT_COUNT
         .saturating_sub(active_demand_lookup_slot_count(demand_lookup_ids));
     available_slots.min(DHT_DEMAND_LOOKUP_SLOT_FILL_PER_TICK)
+}
+
+fn demand_lookup_class_slot_cap(class: DemandSliceClass) -> usize {
+    match class {
+        DemandSliceClass::AwaitingMetadata => DHT_AWAITING_METADATA_SLOT_CAP,
+        DemandSliceClass::NoConnectedPeers => DHT_NO_CONNECTED_PEERS_SLOT_CAP,
+        DemandSliceClass::RoutineRefresh => DHT_ROUTINE_LOOKUP_SLOT_CAP,
+    }
+}
+
+fn select_due_demand_launches(
+    due_candidates: &[DueDemandCandidate],
+    active_counts: DemandSlotCounts,
+    total_budget: usize,
+) -> Vec<DueDemandCandidate> {
+    let mut selected = Vec::new();
+    let mut planned_counts = active_counts;
+
+    for candidate in due_candidates {
+        if selected.len() >= total_budget {
+            break;
+        }
+
+        let class = DemandSliceClass::from_demand(candidate.demand);
+        if planned_counts.count(class) >= demand_lookup_class_slot_cap(class) {
+            continue;
+        }
+
+        planned_counts.record(class);
+        selected.push(*candidate);
+    }
+
+    selected
 }
 
 async fn start_due_demands(
     active_runtime: Option<&mut ActiveRuntime>,
     command_tx: &mpsc::UnboundedSender<DhtCommand>,
     demand_scheduler: &mut DemandScheduler,
-    demand_lookup_ids: &mut HashMap<InfoHash, Arc<StdMutex<Vec<LookupId>>>>,
+    demand_lookup_ids: &mut HashMap<InfoHash, ActiveDemandLookup>,
     parked_crawls: &mut HashMap<InfoHash, DemandCrawlState>,
     slice_metrics: &mut DemandSliceMetrics,
 ) {
@@ -1894,11 +1975,19 @@ async fn start_due_demands(
     if launch_budget == 0 {
         return;
     }
-    let due = demand_scheduler.take_due(Instant::now(), launch_budget);
-    for info_hash in due {
-        let plan = DemandLookupPlan::for_demand(
-            demand_scheduler.demand_state(info_hash).unwrap_or_default(),
-        );
+    let now = Instant::now();
+    let active_counts = active_demand_lookup_slot_counts(demand_lookup_ids);
+    let due = select_due_demand_launches(
+        &demand_scheduler.due_candidates(now),
+        active_counts,
+        launch_budget,
+    );
+    for candidate in due {
+        if !demand_scheduler.mark_in_progress(candidate.info_hash) {
+            continue;
+        }
+        let info_hash = candidate.info_hash;
+        let plan = DemandLookupPlan::for_demand(candidate.demand);
         match start_get_peers_lookup(
             Some(active_runtime),
             command_tx,
@@ -1911,7 +2000,13 @@ async fn start_due_demands(
         .await
         {
             Ok(started) => {
-                demand_lookup_ids.insert(info_hash, started.lookup_ids.clone());
+                demand_lookup_ids.insert(
+                    info_hash,
+                    ActiveDemandLookup {
+                        lookup_ids: started.lookup_ids.clone(),
+                        slice_class: plan.class,
+                    },
+                );
                 let mut receiver = started.receiver;
                 let command_tx = command_tx.clone();
                 let lookup_ids = started.lookup_ids.clone();
@@ -2720,13 +2815,82 @@ mod tests {
         );
 
         for byte in 0..6u8 {
-            active.insert(hash(byte), make_ids());
+            active.insert(
+                hash(byte),
+                ActiveDemandLookup {
+                    lookup_ids: make_ids(),
+                    slice_class: DemandSliceClass::NoConnectedPeers,
+                },
+            );
         }
         assert_eq!(demand_lookup_launch_budget(&active), 2);
 
         for byte in 6..10u8 {
-            active.insert(hash(byte), make_ids());
+            active.insert(
+                hash(byte),
+                ActiveDemandLookup {
+                    lookup_ids: make_ids(),
+                    slice_class: DemandSliceClass::RoutineRefresh,
+                },
+            );
         }
         assert_eq!(demand_lookup_launch_budget(&active), 0);
+    }
+
+    #[test]
+    fn select_due_demand_launches_respects_class_slot_caps() {
+        let hash = |byte: u8| InfoHash::from([byte; InfoHash::LEN]);
+        let now = Instant::now();
+        let due = vec![
+            DueDemandCandidate {
+                info_hash: hash(1),
+                demand: DhtDemandState {
+                    awaiting_metadata: true,
+                    connected_peers: 0,
+                },
+                next_eligible_at: now,
+                subscriber_count: 1,
+            },
+            DueDemandCandidate {
+                info_hash: hash(2),
+                demand: DhtDemandState {
+                    awaiting_metadata: false,
+                    connected_peers: 0,
+                },
+                next_eligible_at: now,
+                subscriber_count: 1,
+            },
+            DueDemandCandidate {
+                info_hash: hash(3),
+                demand: DhtDemandState {
+                    awaiting_metadata: false,
+                    connected_peers: 1,
+                },
+                next_eligible_at: now,
+                subscriber_count: 1,
+            },
+            DueDemandCandidate {
+                info_hash: hash(4),
+                demand: DhtDemandState {
+                    awaiting_metadata: false,
+                    connected_peers: 1,
+                },
+                next_eligible_at: now,
+                subscriber_count: 1,
+            },
+        ];
+
+        let selected = select_due_demand_launches(
+            &due,
+            DemandSlotCounts {
+                awaiting_metadata: 0,
+                no_connected_peers: DHT_NO_CONNECTED_PEERS_SLOT_CAP,
+                routine_refresh: DHT_ROUTINE_LOOKUP_SLOT_CAP,
+            },
+            4,
+        );
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].info_hash, hash(1));
     }
 }
