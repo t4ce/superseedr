@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use super::lookup::LookupQualitySnapshot;
 use super::persist::{PersistenceConfig, PersistenceManager};
 use super::scheduler::DemandScheduler;
 pub use super::scheduler::DhtDemandState;
@@ -30,7 +31,8 @@ const DHT_NO_CONNECTED_PEERS_MAX_INTERVAL: Duration = DHT_ROUTINE_LOOKUP_REFRESH
 const DHT_AWAITING_METADATA_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const DHT_HEALTH_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const DHT_DEMAND_SCHEDULER_INTERVAL: Duration = Duration::from_millis(250);
-const DHT_DEMAND_LOOKUPS_PER_TICK: usize = 4;
+const DHT_DEMAND_LOOKUP_SLOT_COUNT: usize = 8;
+const DHT_DEMAND_LOOKUP_SLOT_FILL_PER_TICK: usize = 4;
 const DHT_PERSISTENCE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const DHT_STARTUP_BOOTSTRAP_DELAY: Duration = Duration::from_secs(5);
 const DHT_IPV6_HEDGE_DELAY: Duration = Duration::from_millis(750);
@@ -49,6 +51,17 @@ const DHT_ROUTINE_SLICE_UNIQUE_PEER_CAP: usize = 16;
 const DHT_AWAITING_METADATA_STALLED_EMPTY_SLICE_RESET_THRESHOLD: u32 = 4;
 const DHT_NO_CONNECTED_PEERS_STALLED_EMPTY_SLICE_RESET_THRESHOLD: u32 = 3;
 const DHT_ROUTINE_STALLED_EMPTY_SLICE_RESET_THRESHOLD: u32 = 2;
+const DHT_AWAITING_METADATA_STALLED_LOW_YIELD_SLICE_MAX_UNIQUE_PEERS: usize = 0;
+const DHT_NO_CONNECTED_PEERS_STALLED_LOW_YIELD_SLICE_MAX_UNIQUE_PEERS: usize = 2;
+const DHT_ROUTINE_STALLED_LOW_YIELD_SLICE_MAX_UNIQUE_PEERS: usize = 1;
+const DHT_NO_CONNECTED_PEERS_WEAK_PARKED_MIN_VISITED: usize = 12;
+const DHT_NO_CONNECTED_PEERS_WEAK_PARKED_MAX_RESPONDERS: usize = 3;
+const DHT_NO_CONNECTED_PEERS_WEAK_PARKED_MAX_FRONTIER: usize = 8;
+const DHT_NO_CONNECTED_PEERS_WEAK_PARKED_MAX_RECEIVED_PEERS: usize = 12;
+const DHT_ROUTINE_WEAK_PARKED_MIN_VISITED: usize = 8;
+const DHT_ROUTINE_WEAK_PARKED_MAX_RESPONDERS: usize = 1;
+const DHT_ROUTINE_WEAK_PARKED_MAX_FRONTIER: usize = 4;
+const DHT_ROUTINE_WEAK_PARKED_MAX_RECEIVED_PEERS: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum DhtBackendKind {
@@ -216,7 +229,7 @@ struct DemandCrawlState {
     class: DemandSliceClass,
     updated_at: Instant,
     reset_count: u32,
-    consecutive_stalled_empty_slices: u32,
+    consecutive_stalled_low_yield_slices: u32,
 }
 
 impl DemandCrawlState {
@@ -227,7 +240,7 @@ impl DemandCrawlState {
             class,
             updated_at: now,
             reset_count: 0,
-            consecutive_stalled_empty_slices: 0,
+            consecutive_stalled_low_yield_slices: 0,
         }
     }
 
@@ -267,7 +280,8 @@ impl DemandCrawlState {
         if self.is_stale(now) {
             Some(DemandCrawlResetReason::Stale)
         } else if self.class == class
-            && self.consecutive_stalled_empty_slices >= class.stalled_empty_slice_reset_threshold()
+            && self.consecutive_stalled_low_yield_slices
+                >= class.stalled_empty_slice_reset_threshold()
         {
             Some(DemandCrawlResetReason::LowQuality)
         } else {
@@ -285,7 +299,7 @@ impl DemandCrawlState {
         self.class = class;
         self.updated_at = now;
         self.reset_count = self.reset_count.saturating_add(1);
-        self.consecutive_stalled_empty_slices = 0;
+        self.consecutive_stalled_low_yield_slices = 0;
     }
 
     fn observe_parked_slice(
@@ -293,23 +307,24 @@ impl DemandCrawlState {
         class: DemandSliceClass,
         stop_reason: DemandSliceStopReason,
         unique_peers: usize,
+        weak_parked_state: bool,
     ) {
         if self.class != class {
             self.class = class;
-            self.consecutive_stalled_empty_slices = 0;
+            self.consecutive_stalled_low_yield_slices = 0;
         }
         self.class = class;
         self.updated_at = Instant::now();
-        if unique_peers == 0
+        if (unique_peers <= class.stalled_low_yield_slice_max_unique_peers() || weak_parked_state)
             && matches!(
                 stop_reason,
                 DemandSliceStopReason::WallTime | DemandSliceStopReason::IdleTimeout
             )
         {
-            self.consecutive_stalled_empty_slices =
-                self.consecutive_stalled_empty_slices.saturating_add(1);
+            self.consecutive_stalled_low_yield_slices =
+                self.consecutive_stalled_low_yield_slices.saturating_add(1);
         } else {
-            self.consecutive_stalled_empty_slices = 0;
+            self.consecutive_stalled_low_yield_slices = 0;
         }
     }
 }
@@ -342,6 +357,63 @@ impl DemandSliceClass {
             }
             DemandSliceClass::RoutineRefresh => DHT_ROUTINE_STALLED_EMPTY_SLICE_RESET_THRESHOLD,
         }
+    }
+
+    fn stalled_low_yield_slice_max_unique_peers(self) -> usize {
+        match self {
+            DemandSliceClass::AwaitingMetadata => {
+                DHT_AWAITING_METADATA_STALLED_LOW_YIELD_SLICE_MAX_UNIQUE_PEERS
+            }
+            DemandSliceClass::NoConnectedPeers => {
+                DHT_NO_CONNECTED_PEERS_STALLED_LOW_YIELD_SLICE_MAX_UNIQUE_PEERS
+            }
+            DemandSliceClass::RoutineRefresh => {
+                DHT_ROUTINE_STALLED_LOW_YIELD_SLICE_MAX_UNIQUE_PEERS
+            }
+        }
+    }
+
+    fn parked_quality_is_weak(self, snapshot: AggregateLookupQualitySnapshot) -> bool {
+        match self {
+            DemandSliceClass::AwaitingMetadata => false,
+            DemandSliceClass::NoConnectedPeers => {
+                snapshot.visited_len >= DHT_NO_CONNECTED_PEERS_WEAK_PARKED_MIN_VISITED
+                    && snapshot.eligible_responder_count
+                        <= DHT_NO_CONNECTED_PEERS_WEAK_PARKED_MAX_RESPONDERS
+                    && snapshot.frontier_len <= DHT_NO_CONNECTED_PEERS_WEAK_PARKED_MAX_FRONTIER
+                    && snapshot.received_peer_count
+                        <= DHT_NO_CONNECTED_PEERS_WEAK_PARKED_MAX_RECEIVED_PEERS
+            }
+            DemandSliceClass::RoutineRefresh => {
+                snapshot.visited_len >= DHT_ROUTINE_WEAK_PARKED_MIN_VISITED
+                    && snapshot.eligible_responder_count <= DHT_ROUTINE_WEAK_PARKED_MAX_RESPONDERS
+                    && snapshot.frontier_len <= DHT_ROUTINE_WEAK_PARKED_MAX_FRONTIER
+                    && snapshot.received_peer_count <= DHT_ROUTINE_WEAK_PARKED_MAX_RECEIVED_PEERS
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AggregateLookupQualitySnapshot {
+    frontier_len: usize,
+    inflight_len: usize,
+    visited_len: usize,
+    eligible_responder_count: usize,
+    received_peer_count: usize,
+}
+
+impl AggregateLookupQualitySnapshot {
+    fn extend(&mut self, snapshot: LookupQualitySnapshot) {
+        self.frontier_len = self.frontier_len.saturating_add(snapshot.frontier_len);
+        self.inflight_len = self.inflight_len.saturating_add(snapshot.inflight_len);
+        self.visited_len = self.visited_len.saturating_add(snapshot.visited_len);
+        self.eligible_responder_count = self
+            .eligible_responder_count
+            .saturating_add(snapshot.eligible_responder_count);
+        self.received_peer_count = self
+            .received_peer_count
+            .saturating_add(snapshot.received_peer_count);
     }
 }
 
@@ -1722,15 +1794,25 @@ fn store_parked_lookup_states(
     }
 
     let now = Instant::now();
+    let quality = aggregate_lookup_quality(&states);
+    let weak_parked_state = slice_class.parked_quality_is_weak(quality);
     let crawl = parked_crawls
         .entry(info_hash)
         .or_insert_with(|| DemandCrawlState::new(now, slice_class));
     if let Some(stop_reason) = stop_reason {
-        crawl.observe_parked_slice(slice_class, stop_reason, unique_peers);
+        crawl.observe_parked_slice(slice_class, stop_reason, unique_peers, weak_parked_state);
     }
     for state in states {
         crawl.store_family_state(slice_class, state);
     }
+}
+
+fn aggregate_lookup_quality(states: &[LookupState]) -> AggregateLookupQualitySnapshot {
+    let mut aggregate = AggregateLookupQualitySnapshot::default();
+    for state in states {
+        aggregate.extend(state.quality_snapshot());
+    }
+    aggregate
 }
 
 fn park_lookup_ids(
@@ -1781,6 +1863,20 @@ fn evict_stale_parked_crawls(
     parked_crawls.retain(|_, crawl| !crawl.is_stale(now) && !crawl.is_empty());
 }
 
+fn active_demand_lookup_slot_count(
+    demand_lookup_ids: &HashMap<InfoHash, Arc<StdMutex<Vec<LookupId>>>>,
+) -> usize {
+    demand_lookup_ids.len()
+}
+
+fn demand_lookup_launch_budget(
+    demand_lookup_ids: &HashMap<InfoHash, Arc<StdMutex<Vec<LookupId>>>>,
+) -> usize {
+    let available_slots = DHT_DEMAND_LOOKUP_SLOT_COUNT
+        .saturating_sub(active_demand_lookup_slot_count(demand_lookup_ids));
+    available_slots.min(DHT_DEMAND_LOOKUP_SLOT_FILL_PER_TICK)
+}
+
 async fn start_due_demands(
     active_runtime: Option<&mut ActiveRuntime>,
     command_tx: &mpsc::UnboundedSender<DhtCommand>,
@@ -1794,7 +1890,11 @@ async fn start_due_demands(
     };
 
     evict_stale_parked_crawls(parked_crawls, Instant::now());
-    let due = demand_scheduler.take_due(Instant::now(), DHT_DEMAND_LOOKUPS_PER_TICK);
+    let launch_budget = demand_lookup_launch_budget(demand_lookup_ids);
+    if launch_budget == 0 {
+        return;
+    }
+    let due = demand_scheduler.take_due(Instant::now(), launch_budget);
     for info_hash in due {
         let plan = DemandLookupPlan::for_demand(
             demand_scheduler.demand_state(info_hash).unwrap_or_default(),
@@ -2454,6 +2554,7 @@ mod tests {
             DemandSliceClass::RoutineRefresh,
             DemandSliceStopReason::IdleTimeout,
             0,
+            false,
         );
         assert_eq!(
             low_quality.reset_reason_for(
@@ -2466,6 +2567,7 @@ mod tests {
             DemandSliceClass::RoutineRefresh,
             DemandSliceStopReason::WallTime,
             0,
+            false,
         );
         assert_eq!(
             low_quality.reset_reason_for(
@@ -2475,6 +2577,53 @@ mod tests {
             Some(DemandCrawlResetReason::LowQuality)
         );
 
+        let mut no_peers_low_yield = DemandCrawlState::new(now, DemandSliceClass::NoConnectedPeers);
+        no_peers_low_yield.observe_parked_slice(
+            DemandSliceClass::NoConnectedPeers,
+            DemandSliceStopReason::IdleTimeout,
+            2,
+            false,
+        );
+        no_peers_low_yield.observe_parked_slice(
+            DemandSliceClass::NoConnectedPeers,
+            DemandSliceStopReason::WallTime,
+            1,
+            false,
+        );
+        assert_eq!(
+            no_peers_low_yield.reset_reason_for(
+                DemandSliceClass::NoConnectedPeers,
+                now + Duration::from_secs(1)
+            ),
+            None
+        );
+        no_peers_low_yield.observe_parked_slice(
+            DemandSliceClass::NoConnectedPeers,
+            DemandSliceStopReason::IdleTimeout,
+            2,
+            false,
+        );
+        assert_eq!(
+            no_peers_low_yield.reset_reason_for(
+                DemandSliceClass::NoConnectedPeers,
+                now + Duration::from_secs(1)
+            ),
+            Some(DemandCrawlResetReason::LowQuality)
+        );
+        no_peers_low_yield.observe_parked_slice(
+            DemandSliceClass::NoConnectedPeers,
+            DemandSliceStopReason::UniquePeerCap,
+            10,
+            false,
+        );
+        assert_eq!(
+            no_peers_low_yield.reset_reason_for(
+                DemandSliceClass::NoConnectedPeers,
+                now + Duration::from_secs(1)
+            ),
+            None
+        );
+
         crawl.reset_for(
             DemandSliceClass::AwaitingMetadata,
             now + Duration::from_secs(2),
@@ -2482,6 +2631,36 @@ mod tests {
         assert_eq!(crawl.class, DemandSliceClass::AwaitingMetadata);
         assert_eq!(crawl.reset_count, 1);
         assert!(crawl.is_empty());
+    }
+
+    #[test]
+    fn parked_quality_thresholds_match_class_expectations() {
+        let weak_routine = AggregateLookupQualitySnapshot {
+            frontier_len: 3,
+            inflight_len: 0,
+            visited_len: 9,
+            eligible_responder_count: 1,
+            received_peer_count: 4,
+        };
+        let weak_no_peers = AggregateLookupQualitySnapshot {
+            frontier_len: 8,
+            inflight_len: 0,
+            visited_len: 12,
+            eligible_responder_count: 3,
+            received_peer_count: 12,
+        };
+        let healthy_no_peers = AggregateLookupQualitySnapshot {
+            frontier_len: 9,
+            inflight_len: 1,
+            visited_len: 12,
+            eligible_responder_count: 4,
+            received_peer_count: 12,
+        };
+
+        assert!(DemandSliceClass::RoutineRefresh.parked_quality_is_weak(weak_routine));
+        assert!(DemandSliceClass::NoConnectedPeers.parked_quality_is_weak(weak_no_peers));
+        assert!(!DemandSliceClass::NoConnectedPeers.parked_quality_is_weak(healthy_no_peers));
+        assert!(!DemandSliceClass::AwaitingMetadata.parked_quality_is_weak(weak_no_peers));
     }
 
     #[test]
@@ -2527,5 +2706,27 @@ mod tests {
         assert_eq!(metrics.routine_refresh.low_quality_resets, 1);
         assert!(metrics.summary().contains("awaiting("));
         assert!(metrics.summary().contains("reset_quality=1"));
+    }
+
+    #[test]
+    fn demand_lookup_launch_budget_respects_active_slot_cap() {
+        let mut active = HashMap::new();
+        let make_ids = || Arc::new(StdMutex::new(Vec::<LookupId>::new()));
+        let hash = |byte: u8| InfoHash::from([byte; InfoHash::LEN]);
+
+        assert_eq!(
+            demand_lookup_launch_budget(&active),
+            DHT_DEMAND_LOOKUP_SLOT_FILL_PER_TICK
+        );
+
+        for byte in 0..6u8 {
+            active.insert(hash(byte), make_ids());
+        }
+        assert_eq!(demand_lookup_launch_budget(&active), 2);
+
+        for byte in 6..10u8 {
+            active.insert(hash(byte), make_ids());
+        }
+        assert_eq!(demand_lookup_launch_budget(&active), 0);
     }
 }

@@ -127,6 +127,15 @@ pub struct LookupState {
     config: LookupConfig,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LookupQualitySnapshot {
+    pub frontier_len: usize,
+    pub inflight_len: usize,
+    pub visited_len: usize,
+    pub eligible_responder_count: usize,
+    pub received_peer_count: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct LookupManager {
     config: LookupConfig,
@@ -207,6 +216,16 @@ impl LookupState {
 
     pub fn inflight_transaction_ids(&self) -> Vec<TransactionId> {
         self.inflight.keys().copied().collect()
+    }
+
+    pub fn quality_snapshot(&self) -> LookupQualitySnapshot {
+        LookupQualitySnapshot {
+            frontier_len: self.frontier.len(),
+            inflight_len: self.inflight.len(),
+            visited_len: self.visited.len(),
+            eligible_responder_count: self.eligible_responders().len(),
+            received_peer_count: self.received_peers.len(),
+        }
     }
 
     pub fn park(&mut self) {

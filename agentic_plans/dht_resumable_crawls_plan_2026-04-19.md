@@ -302,6 +302,11 @@ Resumable crawls directly address those.
 - Let each active slot run one slice for one `DemandEntry`
 - Add per-class budgets
 
+Current note:
+- the current implementation now has resumable slices and parked-crawl reuse across class changes
+- the next gap is `NoConnectedPeers` reset quality: low-quality resets are still too conservative there compared to `RoutineRefresh`
+- the first slot-planner step should be a real shared active-slot cap, because the old "up to N launches per tick" behavior can still over-admit slices during busy periods
+
 ### Phase 5: Reset Rules And Telemetry
 
 - Add reset heuristics
