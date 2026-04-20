@@ -46,6 +46,9 @@ const DHT_ROUTINE_SLICE_IDLE_TIMEOUT: Duration = Duration::from_millis(750);
 const DHT_AWAITING_METADATA_SLICE_UNIQUE_PEER_CAP: usize = 128;
 const DHT_NO_CONNECTED_PEERS_SLICE_UNIQUE_PEER_CAP: usize = 48;
 const DHT_ROUTINE_SLICE_UNIQUE_PEER_CAP: usize = 16;
+const DHT_AWAITING_METADATA_STALLED_EMPTY_SLICE_RESET_THRESHOLD: u32 = 4;
+const DHT_NO_CONNECTED_PEERS_STALLED_EMPTY_SLICE_RESET_THRESHOLD: u32 = 3;
+const DHT_ROUTINE_STALLED_EMPTY_SLICE_RESET_THRESHOLD: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum DhtBackendKind {
@@ -213,6 +216,7 @@ struct DemandCrawlState {
     class: DemandSliceClass,
     updated_at: Instant,
     reset_count: u32,
+    consecutive_stalled_empty_slices: u32,
 }
 
 impl DemandCrawlState {
@@ -223,6 +227,7 @@ impl DemandCrawlState {
             class,
             updated_at: now,
             reset_count: 0,
+            consecutive_stalled_empty_slices: 0,
         }
     }
 
@@ -259,10 +264,12 @@ impl DemandCrawlState {
         class: DemandSliceClass,
         now: Instant,
     ) -> Option<DemandCrawlResetReason> {
-        if self.class != class {
-            Some(DemandCrawlResetReason::ClassChanged)
-        } else if self.is_stale(now) {
+        if self.is_stale(now) {
             Some(DemandCrawlResetReason::Stale)
+        } else if self.class == class
+            && self.consecutive_stalled_empty_slices >= class.stalled_empty_slice_reset_threshold()
+        {
+            Some(DemandCrawlResetReason::LowQuality)
         } else {
             None
         }
@@ -278,6 +285,32 @@ impl DemandCrawlState {
         self.class = class;
         self.updated_at = now;
         self.reset_count = self.reset_count.saturating_add(1);
+        self.consecutive_stalled_empty_slices = 0;
+    }
+
+    fn observe_parked_slice(
+        &mut self,
+        class: DemandSliceClass,
+        stop_reason: DemandSliceStopReason,
+        unique_peers: usize,
+    ) {
+        if self.class != class {
+            self.class = class;
+            self.consecutive_stalled_empty_slices = 0;
+        }
+        self.class = class;
+        self.updated_at = Instant::now();
+        if unique_peers == 0
+            && matches!(
+                stop_reason,
+                DemandSliceStopReason::WallTime | DemandSliceStopReason::IdleTimeout
+            )
+        {
+            self.consecutive_stalled_empty_slices =
+                self.consecutive_stalled_empty_slices.saturating_add(1);
+        } else {
+            self.consecutive_stalled_empty_slices = 0;
+        }
     }
 }
 
@@ -298,6 +331,18 @@ impl DemandSliceClass {
             Self::RoutineRefresh
         }
     }
+
+    fn stalled_empty_slice_reset_threshold(self) -> u32 {
+        match self {
+            DemandSliceClass::AwaitingMetadata => {
+                DHT_AWAITING_METADATA_STALLED_EMPTY_SLICE_RESET_THRESHOLD
+            }
+            DemandSliceClass::NoConnectedPeers => {
+                DHT_NO_CONNECTED_PEERS_STALLED_EMPTY_SLICE_RESET_THRESHOLD
+            }
+            DemandSliceClass::RoutineRefresh => DHT_ROUTINE_STALLED_EMPTY_SLICE_RESET_THRESHOLD,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,6 +358,7 @@ enum DemandSliceStopReason {
 enum DemandCrawlResetReason {
     Stale,
     ClassChanged,
+    LowQuality,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -328,6 +374,7 @@ struct DemandSliceClassMetrics {
     unique_peers_yielded: u64,
     stale_resets: u64,
     class_change_resets: u64,
+    low_quality_resets: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -403,6 +450,9 @@ impl DemandSliceMetrics {
             DemandCrawlResetReason::ClassChanged => {
                 metrics.class_change_resets = metrics.class_change_resets.saturating_add(1)
             }
+            DemandCrawlResetReason::LowQuality => {
+                metrics.low_quality_resets = metrics.low_quality_resets.saturating_add(1)
+            }
         }
     }
 
@@ -424,6 +474,7 @@ impl DemandSliceMetrics {
                 || metrics.unique_peers_yielded > 0
                 || metrics.stale_resets > 0
                 || metrics.class_change_resets > 0
+                || metrics.low_quality_resets > 0
             {
                 return true;
             }
@@ -434,7 +485,7 @@ impl DemandSliceMetrics {
     fn summary(&self) -> String {
         fn fmt(label: &str, metrics: &DemandSliceClassMetrics) -> String {
             format!(
-                "{label}(fresh={} resumed={} natural={} wall={} idle={} first={} cap={} peers={} unique={} reset_stale={} reset_class={})",
+                "{label}(fresh={} resumed={} natural={} wall={} idle={} first={} cap={} peers={} unique={} reset_stale={} reset_class={} reset_quality={})",
                 metrics.fresh_starts,
                 metrics.resumed_starts,
                 metrics.natural_finishes,
@@ -446,6 +497,7 @@ impl DemandSliceMetrics {
                 metrics.unique_peers_yielded,
                 metrics.stale_resets,
                 metrics.class_change_resets,
+                metrics.low_quality_resets,
             )
         }
 
@@ -1317,6 +1369,8 @@ async fn run_service(
                             &mut parked_crawls,
                             info_hash,
                             slice_class,
+                            None,
+                            0,
                             lookup_ids,
                         );
                     }
@@ -1351,6 +1405,8 @@ async fn run_service(
                                 &mut parked_crawls,
                                 info_hash,
                                 slice_class,
+                                None,
+                                0,
                                 lookup_ids,
                             );
                         }
@@ -1445,6 +1501,8 @@ async fn run_service(
                     &mut parked_crawls,
                     info_hash,
                     slice_class,
+                    Some(stop_reason),
+                    unique_peers,
                     lookup_ids,
                 );
                 demand_scheduler.finish(info_hash, Instant::now());
@@ -1655,6 +1713,8 @@ fn store_parked_lookup_states(
     parked_crawls: &mut HashMap<InfoHash, DemandCrawlState>,
     info_hash: InfoHash,
     slice_class: DemandSliceClass,
+    stop_reason: Option<DemandSliceStopReason>,
+    unique_peers: usize,
     states: Vec<LookupState>,
 ) {
     if states.is_empty() {
@@ -1665,6 +1725,9 @@ fn store_parked_lookup_states(
     let crawl = parked_crawls
         .entry(info_hash)
         .or_insert_with(|| DemandCrawlState::new(now, slice_class));
+    if let Some(stop_reason) = stop_reason {
+        crawl.observe_parked_slice(slice_class, stop_reason, unique_peers);
+    }
     for state in states {
         crawl.store_family_state(slice_class, state);
     }
@@ -1675,6 +1738,8 @@ fn park_lookup_ids(
     parked_crawls: &mut HashMap<InfoHash, DemandCrawlState>,
     info_hash: InfoHash,
     slice_class: DemandSliceClass,
+    stop_reason: Option<DemandSliceStopReason>,
+    unique_peers: usize,
     lookup_ids: Arc<StdMutex<Vec<LookupId>>>,
 ) {
     let lookup_ids = {
@@ -1699,7 +1764,14 @@ fn park_lookup_ids(
         }
     }
 
-    store_parked_lookup_states(parked_crawls, info_hash, slice_class, parked_states);
+    store_parked_lookup_states(
+        parked_crawls,
+        info_hash,
+        slice_class,
+        stop_reason,
+        unique_peers,
+        parked_states,
+    );
 }
 
 fn evict_stale_parked_crawls(
@@ -2351,7 +2423,7 @@ mod tests {
     }
 
     #[test]
-    fn demand_crawl_state_resets_on_class_change_or_staleness() {
+    fn demand_crawl_state_reuses_across_class_change_and_resets_on_staleness_or_low_quality() {
         let now = Instant::now();
         let mut crawl = DemandCrawlState::new(now, DemandSliceClass::RoutineRefresh);
 
@@ -2367,7 +2439,7 @@ mod tests {
                 DemandSliceClass::NoConnectedPeers,
                 now + Duration::from_secs(1)
             ),
-            Some(DemandCrawlResetReason::ClassChanged)
+            None
         );
         assert_eq!(
             crawl.reset_reason_for(
@@ -2375,6 +2447,32 @@ mod tests {
                 now + DHT_PARKED_CRAWL_MAX_AGE
             ),
             Some(DemandCrawlResetReason::Stale)
+        );
+
+        let mut low_quality = DemandCrawlState::new(now, DemandSliceClass::RoutineRefresh);
+        low_quality.observe_parked_slice(
+            DemandSliceClass::RoutineRefresh,
+            DemandSliceStopReason::IdleTimeout,
+            0,
+        );
+        assert_eq!(
+            low_quality.reset_reason_for(
+                DemandSliceClass::RoutineRefresh,
+                now + Duration::from_secs(1)
+            ),
+            None
+        );
+        low_quality.observe_parked_slice(
+            DemandSliceClass::RoutineRefresh,
+            DemandSliceStopReason::WallTime,
+            0,
+        );
+        assert_eq!(
+            low_quality.reset_reason_for(
+                DemandSliceClass::RoutineRefresh,
+                now + Duration::from_secs(1)
+            ),
+            Some(DemandCrawlResetReason::LowQuality)
         );
 
         crawl.reset_for(
@@ -2406,11 +2504,15 @@ mod tests {
         );
         metrics.record_reset(
             DemandSliceClass::RoutineRefresh,
-            DemandCrawlResetReason::ClassChanged,
+            DemandCrawlResetReason::LowQuality,
         );
         metrics.record_reset(
             DemandSliceClass::RoutineRefresh,
             DemandCrawlResetReason::Stale,
+        );
+        metrics.record_reset(
+            DemandSliceClass::RoutineRefresh,
+            DemandCrawlResetReason::ClassChanged,
         );
 
         assert!(metrics.has_activity());
@@ -2422,6 +2524,8 @@ mod tests {
         assert_eq!(metrics.no_connected_peers.natural_finishes, 1);
         assert_eq!(metrics.routine_refresh.class_change_resets, 1);
         assert_eq!(metrics.routine_refresh.stale_resets, 1);
+        assert_eq!(metrics.routine_refresh.low_quality_resets, 1);
         assert!(metrics.summary().contains("awaiting("));
+        assert!(metrics.summary().contains("reset_quality=1"));
     }
 }
