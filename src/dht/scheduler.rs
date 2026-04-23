@@ -119,6 +119,26 @@ impl DemandScheduler {
         }
     }
 
+    fn no_connected_peers_backoff_step_cap(&self) -> u8 {
+        if self.no_connected_peers_base_interval.is_zero()
+            || self.no_connected_peers_base_interval >= self.no_connected_peers_max_interval
+        {
+            return 0;
+        }
+
+        let mut step = 0u8;
+        let mut interval = self.no_connected_peers_base_interval;
+        while interval < self.no_connected_peers_max_interval && step < u8::MAX {
+            step = step.saturating_add(1);
+            interval = interval.saturating_mul(2);
+        }
+        step
+    }
+
+    fn capped_no_connected_peers_backoff_step(&self, step: u8) -> u8 {
+        step.min(self.no_connected_peers_backoff_step_cap())
+    }
+
     fn apply_demand_update(entry: &mut DemandEntry, demand: DhtDemandState, now: Instant) {
         let previous_class = DemandClass::from_demand(entry.demand);
         let next_class = DemandClass::from_demand(demand);
@@ -296,8 +316,10 @@ impl DemandScheduler {
         let demand_class = DemandClass::from_demand(demand);
         let effective_no_connected_peers_backoff_step =
             if demand_class == DemandClass::NoConnectedPeers {
-                no_connected_peers_backoff_step
-                    .saturating_add(mode.no_connected_peers_backoff_extra_steps())
+                self.capped_no_connected_peers_backoff_step(
+                    no_connected_peers_backoff_step
+                        .saturating_add(mode.no_connected_peers_backoff_extra_steps()),
+                )
             } else {
                 no_connected_peers_backoff_step
             };
@@ -307,6 +329,18 @@ impl DemandScheduler {
             now + self.interval_for_demand(demand, effective_no_connected_peers_backoff_step)
         };
         let next_interval = next_eligible_at.saturating_duration_since(now);
+        let next_no_connected_peers_backoff_step = if demand_class == DemandClass::NoConnectedPeers
+        {
+            if next_interval < self.no_connected_peers_max_interval {
+                self.capped_no_connected_peers_backoff_step(
+                    effective_no_connected_peers_backoff_step.saturating_add(1),
+                )
+            } else {
+                effective_no_connected_peers_backoff_step
+            }
+        } else {
+            0
+        };
 
         let Some(entry) = self.entries.get_mut(&info_hash) else {
             return;
@@ -319,12 +353,7 @@ impl DemandScheduler {
         }
 
         if demand_class == DemandClass::NoConnectedPeers {
-            if next_interval < self.no_connected_peers_max_interval {
-                entry.no_connected_peers_backoff_step =
-                    effective_no_connected_peers_backoff_step.saturating_add(1);
-            } else {
-                entry.no_connected_peers_backoff_step = effective_no_connected_peers_backoff_step;
-            }
+            entry.no_connected_peers_backoff_step = next_no_connected_peers_backoff_step;
         } else {
             entry.no_connected_peers_backoff_step = 0;
         }
@@ -545,6 +574,41 @@ mod tests {
         assert_eq!(
             scheduler.take_due(now + Duration::from_secs(48), 8),
             vec![hash]
+        );
+    }
+
+    #[test]
+    fn no_connected_peers_backoff_step_stays_capped_at_max_interval() {
+        let mut now = Instant::now();
+        let mut scheduler = DemandScheduler::new(
+            Duration::from_secs(60),
+            Duration::from_secs(8),
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+        );
+        let hash = info_hash(10);
+
+        assert_eq!(scheduler.no_connected_peers_backoff_step_cap(), 3);
+
+        scheduler.register(hash, demand(false, 0), now);
+        for _ in 0..8 {
+            assert_eq!(scheduler.take_due(now, 8), vec![hash]);
+            scheduler.finish_with_mode(
+                hash,
+                now,
+                DemandFinishMode::AcceleratedNoConnectedPeersBackoff,
+            );
+            let snapshot = scheduler.entry_snapshot(hash).expect("demand entry");
+            assert!(snapshot.no_connected_peers_backoff_step <= 3);
+            now = snapshot.next_eligible_at;
+        }
+
+        assert_eq!(
+            scheduler
+                .entry_snapshot(hash)
+                .expect("demand entry")
+                .no_connected_peers_backoff_step,
+            3
         );
     }
 }
