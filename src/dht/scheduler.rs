@@ -19,6 +19,32 @@ pub(super) struct DueDemandCandidate {
     pub subscriber_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DemandEntrySnapshot {
+    pub info_hash: InfoHash,
+    pub demand: DhtDemandState,
+    pub next_eligible_at: Instant,
+    pub subscriber_count: usize,
+    pub in_progress: bool,
+    pub retrigger_pending: bool,
+    pub no_connected_peers_backoff_step: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DemandFinishMode {
+    Standard,
+    AcceleratedNoConnectedPeersBackoff,
+}
+
+impl DemandFinishMode {
+    fn no_connected_peers_backoff_extra_steps(self) -> u8 {
+        match self {
+            Self::Standard => 0,
+            Self::AcceleratedNoConnectedPeersBackoff => 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum DemandClass {
     RoutineRefresh,
@@ -160,6 +186,35 @@ impl DemandScheduler {
         self.entries.get(&info_hash).map(|entry| entry.demand)
     }
 
+    pub(super) fn entry_snapshot(&self, info_hash: InfoHash) -> Option<DemandEntrySnapshot> {
+        self.entries
+            .get(&info_hash)
+            .map(|entry| DemandEntrySnapshot {
+                info_hash,
+                demand: entry.demand,
+                next_eligible_at: entry.next_eligible_at,
+                subscriber_count: entry.subscriber_count,
+                in_progress: entry.in_progress,
+                retrigger_pending: entry.retrigger_pending,
+                no_connected_peers_backoff_step: entry.no_connected_peers_backoff_step,
+            })
+    }
+
+    pub(super) fn entry_snapshots(&self) -> Vec<DemandEntrySnapshot> {
+        self.entries
+            .iter()
+            .map(|(info_hash, entry)| DemandEntrySnapshot {
+                info_hash: *info_hash,
+                demand: entry.demand,
+                next_eligible_at: entry.next_eligible_at,
+                subscriber_count: entry.subscriber_count,
+                in_progress: entry.in_progress,
+                retrigger_pending: entry.retrigger_pending,
+                no_connected_peers_backoff_step: entry.no_connected_peers_backoff_step,
+            })
+            .collect()
+    }
+
     pub(super) fn due_candidates(&self, now: Instant) -> Vec<DueDemandCandidate> {
         let mut due = self
             .entries
@@ -218,6 +273,15 @@ impl DemandScheduler {
     }
 
     pub(super) fn finish(&mut self, info_hash: InfoHash, now: Instant) {
+        self.finish_with_mode(info_hash, now, DemandFinishMode::Standard);
+    }
+
+    pub(super) fn finish_with_mode(
+        &mut self,
+        info_hash: InfoHash,
+        now: Instant,
+        mode: DemandFinishMode,
+    ) {
         let Some((retrigger_pending, demand, no_connected_peers_backoff_step)) =
             self.entries.get(&info_hash).map(|entry| {
                 (
@@ -229,12 +293,19 @@ impl DemandScheduler {
         else {
             return;
         };
+        let demand_class = DemandClass::from_demand(demand);
+        let effective_no_connected_peers_backoff_step =
+            if demand_class == DemandClass::NoConnectedPeers {
+                no_connected_peers_backoff_step
+                    .saturating_add(mode.no_connected_peers_backoff_extra_steps())
+            } else {
+                no_connected_peers_backoff_step
+            };
         let next_eligible_at = if retrigger_pending {
             now
         } else {
-            now + self.interval_for_demand(demand, no_connected_peers_backoff_step)
+            now + self.interval_for_demand(demand, effective_no_connected_peers_backoff_step)
         };
-        let demand_class = DemandClass::from_demand(demand);
         let next_interval = next_eligible_at.saturating_duration_since(now);
 
         let Some(entry) = self.entries.get_mut(&info_hash) else {
@@ -250,7 +321,9 @@ impl DemandScheduler {
         if demand_class == DemandClass::NoConnectedPeers {
             if next_interval < self.no_connected_peers_max_interval {
                 entry.no_connected_peers_backoff_step =
-                    entry.no_connected_peers_backoff_step.saturating_add(1);
+                    effective_no_connected_peers_backoff_step.saturating_add(1);
+            } else {
+                entry.no_connected_peers_backoff_step = effective_no_connected_peers_backoff_step;
             }
         } else {
             entry.no_connected_peers_backoff_step = 0;
@@ -435,6 +508,42 @@ mod tests {
             .is_empty());
         assert_eq!(
             scheduler.take_due(now + Duration::from_secs(116), 8),
+            vec![hash]
+        );
+    }
+
+    #[test]
+    fn accelerated_no_connected_peers_backoff_skips_one_step() {
+        let now = Instant::now();
+        let mut scheduler = DemandScheduler::new(
+            Duration::from_secs(60),
+            Duration::from_secs(8),
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+        );
+        let hash = info_hash(9);
+
+        scheduler.register(hash, demand(false, 0), now);
+        assert_eq!(scheduler.take_due(now, 8), vec![hash]);
+        scheduler.finish_with_mode(
+            hash,
+            now,
+            DemandFinishMode::AcceleratedNoConnectedPeersBackoff,
+        );
+        assert!(scheduler
+            .take_due(now + Duration::from_secs(15), 8)
+            .is_empty());
+        assert_eq!(
+            scheduler.take_due(now + Duration::from_secs(16), 8),
+            vec![hash]
+        );
+
+        scheduler.finish(hash, now + Duration::from_secs(16));
+        assert!(scheduler
+            .take_due(now + Duration::from_secs(47), 8)
+            .is_empty());
+        assert_eq!(
+            scheduler.take_due(now + Duration::from_secs(48), 8),
             vec![hash]
         );
     }

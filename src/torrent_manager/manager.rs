@@ -98,6 +98,16 @@ const ACTIVITY_MESSAGE_MAX_LEN: usize = 28;
 const BASE_BACKOFF_MS: u64 = 1000;
 const JITTER_MS: u64 = 100;
 
+#[cfg(feature = "dht")]
+fn dht_demand_log_enabled() -> bool {
+    std::env::var_os("SUPERSEEDR_DHT_DEMAND_LOG").is_some()
+}
+
+#[cfg(feature = "dht")]
+fn short_info_hash_hex(info_hash: &[u8]) -> String {
+    hex::encode(&info_hash[..info_hash.len().min(4)])
+}
+
 struct PreparedFileProbeEntry {
     relative_path: std::path::PathBuf,
     absolute_path: std::path::PathBuf,
@@ -194,9 +204,21 @@ impl TorrentManager {
             return;
         }
 
-        let _ = self
+        let previous_demand = self.dht_demand_state;
+        let update_sent = self
             .dht_handle
             .update_demand(self.state.info_hash.clone(), desired_demand);
+        if dht_demand_log_enabled() {
+            tracing::info!(
+                target: "superseedr::dht_demand",
+                info_hash = %short_info_hash_hex(&self.state.info_hash),
+                previous = ?previous_demand,
+                desired = ?desired_demand,
+                torrent_status = ?self.state.torrent_status,
+                dht_update_sent = update_sent,
+                "torrent manager dht demand sync"
+            );
+        }
         self.dht_demand_state = Some(desired_demand);
     }
 
@@ -1705,6 +1727,15 @@ impl TorrentManager {
         ) {
             self.dht_task_handle = Some(handle);
             self.dht_demand_state = Some(demand_state);
+            if dht_demand_log_enabled() {
+                tracing::info!(
+                    target: "superseedr::dht_demand",
+                    info_hash = %short_info_hash_hex(&self.state.info_hash),
+                    demand = ?demand_state,
+                    torrent_status = ?self.state.torrent_status,
+                    "torrent manager dht demand registered"
+                );
+            }
         }
     }
 

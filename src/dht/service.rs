@@ -4,7 +4,9 @@
 use super::lookup::LookupQualitySnapshot;
 use super::persist::{PersistenceConfig, PersistenceManager};
 pub use super::scheduler::DhtDemandState;
-use super::scheduler::{DemandScheduler, DueDemandCandidate};
+use super::scheduler::{
+    DemandEntrySnapshot, DemandFinishMode, DemandScheduler, DueDemandCandidate,
+};
 use super::types::{AddressFamily, InfoHash, LookupId, NodeId};
 use super::{LookupState, Runtime, RuntimeConfig};
 use crate::config::{self, Settings};
@@ -31,11 +33,11 @@ const DHT_NO_CONNECTED_PEERS_MAX_INTERVAL: Duration = DHT_ROUTINE_LOOKUP_REFRESH
 const DHT_AWAITING_METADATA_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const DHT_HEALTH_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const DHT_DEMAND_SCHEDULER_INTERVAL: Duration = Duration::from_millis(250);
-const DHT_DEMAND_LOOKUP_BASE_SLOT_COUNT: usize = 8;
-const DHT_DEMAND_LOOKUP_OLDEST_RESERVE_SLOT_COUNT: usize = 1;
-const DHT_DEMAND_LOOKUP_SLOT_COUNT: usize =
-    DHT_DEMAND_LOOKUP_BASE_SLOT_COUNT + DHT_DEMAND_LOOKUP_OLDEST_RESERVE_SLOT_COUNT;
+const DHT_DEMAND_LOOKUP_SLOT_COUNT: usize = 8;
 const DHT_DEMAND_LOOKUP_SLOT_FILL_PER_TICK: usize = 4;
+const DHT_DEMAND_SPARE_RESEARCH_MAX_ACTIVE: usize = 1;
+const DHT_DEMAND_SPARE_RESEARCH_LAUNCH_LIMIT: usize = 1;
+const DHT_DEMAND_SPARE_RESEARCH_MIN_INTERVAL: Duration = Duration::from_secs(20);
 const DHT_AWAITING_METADATA_SLOT_CAP: usize = DHT_DEMAND_LOOKUP_SLOT_COUNT;
 const DHT_NO_CONNECTED_PEERS_SLOT_CAP: usize = 7;
 const DHT_ROUTINE_LOOKUP_SLOT_CAP: usize = 2;
@@ -301,6 +303,7 @@ struct DemandCrawlState {
     updated_at: Instant,
     reset_count: u32,
     consecutive_stalled_low_yield_slices: u32,
+    consecutive_healthy_zero_yield_slices: u32,
 }
 
 impl DemandCrawlState {
@@ -312,6 +315,7 @@ impl DemandCrawlState {
             updated_at: now,
             reset_count: 0,
             consecutive_stalled_low_yield_slices: 0,
+            consecutive_healthy_zero_yield_slices: 0,
         }
     }
 
@@ -371,31 +375,34 @@ impl DemandCrawlState {
         self.updated_at = now;
         self.reset_count = self.reset_count.saturating_add(1);
         self.consecutive_stalled_low_yield_slices = 0;
+        self.consecutive_healthy_zero_yield_slices = 0;
     }
 
-    fn observe_parked_slice(
-        &mut self,
-        class: DemandSliceClass,
-        stop_reason: DemandSliceStopReason,
-        unique_peers: usize,
-        weak_parked_state: bool,
-    ) {
+    fn observe_parked_slice(&mut self, class: DemandSliceClass, outcome: DemandParkedSliceOutcome) {
         if self.class != class {
             self.class = class;
             self.consecutive_stalled_low_yield_slices = 0;
+            self.consecutive_healthy_zero_yield_slices = 0;
         }
         self.class = class;
         self.updated_at = Instant::now();
-        if (unique_peers <= class.stalled_low_yield_slice_max_unique_peers() || weak_parked_state)
-            && matches!(
-                stop_reason,
-                DemandSliceStopReason::WallTime | DemandSliceStopReason::IdleTimeout
-            )
-        {
-            self.consecutive_stalled_low_yield_slices =
-                self.consecutive_stalled_low_yield_slices.saturating_add(1);
-        } else {
-            self.consecutive_stalled_low_yield_slices = 0;
+        match outcome {
+            DemandParkedSliceOutcome::WeakLowYield => {
+                self.consecutive_stalled_low_yield_slices =
+                    self.consecutive_stalled_low_yield_slices.saturating_add(1);
+                self.consecutive_healthy_zero_yield_slices = 0;
+            }
+            DemandParkedSliceOutcome::HealthyZeroYield => {
+                self.consecutive_stalled_low_yield_slices = 0;
+                self.consecutive_healthy_zero_yield_slices =
+                    self.consecutive_healthy_zero_yield_slices.saturating_add(1);
+            }
+            DemandParkedSliceOutcome::HealthyLowYield
+            | DemandParkedSliceOutcome::UsefulYield
+            | DemandParkedSliceOutcome::Ignored => {
+                self.consecutive_stalled_low_yield_slices = 0;
+                self.consecutive_healthy_zero_yield_slices = 0;
+            }
         }
     }
 }
@@ -444,6 +451,34 @@ impl DemandSliceClass {
         }
     }
 
+    fn parked_slice_outcome(
+        self,
+        stop_reason: DemandSliceStopReason,
+        unique_peers: usize,
+        weak_parked_state: bool,
+    ) -> DemandParkedSliceOutcome {
+        if !matches!(
+            stop_reason,
+            DemandSliceStopReason::WallTime | DemandSliceStopReason::IdleTimeout
+        ) {
+            return if unique_peers > 0 {
+                DemandParkedSliceOutcome::UsefulYield
+            } else {
+                DemandParkedSliceOutcome::Ignored
+            };
+        }
+
+        if unique_peers > self.stalled_low_yield_slice_max_unique_peers() {
+            DemandParkedSliceOutcome::UsefulYield
+        } else if weak_parked_state {
+            DemandParkedSliceOutcome::WeakLowYield
+        } else if unique_peers == 0 {
+            DemandParkedSliceOutcome::HealthyZeroYield
+        } else {
+            DemandParkedSliceOutcome::HealthyLowYield
+        }
+    }
+
     fn parked_quality_is_weak(self, snapshot: AggregateLookupQualitySnapshot) -> bool {
         match self {
             DemandSliceClass::AwaitingMetadata => false,
@@ -488,6 +523,17 @@ impl AggregateLookupQualitySnapshot {
     }
 }
 
+fn aggregate_parked_crawl_quality(crawl: &DemandCrawlState) -> AggregateLookupQualitySnapshot {
+    let mut aggregate = AggregateLookupQualitySnapshot::default();
+    if let Some(state) = crawl.ipv4.as_ref() {
+        aggregate.extend(state.quality_snapshot());
+    }
+    if let Some(state) = crawl.ipv6.as_ref() {
+        aggregate.extend(state.quality_snapshot());
+    }
+    aggregate
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DemandSliceStopReason {
     NaturalFinish,
@@ -495,6 +541,15 @@ enum DemandSliceStopReason {
     IdleTimeout,
     FirstBatch,
     UniquePeerCap,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DemandParkedSliceOutcome {
+    UsefulYield,
+    WeakLowYield,
+    HealthyZeroYield,
+    HealthyLowYield,
+    Ignored,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -509,6 +564,7 @@ enum DemandSelectionReason {
     ReusableParked,
     UsefulYieldHistory,
     OverdueScarce,
+    SpareCapacity,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -518,6 +574,7 @@ struct DemandSliceClassMetrics {
     selected_reusable_parked: u64,
     selected_useful_yield_history: u64,
     selected_overdue_scarce: u64,
+    selected_spare_capacity: u64,
     natural_finishes: u64,
     wall_time_stops: u64,
     idle_timeout_stops: u64,
@@ -576,6 +633,9 @@ impl DemandSliceMetrics {
             }
             DemandSelectionReason::OverdueScarce => {
                 metrics.selected_overdue_scarce = metrics.selected_overdue_scarce.saturating_add(1)
+            }
+            DemandSelectionReason::SpareCapacity => {
+                metrics.selected_spare_capacity = metrics.selected_spare_capacity.saturating_add(1)
             }
         }
     }
@@ -638,6 +698,7 @@ impl DemandSliceMetrics {
                 || metrics.selected_reusable_parked > 0
                 || metrics.selected_useful_yield_history > 0
                 || metrics.selected_overdue_scarce > 0
+                || metrics.selected_spare_capacity > 0
                 || metrics.natural_finishes > 0
                 || metrics.wall_time_stops > 0
                 || metrics.idle_timeout_stops > 0
@@ -658,12 +719,13 @@ impl DemandSliceMetrics {
     fn summary(&self) -> String {
         fn fmt(label: &str, metrics: &DemandSliceClassMetrics) -> String {
             format!(
-                "{label}(fresh={} resumed={} sel_reuse={} sel_yield={} sel_due={} natural={} wall={} idle={} first={} cap={} peers={} unique={} reset_stale={} reset_class={} reset_quality={})",
+                "{label}(fresh={} resumed={} sel_reuse={} sel_yield={} sel_due={} sel_spare={} natural={} wall={} idle={} first={} cap={} peers={} unique={} reset_stale={} reset_class={} reset_quality={})",
                 metrics.fresh_starts,
                 metrics.resumed_starts,
                 metrics.selected_reusable_parked,
                 metrics.selected_useful_yield_history,
                 metrics.selected_overdue_scarce,
+                metrics.selected_spare_capacity,
                 metrics.natural_finishes,
                 metrics.wall_time_stops,
                 metrics.idle_timeout_stops,
@@ -684,6 +746,179 @@ impl DemandSliceMetrics {
         ]
         .join(" ")
     }
+}
+
+fn short_info_hash_hex(info_hash: InfoHash) -> String {
+    hex::encode(&info_hash.as_ref()[..4])
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn due_in_ms(snapshot: DemandEntrySnapshot, now: Instant) -> u64 {
+    duration_ms(snapshot.next_eligible_at.saturating_duration_since(now))
+}
+
+fn demand_slice_class_label(class: DemandSliceClass) -> &'static str {
+    match class {
+        DemandSliceClass::AwaitingMetadata => "awaiting_metadata",
+        DemandSliceClass::NoConnectedPeers => "no_connected_peers",
+        DemandSliceClass::RoutineRefresh => "routine_refresh",
+    }
+}
+
+fn demand_selection_reason_label(reason: DemandSelectionReason) -> &'static str {
+    match reason {
+        DemandSelectionReason::ReusableParked => "reusable_parked",
+        DemandSelectionReason::UsefulYieldHistory => "useful_yield_history",
+        DemandSelectionReason::OverdueScarce => "overdue_scarce",
+        DemandSelectionReason::SpareCapacity => "spare_capacity",
+    }
+}
+
+fn demand_stop_reason_label(reason: DemandSliceStopReason) -> &'static str {
+    match reason {
+        DemandSliceStopReason::NaturalFinish => "natural_finish",
+        DemandSliceStopReason::WallTime => "wall_time",
+        DemandSliceStopReason::IdleTimeout => "idle_timeout",
+        DemandSliceStopReason::FirstBatch => "first_batch",
+        DemandSliceStopReason::UniquePeerCap => "unique_peer_cap",
+    }
+}
+
+fn demand_parked_slice_outcome_label(outcome: DemandParkedSliceOutcome) -> &'static str {
+    match outcome {
+        DemandParkedSliceOutcome::UsefulYield => "useful_yield",
+        DemandParkedSliceOutcome::WeakLowYield => "weak_low_yield",
+        DemandParkedSliceOutcome::HealthyZeroYield => "healthy_zero_yield",
+        DemandParkedSliceOutcome::HealthyLowYield => "healthy_low_yield",
+        DemandParkedSliceOutcome::Ignored => "ignored",
+    }
+}
+
+fn demand_reset_reason_label(reason: DemandCrawlResetReason) -> &'static str {
+    match reason {
+        DemandCrawlResetReason::Stale => "stale",
+        DemandCrawlResetReason::ClassChanged => "class_changed",
+        DemandCrawlResetReason::LowQuality => "low_quality",
+    }
+}
+
+fn demand_diagnostics_log_enabled() -> bool {
+    env::var_os("SUPERSEEDR_DHT_DEMAND_LOG").is_some()
+}
+
+fn snapshot_class_label(snapshot: Option<DemandEntrySnapshot>) -> &'static str {
+    snapshot
+        .map(|snapshot| demand_slice_class_label(DemandSliceClass::from_demand(snapshot.demand)))
+        .unwrap_or("none")
+}
+
+fn log_demand_state_event(
+    action: &'static str,
+    info_hash: InfoHash,
+    requested_demand: Option<DhtDemandState>,
+    before: Option<DemandEntrySnapshot>,
+    after: Option<DemandEntrySnapshot>,
+    demand_lookup_ids: &HashMap<InfoHash, ActiveDemandLookup>,
+    parked_crawls: &HashMap<InfoHash, DemandCrawlState>,
+    now: Instant,
+) {
+    let active_lookup_class = demand_lookup_ids
+        .get(&info_hash)
+        .map(|lookup| demand_slice_class_label(lookup.slice_class))
+        .unwrap_or("none");
+    let parked_class = parked_crawls
+        .get(&info_hash)
+        .map(|crawl| demand_slice_class_label(crawl.class))
+        .unwrap_or("none");
+
+    tracing::info!(
+        target: "superseedr::dht_demand",
+        action = action,
+        info_hash = %short_info_hash_hex(info_hash),
+        requested_demand = ?requested_demand,
+        previous_demand = ?before.map(|snapshot| snapshot.demand),
+        current_demand = ?after.map(|snapshot| snapshot.demand),
+        previous_class = snapshot_class_label(before),
+        current_class = snapshot_class_label(after),
+        current_subscribers = after.map(|snapshot| snapshot.subscriber_count).unwrap_or(0),
+        current_in_progress = after.map(|snapshot| snapshot.in_progress).unwrap_or(false),
+        current_retrigger_pending = after.map(|snapshot| snapshot.retrigger_pending).unwrap_or(false),
+        current_no_peers_backoff_step = after
+            .map(|snapshot| snapshot.no_connected_peers_backoff_step)
+            .unwrap_or(0),
+        current_due_in_ms = after.map(|snapshot| due_in_ms(snapshot, now)).unwrap_or(0),
+        active_lookup_class,
+        parked_class,
+        "dht demand state"
+    );
+}
+
+fn log_demand_scheduler_summary(
+    demand_scheduler: &DemandScheduler,
+    demand_lookup_ids: &HashMap<InfoHash, ActiveDemandLookup>,
+    parked_crawls: &HashMap<InfoHash, DemandCrawlState>,
+    now: Instant,
+) {
+    let mut entries = DemandSlotCounts::default();
+    let mut due = DemandSlotCounts::default();
+    let mut in_progress = DemandSlotCounts::default();
+    let mut retrigger_pending = 0usize;
+    let mut subscribers = 0usize;
+    let mut max_no_peers_backoff_step = 0u8;
+    let mut next_due_ms: Option<u64> = None;
+
+    for snapshot in demand_scheduler.entry_snapshots() {
+        let class = DemandSliceClass::from_demand(snapshot.demand);
+        entries.record(class);
+        subscribers = subscribers.saturating_add(snapshot.subscriber_count);
+        max_no_peers_backoff_step =
+            max_no_peers_backoff_step.max(snapshot.no_connected_peers_backoff_step);
+        if snapshot.in_progress {
+            in_progress.record(class);
+        }
+        if snapshot.retrigger_pending {
+            retrigger_pending = retrigger_pending.saturating_add(1);
+        }
+        if snapshot.subscriber_count > 0 && !snapshot.in_progress {
+            if snapshot.next_eligible_at <= now {
+                due.record(class);
+            } else {
+                let candidate_due_ms = due_in_ms(snapshot, now);
+                next_due_ms = Some(
+                    next_due_ms.map_or(candidate_due_ms, |current| current.min(candidate_due_ms)),
+                );
+            }
+        }
+    }
+
+    let active = active_demand_lookup_slot_counts(demand_lookup_ids);
+    tracing::info!(
+        target: "superseedr::dht_demand",
+        entries_total = entries.total(),
+        entries_awaiting = entries.awaiting_metadata,
+        entries_no_peers = entries.no_connected_peers,
+        entries_routine = entries.routine_refresh,
+        subscribers,
+        due_total = due.total(),
+        due_awaiting = due.awaiting_metadata,
+        due_no_peers = due.no_connected_peers,
+        due_routine = due.routine_refresh,
+        active_total = active.total(),
+        active_awaiting = active.awaiting_metadata,
+        active_no_peers = active.no_connected_peers,
+        active_routine = active.routine_refresh,
+        retrigger_pending,
+        parked = parked_crawls.len(),
+        launch_budget = demand_lookup_launch_budget(demand_lookup_ids),
+        next_due_ms = next_due_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        max_no_peers_backoff_step,
+        "dht demand summary"
+    );
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1388,6 +1623,7 @@ async fn run_service(
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
     let slice_metrics_log_enabled = env::var_os("SUPERSEEDR_DHT_SLICE_LOG").is_some();
+    let demand_log_enabled = env::var_os("SUPERSEEDR_DHT_DEMAND_LOG").is_some();
     let mut demand_tick = tokio::time::interval(DHT_DEMAND_SCHEDULER_INTERVAL);
     demand_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut maintenance_interval = tokio::time::interval(DHT_MAINTENANCE_INTERVAL);
@@ -1487,6 +1723,7 @@ async fn run_service(
                     &mut parked_crawls,
                     &mut planner_state,
                     &mut slice_metrics,
+                    demand_log_enabled,
                 )
                 .await;
             }
@@ -1502,7 +1739,25 @@ async fn run_service(
                     .entry(info_hash)
                     .or_default()
                     .insert(subscriber_id, subscriber_tx);
-                demand_scheduler.register(info_hash, demand, Instant::now());
+                let now = Instant::now();
+                let previous = if demand_log_enabled {
+                    demand_scheduler.entry_snapshot(info_hash)
+                } else {
+                    None
+                };
+                demand_scheduler.register(info_hash, demand, now);
+                if demand_log_enabled {
+                    log_demand_state_event(
+                        "register",
+                        info_hash,
+                        Some(demand),
+                        previous,
+                        demand_scheduler.entry_snapshot(info_hash),
+                        &demand_lookup_ids,
+                        &parked_crawls,
+                        now,
+                    );
+                }
                 let _ = response_tx.send(Some(subscriber_id));
                 start_due_demands(
                     active_runtime.as_mut(),
@@ -1512,11 +1767,30 @@ async fn run_service(
                     &mut parked_crawls,
                     &mut planner_state,
                     &mut slice_metrics,
+                    demand_log_enabled,
                 )
                 .await;
             }
             LoopEvent::Command(DhtCommand::UpdateDemand { info_hash, demand }) => {
-                demand_scheduler.update(info_hash, demand, Instant::now());
+                let now = Instant::now();
+                let previous = if demand_log_enabled {
+                    demand_scheduler.entry_snapshot(info_hash)
+                } else {
+                    None
+                };
+                demand_scheduler.update(info_hash, demand, now);
+                if demand_log_enabled {
+                    log_demand_state_event(
+                        "update",
+                        info_hash,
+                        Some(demand),
+                        previous,
+                        demand_scheduler.entry_snapshot(info_hash),
+                        &demand_lookup_ids,
+                        &parked_crawls,
+                        now,
+                    );
+                }
                 start_due_demands(
                     active_runtime.as_mut(),
                     &command_tx,
@@ -1525,6 +1799,7 @@ async fn run_service(
                     &mut parked_crawls,
                     &mut planner_state,
                     &mut slice_metrics,
+                    demand_log_enabled,
                 )
                 .await;
             }
@@ -1556,14 +1831,43 @@ async fn run_service(
                         );
                     }
                 }
+                if demand_log_enabled && removed {
+                    log_demand_state_event(
+                        "unregister",
+                        info_hash,
+                        None,
+                        None,
+                        demand_scheduler.entry_snapshot(info_hash),
+                        &demand_lookup_ids,
+                        &parked_crawls,
+                        Instant::now(),
+                    );
+                }
             }
             LoopEvent::Command(DhtCommand::DemandPeers { info_hash, peers }) => {
                 recent_unique_peers.record_batch(Instant::now(), &peers);
                 let Some(subscribers) = demand_subscribers.get_mut(&info_hash) else {
+                    if demand_log_enabled {
+                        tracing::info!(
+                            target: "superseedr::dht_demand",
+                            info_hash = %short_info_hash_hex(info_hash),
+                            peers = peers.len(),
+                            "dht demand peers dropped without subscribers"
+                        );
+                    }
                     continue;
                 };
 
                 let subscriber_count_before = subscribers.len();
+                if demand_log_enabled {
+                    tracing::info!(
+                        target: "superseedr::dht_demand",
+                        info_hash = %short_info_hash_hex(info_hash),
+                        peers = peers.len(),
+                        subscriber_count = subscriber_count_before,
+                        "dht demand peers"
+                    );
+                }
                 subscribers.retain(|_, subscriber_tx| subscriber_tx.send(peers.clone()).is_ok());
                 let removed = subscriber_count_before.saturating_sub(subscribers.len());
                 let mut drained = false;
@@ -1593,6 +1897,18 @@ async fn run_service(
                         }
                     }
                 }
+                if demand_log_enabled && removed > 0 {
+                    log_demand_state_event(
+                        "subscriber_prune",
+                        info_hash,
+                        None,
+                        None,
+                        demand_scheduler.entry_snapshot(info_hash),
+                        &demand_lookup_ids,
+                        &parked_crawls,
+                        Instant::now(),
+                    );
+                }
             }
             LoopEvent::Command(DhtCommand::DemandLookupFinished {
                 info_hash,
@@ -1600,6 +1916,11 @@ async fn run_service(
                 total_peers,
                 unique_peers,
             }) => {
+                let previous = if demand_log_enabled {
+                    demand_scheduler.entry_snapshot(info_hash)
+                } else {
+                    None
+                };
                 demand_lookup_ids.remove(&info_hash);
                 planner_state
                     .entry(info_hash)
@@ -1611,7 +1932,29 @@ async fn run_service(
                     total_peers,
                     unique_peers,
                 );
-                demand_scheduler.finish(info_hash, Instant::now());
+                let now = Instant::now();
+                demand_scheduler.finish(info_hash, now);
+                if demand_log_enabled {
+                    tracing::info!(
+                        target: "superseedr::dht_demand",
+                        info_hash = %short_info_hash_hex(info_hash),
+                        class = demand_slice_class_label(slice_class),
+                        stop_reason = demand_stop_reason_label(DemandSliceStopReason::NaturalFinish),
+                        total_peers,
+                        unique_peers,
+                        "dht demand lookup stopped"
+                    );
+                    log_demand_state_event(
+                        "finish",
+                        info_hash,
+                        None,
+                        previous,
+                        demand_scheduler.entry_snapshot(info_hash),
+                        &demand_lookup_ids,
+                        &parked_crawls,
+                        now,
+                    );
+                }
                 start_due_demands(
                     active_runtime.as_mut(),
                     &command_tx,
@@ -1620,6 +1963,7 @@ async fn run_service(
                     &mut parked_crawls,
                     &mut planner_state,
                     &mut slice_metrics,
+                    demand_log_enabled,
                 )
                 .await;
             }
@@ -1680,13 +2024,18 @@ async fn run_service(
                 unique_peers,
                 lookup_ids,
             }) => {
+                let previous = if demand_log_enabled {
+                    demand_scheduler.entry_snapshot(info_hash)
+                } else {
+                    None
+                };
                 demand_lookup_ids.remove(&info_hash);
                 planner_state
                     .entry(info_hash)
                     .or_default()
                     .note_finish(Instant::now(), unique_peers);
                 slice_metrics.record_stop(slice_class, stop_reason, total_peers, unique_peers);
-                park_lookup_ids(
+                let parked_outcome = park_lookup_ids(
                     active_runtime.as_mut(),
                     &mut parked_crawls,
                     info_hash,
@@ -1695,7 +2044,43 @@ async fn run_service(
                     unique_peers,
                     lookup_ids,
                 );
-                demand_scheduler.finish(info_hash, Instant::now());
+                let now = Instant::now();
+                let finish_mode = if slice_class == DemandSliceClass::NoConnectedPeers
+                    && parked_outcome == Some(DemandParkedSliceOutcome::HealthyZeroYield)
+                {
+                    DemandFinishMode::AcceleratedNoConnectedPeersBackoff
+                } else {
+                    DemandFinishMode::Standard
+                };
+                demand_scheduler.finish_with_mode(info_hash, now, finish_mode);
+                if demand_log_enabled {
+                    tracing::info!(
+                        target: "superseedr::dht_demand",
+                        info_hash = %short_info_hash_hex(info_hash),
+                        class = demand_slice_class_label(slice_class),
+                        stop_reason = demand_stop_reason_label(stop_reason),
+                        parked_outcome = parked_outcome
+                            .map(demand_parked_slice_outcome_label)
+                            .unwrap_or("none"),
+                        accelerated_no_peers_backoff = matches!(
+                            finish_mode,
+                            DemandFinishMode::AcceleratedNoConnectedPeersBackoff
+                        ),
+                        total_peers,
+                        unique_peers,
+                        "dht demand lookup stopped"
+                    );
+                    log_demand_state_event(
+                        "park",
+                        info_hash,
+                        None,
+                        previous,
+                        demand_scheduler.entry_snapshot(info_hash),
+                        &demand_lookup_ids,
+                        &parked_crawls,
+                        now,
+                    );
+                }
                 start_due_demands(
                     active_runtime.as_mut(),
                     &command_tx,
@@ -1704,6 +2089,7 @@ async fn run_service(
                     &mut parked_crawls,
                     &mut planner_state,
                     &mut slice_metrics,
+                    demand_log_enabled,
                 )
                 .await;
             }
@@ -1724,6 +2110,7 @@ async fn run_service(
                     &mut parked_crawls,
                     &mut planner_state,
                     &mut slice_metrics,
+                    demand_log_enabled,
                 )
                 .await;
             }
@@ -1759,6 +2146,14 @@ async fn run_service(
                         target: "superseedr::dht_slice",
                         summary = %slice_metrics.summary(),
                         "DHT slice metrics"
+                    );
+                }
+                if demand_log_enabled {
+                    log_demand_scheduler_summary(
+                        &demand_scheduler,
+                        &demand_lookup_ids,
+                        &parked_crawls,
+                        Instant::now(),
                     );
                 }
             }
@@ -1883,6 +2278,27 @@ fn take_parked_family_state(
     let mut remove_entry = false;
     let state = parked_crawls.get_mut(&info_hash).and_then(|crawl| {
         if let Some(reason) = crawl.reset_reason_for(slice_class, now) {
+            if demand_diagnostics_log_enabled() {
+                let quality = aggregate_parked_crawl_quality(crawl);
+                tracing::info!(
+                    target: "superseedr::dht_demand",
+                    info_hash = %short_info_hash_hex(info_hash),
+                    requested_class = demand_slice_class_label(slice_class),
+                    previous_class = demand_slice_class_label(crawl.class),
+                    reset_reason = demand_reset_reason_label(reason),
+                    requested_family = ?family,
+                    parked_age_ms = duration_ms(now.saturating_duration_since(crawl.updated_at)),
+                    low_yield_streak = crawl.consecutive_stalled_low_yield_slices,
+                    reset_count = crawl.reset_count,
+                    healthy_zero_yield_streak = crawl.consecutive_healthy_zero_yield_slices,
+                    frontier = quality.frontier_len,
+                    inflight = quality.inflight_len,
+                    visited = quality.visited_len,
+                    eligible_responders = quality.eligible_responder_count,
+                    received_peers = quality.received_peer_count,
+                    "dht demand parked crawl reset"
+                );
+            }
             if let Some(metrics) = slice_metrics.as_mut() {
                 metrics.record_reset(crawl.class, reason);
             }
@@ -1908,23 +2324,57 @@ fn store_parked_lookup_states(
     stop_reason: Option<DemandSliceStopReason>,
     unique_peers: usize,
     states: Vec<LookupState>,
-) {
+) -> Option<DemandParkedSliceOutcome> {
     if states.is_empty() {
-        return;
+        return None;
     }
 
     let now = Instant::now();
     let quality = aggregate_lookup_quality(&states);
     let weak_parked_state = slice_class.parked_quality_is_weak(quality);
+    let parked_outcome = stop_reason
+        .map(|reason| slice_class.parked_slice_outcome(reason, unique_peers, weak_parked_state));
     let crawl = parked_crawls
         .entry(info_hash)
         .or_insert_with(|| DemandCrawlState::new(now, slice_class));
-    if let Some(stop_reason) = stop_reason {
-        crawl.observe_parked_slice(slice_class, stop_reason, unique_peers, weak_parked_state);
+    let previous_low_yield_streak = crawl.consecutive_stalled_low_yield_slices;
+    let previous_healthy_zero_yield_streak = crawl.consecutive_healthy_zero_yield_slices;
+    let previous_reset_count = crawl.reset_count;
+    if let Some(outcome) = parked_outcome {
+        crawl.observe_parked_slice(slice_class, outcome);
+    }
+    if demand_diagnostics_log_enabled() {
+        tracing::info!(
+            target: "superseedr::dht_demand",
+            info_hash = %short_info_hash_hex(info_hash),
+            class = demand_slice_class_label(slice_class),
+            stop_reason = stop_reason
+                .map(demand_stop_reason_label)
+                .unwrap_or("none"),
+            unique_peers,
+            parked_outcome = parked_outcome
+                .map(demand_parked_slice_outcome_label)
+                .unwrap_or("none"),
+            state_count = states.len(),
+            frontier = quality.frontier_len,
+            inflight = quality.inflight_len,
+            visited = quality.visited_len,
+            eligible_responders = quality.eligible_responder_count,
+            received_peers = quality.received_peer_count,
+            weak_parked_state,
+            previous_low_yield_streak,
+            current_low_yield_streak = crawl.consecutive_stalled_low_yield_slices,
+            previous_healthy_zero_yield_streak,
+            current_healthy_zero_yield_streak = crawl.consecutive_healthy_zero_yield_slices,
+            reset_count = crawl.reset_count,
+            reset_count_delta = crawl.reset_count.saturating_sub(previous_reset_count),
+            "dht demand parked crawl quality"
+        );
     }
     for state in states {
         crawl.store_family_state(slice_class, state);
     }
+    parked_outcome
 }
 
 fn aggregate_lookup_quality(states: &[LookupState]) -> AggregateLookupQualitySnapshot {
@@ -1943,17 +2393,17 @@ fn park_lookup_ids(
     stop_reason: Option<DemandSliceStopReason>,
     unique_peers: usize,
     lookup_ids: Arc<StdMutex<Vec<LookupId>>>,
-) {
+) -> Option<DemandParkedSliceOutcome> {
     let lookup_ids = {
         let mut lookup_ids = lookup_ids.lock().expect("managed dht lookup ids lock");
         if lookup_ids.is_empty() {
-            return;
+            return None;
         }
         std::mem::take(&mut *lookup_ids)
     };
 
     let Some(active_runtime) = active_runtime else {
-        return;
+        return None;
     };
 
     let mut parked_states = Vec::new();
@@ -1973,7 +2423,7 @@ fn park_lookup_ids(
         stop_reason,
         unique_peers,
         parked_states,
-    );
+    )
 }
 
 fn evict_stale_parked_crawls(
@@ -2092,6 +2542,85 @@ fn candidate_selection_reason(
     }
 }
 
+fn candidate_last_activity_age(
+    planner_state: &HashMap<InfoHash, DemandPlannerState>,
+    info_hash: InfoHash,
+    now: Instant,
+) -> Option<Duration> {
+    planner_state.get(&info_hash).and_then(|state| {
+        state
+            .last_finished_at
+            .or(state.last_started_at)
+            .map(|at| now.saturating_duration_since(at))
+    })
+}
+
+fn spare_research_candidate_ready(
+    planner_state: &HashMap<InfoHash, DemandPlannerState>,
+    info_hash: InfoHash,
+    now: Instant,
+) -> bool {
+    candidate_last_activity_age(planner_state, info_hash, now)
+        .map(|age| age >= DHT_DEMAND_SPARE_RESEARCH_MIN_INTERVAL)
+        .unwrap_or(true)
+}
+
+fn select_spare_research_launches(
+    demand_snapshots: &[DemandEntrySnapshot],
+    active_counts: DemandSlotCounts,
+    parked_crawls: &HashMap<InfoHash, DemandCrawlState>,
+    planner_state: &HashMap<InfoHash, DemandPlannerState>,
+    now: Instant,
+    total_budget: usize,
+) -> Vec<DueDemandCandidate> {
+    if total_budget == 0 || active_counts.total() >= DHT_DEMAND_SPARE_RESEARCH_MAX_ACTIVE {
+        return Vec::new();
+    }
+
+    let take_count = total_budget.min(DHT_DEMAND_SPARE_RESEARCH_LAUNCH_LIMIT);
+    let mut candidates = demand_snapshots
+        .iter()
+        .copied()
+        .filter(|snapshot| {
+            snapshot.subscriber_count > 0
+                && !snapshot.in_progress
+                && snapshot.next_eligible_at > now
+                && DemandSliceClass::from_demand(snapshot.demand)
+                    == DemandSliceClass::NoConnectedPeers
+                && spare_research_candidate_ready(planner_state, snapshot.info_hash, now)
+        })
+        .map(|snapshot| DueDemandCandidate {
+            info_hash: snapshot.info_hash,
+            demand: snapshot.demand,
+            next_eligible_at: snapshot.next_eligible_at,
+            subscriber_count: snapshot.subscriber_count,
+        })
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|left, right| {
+        let left_activity_age = candidate_last_activity_age(planner_state, left.info_hash, now);
+        let right_activity_age = candidate_last_activity_age(planner_state, right.info_hash, now);
+        let left_reusable = due_candidate_has_reusable_parked_crawl(parked_crawls, *left, now);
+        let right_reusable = due_candidate_has_reusable_parked_crawl(parked_crawls, *right, now);
+        match (left_activity_age, right_activity_age) {
+            (Some(left_age), Some(right_age)) => right_age.cmp(&left_age),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+        .then_with(|| left.next_eligible_at.cmp(&right.next_eligible_at))
+        .then_with(|| right_reusable.cmp(&left_reusable))
+        .then_with(|| {
+            left.demand
+                .connected_peers
+                .cmp(&right.demand.connected_peers)
+        })
+        .then_with(|| right.subscriber_count.cmp(&left.subscriber_count))
+    });
+
+    candidates.into_iter().take(take_count).collect()
+}
+
 fn select_due_demand_launches(
     due_candidates: &[DueDemandCandidate],
     active_counts: DemandSlotCounts,
@@ -2103,13 +2632,6 @@ fn select_due_demand_launches(
     let mut selected = Vec::new();
     let mut planned_counts = active_counts;
     let mut remaining_candidates = due_candidates.to_vec();
-
-    if total_budget > 0 && active_counts.total() >= DHT_DEMAND_LOOKUP_BASE_SLOT_COUNT {
-        if let Some(oldest) = select_oldest_due_candidate(&remaining_candidates) {
-            selected.push(oldest);
-            remaining_candidates.retain(|candidate| candidate.info_hash != oldest.info_hash);
-        }
-    }
 
     for class in demand_lookup_planner_classes() {
         if selected.len() >= total_budget {
@@ -2163,7 +2685,17 @@ fn select_due_demand_launches(
         for candidate in class_candidates.into_iter().take(take_count) {
             planned_counts.record(class);
             selected.push(candidate);
+            remaining_candidates.retain(|remaining| remaining.info_hash != candidate.info_hash);
         }
+    }
+
+    while selected.len() < total_budget {
+        let Some(oldest) = select_oldest_due_candidate(&remaining_candidates) else {
+            break;
+        };
+        planned_counts.record(DemandSliceClass::from_demand(oldest.demand));
+        selected.push(oldest);
+        remaining_candidates.retain(|candidate| candidate.info_hash != oldest.info_hash);
     }
 
     selected
@@ -2177,6 +2709,7 @@ async fn start_due_demands(
     parked_crawls: &mut HashMap<InfoHash, DemandCrawlState>,
     planner_state: &mut HashMap<InfoHash, DemandPlannerState>,
     slice_metrics: &mut DemandSliceMetrics,
+    demand_log_enabled: bool,
 ) {
     let Some(active_runtime) = active_runtime else {
         return;
@@ -2189,24 +2722,94 @@ async fn start_due_demands(
     }
     let now = Instant::now();
     let active_counts = active_demand_lookup_slot_counts(demand_lookup_ids);
-    let due = select_due_demand_launches(
-        &demand_scheduler.due_candidates(now),
+    let due_candidates = demand_scheduler.due_candidates(now);
+    let demand_snapshots = demand_scheduler.entry_snapshots();
+    let due_launches = select_due_demand_launches(
+        &due_candidates,
         active_counts,
         parked_crawls,
         planner_state,
         now,
         launch_budget,
     );
-    for candidate in due {
-        if !demand_scheduler.mark_in_progress(candidate.info_hash) {
+    let mut planned_launches = due_launches
+        .into_iter()
+        .map(|candidate| {
+            (
+                candidate,
+                candidate_selection_reason(candidate, parked_crawls, planner_state, now),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    if planned_launches.is_empty() {
+        planned_launches = select_spare_research_launches(
+            &demand_snapshots,
+            active_counts,
+            parked_crawls,
+            planner_state,
+            now,
+            launch_budget,
+        )
+        .into_iter()
+        .map(|candidate| (candidate, DemandSelectionReason::SpareCapacity))
+        .collect();
+    }
+
+    if demand_log_enabled && !planned_launches.is_empty() {
+        let spare_selected = planned_launches
+            .iter()
+            .filter(|(_, reason)| *reason == DemandSelectionReason::SpareCapacity)
+            .count();
+        tracing::info!(
+            target: "superseedr::dht_demand",
+            launch_budget,
+            due_total = due_candidates.len(),
+            selected = planned_launches.len(),
+            spare_selected,
+            active_total = active_counts.total(),
+            active_awaiting = active_counts.awaiting_metadata,
+            active_no_peers = active_counts.no_connected_peers,
+            active_routine = active_counts.routine_refresh,
+            parked = parked_crawls.len(),
+            "dht demand launch batch"
+        );
+    }
+    for (candidate, selection_reason) in planned_launches {
+        let info_hash = candidate.info_hash;
+        if !demand_scheduler.mark_in_progress(info_hash) {
+            if demand_log_enabled {
+                tracing::info!(
+                    target: "superseedr::dht_demand",
+                    info_hash = %short_info_hash_hex(info_hash),
+                    demand = ?candidate.demand,
+                    "dht demand launch skipped after planner selection"
+                );
+            }
             continue;
         }
-        let info_hash = candidate.info_hash;
         let plan = DemandLookupPlan::for_demand(candidate.demand);
-        let selection_reason =
-            candidate_selection_reason(candidate, parked_crawls, planner_state, now);
         slice_metrics.record_selection(plan.class, selection_reason);
         planner_state.entry(info_hash).or_default().note_start(now);
+        if demand_log_enabled {
+            tracing::info!(
+                target: "superseedr::dht_demand",
+                info_hash = %short_info_hash_hex(info_hash),
+                class = demand_slice_class_label(plan.class),
+                selection_reason = demand_selection_reason_label(selection_reason),
+                awaiting_metadata = candidate.demand.awaiting_metadata,
+                connected_peers = candidate.demand.connected_peers,
+                subscribers = candidate.subscriber_count,
+                overdue_ms = duration_ms(now.saturating_duration_since(candidate.next_eligible_at)),
+                early_ms = duration_ms(candidate.next_eligible_at.saturating_duration_since(now)),
+                parked = parked_crawls.contains_key(&info_hash),
+                idle_timeout_ms = duration_ms(plan.idle_timeout),
+                max_wall_time_ms = duration_ms(plan.max_wall_time),
+                unique_peer_cap = plan.unique_peer_cap,
+                stop_after_first_batch = plan.stop_after_first_batch,
+                "dht demand launch"
+            );
+        }
         match start_get_peers_lookup(
             Some(active_runtime),
             command_tx,
@@ -2219,6 +2822,20 @@ async fn start_due_demands(
         .await
         {
             Ok(started) => {
+                if demand_log_enabled {
+                    let lookup_count = started
+                        .lookup_ids
+                        .lock()
+                        .expect("managed dht lookup ids lock")
+                        .len();
+                    tracing::info!(
+                        target: "superseedr::dht_demand",
+                        info_hash = %short_info_hash_hex(info_hash),
+                        class = demand_slice_class_label(plan.class),
+                        lookup_count,
+                        "dht demand launch started"
+                    );
+                }
                 demand_lookup_ids.insert(
                     info_hash,
                     ActiveDemandLookup {
@@ -2293,7 +2910,16 @@ async fn start_due_demands(
                     }
                 });
             }
-            Err(_) => {
+            Err(error) => {
+                if demand_log_enabled {
+                    tracing::info!(
+                        target: "superseedr::dht_demand",
+                        info_hash = %short_info_hash_hex(info_hash),
+                        class = demand_slice_class_label(plan.class),
+                        error = %error,
+                        "dht demand launch failed"
+                    );
+                }
                 demand_scheduler.finish(info_hash, Instant::now());
             }
         }
@@ -2866,9 +3492,31 @@ mod tests {
         let mut low_quality = DemandCrawlState::new(now, DemandSliceClass::RoutineRefresh);
         low_quality.observe_parked_slice(
             DemandSliceClass::RoutineRefresh,
-            DemandSliceStopReason::IdleTimeout,
-            0,
-            false,
+            DemandParkedSliceOutcome::HealthyZeroYield,
+        );
+        assert_eq!(
+            low_quality.reset_reason_for(
+                DemandSliceClass::RoutineRefresh,
+                now + Duration::from_secs(1)
+            ),
+            None
+        );
+        assert_eq!(low_quality.consecutive_healthy_zero_yield_slices, 1);
+        low_quality.observe_parked_slice(
+            DemandSliceClass::RoutineRefresh,
+            DemandParkedSliceOutcome::HealthyZeroYield,
+        );
+        assert_eq!(
+            low_quality.reset_reason_for(
+                DemandSliceClass::RoutineRefresh,
+                now + Duration::from_secs(1)
+            ),
+            None
+        );
+        assert_eq!(low_quality.consecutive_healthy_zero_yield_slices, 2);
+        low_quality.observe_parked_slice(
+            DemandSliceClass::RoutineRefresh,
+            DemandParkedSliceOutcome::WeakLowYield,
         );
         assert_eq!(
             low_quality.reset_reason_for(
@@ -2879,9 +3527,7 @@ mod tests {
         );
         low_quality.observe_parked_slice(
             DemandSliceClass::RoutineRefresh,
-            DemandSliceStopReason::WallTime,
-            0,
-            false,
+            DemandParkedSliceOutcome::WeakLowYield,
         );
         assert_eq!(
             low_quality.reset_reason_for(
@@ -2894,15 +3540,31 @@ mod tests {
         let mut no_peers_low_yield = DemandCrawlState::new(now, DemandSliceClass::NoConnectedPeers);
         no_peers_low_yield.observe_parked_slice(
             DemandSliceClass::NoConnectedPeers,
-            DemandSliceStopReason::IdleTimeout,
-            2,
-            false,
+            DemandParkedSliceOutcome::HealthyLowYield,
         );
         no_peers_low_yield.observe_parked_slice(
             DemandSliceClass::NoConnectedPeers,
-            DemandSliceStopReason::WallTime,
-            1,
-            false,
+            DemandParkedSliceOutcome::HealthyLowYield,
+        );
+        no_peers_low_yield.observe_parked_slice(
+            DemandSliceClass::NoConnectedPeers,
+            DemandParkedSliceOutcome::HealthyZeroYield,
+        );
+        assert_eq!(
+            no_peers_low_yield.reset_reason_for(
+                DemandSliceClass::NoConnectedPeers,
+                now + Duration::from_secs(1)
+            ),
+            None
+        );
+        assert_eq!(no_peers_low_yield.consecutive_healthy_zero_yield_slices, 1);
+        no_peers_low_yield.observe_parked_slice(
+            DemandSliceClass::NoConnectedPeers,
+            DemandParkedSliceOutcome::WeakLowYield,
+        );
+        no_peers_low_yield.observe_parked_slice(
+            DemandSliceClass::NoConnectedPeers,
+            DemandParkedSliceOutcome::WeakLowYield,
         );
         assert_eq!(
             no_peers_low_yield.reset_reason_for(
@@ -2913,9 +3575,7 @@ mod tests {
         );
         no_peers_low_yield.observe_parked_slice(
             DemandSliceClass::NoConnectedPeers,
-            DemandSliceStopReason::IdleTimeout,
-            2,
-            false,
+            DemandParkedSliceOutcome::WeakLowYield,
         );
         assert_eq!(
             no_peers_low_yield.reset_reason_for(
@@ -2926,9 +3586,7 @@ mod tests {
         );
         no_peers_low_yield.observe_parked_slice(
             DemandSliceClass::NoConnectedPeers,
-            DemandSliceStopReason::UniquePeerCap,
-            10,
-            false,
+            DemandParkedSliceOutcome::UsefulYield,
         );
         assert_eq!(
             no_peers_low_yield.reset_reason_for(
@@ -2978,6 +3636,50 @@ mod tests {
     }
 
     #[test]
+    fn parked_slice_outcome_separates_healthy_zero_from_weak_low_yield() {
+        assert_eq!(
+            DemandSliceClass::NoConnectedPeers.parked_slice_outcome(
+                DemandSliceStopReason::IdleTimeout,
+                0,
+                false,
+            ),
+            DemandParkedSliceOutcome::HealthyZeroYield
+        );
+        assert_eq!(
+            DemandSliceClass::NoConnectedPeers.parked_slice_outcome(
+                DemandSliceStopReason::IdleTimeout,
+                0,
+                true,
+            ),
+            DemandParkedSliceOutcome::WeakLowYield
+        );
+        assert_eq!(
+            DemandSliceClass::NoConnectedPeers.parked_slice_outcome(
+                DemandSliceStopReason::WallTime,
+                1,
+                false,
+            ),
+            DemandParkedSliceOutcome::HealthyLowYield
+        );
+        assert_eq!(
+            DemandSliceClass::NoConnectedPeers.parked_slice_outcome(
+                DemandSliceStopReason::WallTime,
+                4,
+                true,
+            ),
+            DemandParkedSliceOutcome::UsefulYield
+        );
+        assert_eq!(
+            DemandSliceClass::NoConnectedPeers.parked_slice_outcome(
+                DemandSliceStopReason::UniquePeerCap,
+                0,
+                true,
+            ),
+            DemandParkedSliceOutcome::Ignored
+        );
+    }
+
+    #[test]
     fn demand_slice_metrics_record_starts_stops_and_resets() {
         let mut metrics = DemandSliceMetrics::default();
 
@@ -2994,6 +3696,10 @@ mod tests {
         metrics.record_selection(
             DemandSliceClass::RoutineRefresh,
             DemandSelectionReason::OverdueScarce,
+        );
+        metrics.record_selection(
+            DemandSliceClass::NoConnectedPeers,
+            DemandSelectionReason::SpareCapacity,
         );
         metrics.record_stop(
             DemandSliceClass::AwaitingMetadata,
@@ -3025,6 +3731,7 @@ mod tests {
         assert_eq!(metrics.awaiting_metadata.resumed_starts, 1);
         assert_eq!(metrics.awaiting_metadata.selected_reusable_parked, 1);
         assert_eq!(metrics.no_connected_peers.selected_useful_yield_history, 1);
+        assert_eq!(metrics.no_connected_peers.selected_spare_capacity, 1);
         assert_eq!(metrics.routine_refresh.selected_overdue_scarce, 1);
         assert_eq!(metrics.awaiting_metadata.wall_time_stops, 1);
         assert_eq!(metrics.awaiting_metadata.peers_yielded, 12);
@@ -3037,6 +3744,7 @@ mod tests {
         assert!(metrics.summary().contains("sel_reuse=1"));
         assert!(metrics.summary().contains("sel_yield=1"));
         assert!(metrics.summary().contains("sel_due=1"));
+        assert!(metrics.summary().contains("sel_spare=1"));
         assert!(metrics.summary().contains("reset_quality=1"));
     }
 
@@ -3060,7 +3768,7 @@ mod tests {
                 },
             );
         }
-        assert_eq!(demand_lookup_launch_budget(&active), 3);
+        assert_eq!(demand_lookup_launch_budget(&active), 2);
 
         for byte in 6..10u8 {
             active.insert(
@@ -3127,7 +3835,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             now,
-            4,
+            1,
         );
 
         assert_eq!(selected.len(), 1);
@@ -3247,7 +3955,7 @@ mod tests {
     }
 
     #[test]
-    fn select_due_demand_launches_uses_reserve_slot_for_oldest_candidate() {
+    fn select_due_demand_launches_uses_unfilled_capacity_for_oldest_due_candidate() {
         let hash = |byte: u8| InfoHash::from([byte; InfoHash::LEN]);
         let now = Instant::now();
         let due = vec![
@@ -3255,7 +3963,7 @@ mod tests {
                 info_hash: hash(1),
                 demand: DhtDemandState {
                     awaiting_metadata: false,
-                    connected_peers: 1,
+                    connected_peers: 0,
                 },
                 next_eligible_at: now - Duration::from_secs(120),
                 subscriber_count: 1,
@@ -3263,7 +3971,7 @@ mod tests {
             DueDemandCandidate {
                 info_hash: hash(2),
                 demand: DhtDemandState {
-                    awaiting_metadata: true,
+                    awaiting_metadata: false,
                     connected_peers: 0,
                 },
                 next_eligible_at: now - Duration::from_secs(10),
@@ -3274,9 +3982,9 @@ mod tests {
         let selected = select_due_demand_launches(
             &due,
             DemandSlotCounts {
-                awaiting_metadata: 6,
-                no_connected_peers: 1,
-                routine_refresh: 1,
+                awaiting_metadata: 0,
+                no_connected_peers: DHT_NO_CONNECTED_PEERS_SLOT_CAP,
+                routine_refresh: 0,
             },
             &HashMap::new(),
             &HashMap::new(),
@@ -3286,6 +3994,108 @@ mod tests {
 
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].info_hash, hash(1));
+    }
+
+    #[test]
+    fn select_spare_research_launches_uses_idle_capacity_for_backed_off_no_peer_work() {
+        let hash = |byte: u8| InfoHash::from([byte; InfoHash::LEN]);
+        let now = Instant::now();
+        let snapshot = |byte: u8, demand: DhtDemandState| DemandEntrySnapshot {
+            info_hash: hash(byte),
+            demand,
+            next_eligible_at: now + Duration::from_secs(40),
+            subscriber_count: 1,
+            in_progress: false,
+            retrigger_pending: false,
+            no_connected_peers_backoff_step: 3,
+        };
+        let snapshots = vec![
+            snapshot(
+                1,
+                DhtDemandState {
+                    awaiting_metadata: false,
+                    connected_peers: 0,
+                },
+            ),
+            snapshot(
+                2,
+                DhtDemandState {
+                    awaiting_metadata: false,
+                    connected_peers: 0,
+                },
+            ),
+            snapshot(
+                3,
+                DhtDemandState {
+                    awaiting_metadata: false,
+                    connected_peers: 4,
+                },
+            ),
+        ];
+        let mut planner_state = HashMap::new();
+        planner_state.insert(
+            hash(1),
+            DemandPlannerState {
+                last_started_at: Some(now - Duration::from_secs(35)),
+                last_finished_at: Some(now - Duration::from_secs(30)),
+                last_useful_yield_at: None,
+                last_unique_peers: 0,
+            },
+        );
+        planner_state.insert(
+            hash(2),
+            DemandPlannerState {
+                last_started_at: Some(now - Duration::from_secs(10)),
+                last_finished_at: Some(now - Duration::from_secs(5)),
+                last_useful_yield_at: None,
+                last_unique_peers: 0,
+            },
+        );
+
+        let selected = select_spare_research_launches(
+            &snapshots,
+            DemandSlotCounts::default(),
+            &HashMap::new(),
+            &planner_state,
+            now,
+            4,
+        );
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].info_hash, hash(1));
+    }
+
+    #[test]
+    fn select_spare_research_launches_waits_when_demand_lookup_is_active() {
+        let hash = |byte: u8| InfoHash::from([byte; InfoHash::LEN]);
+        let now = Instant::now();
+        let snapshots = vec![DemandEntrySnapshot {
+            info_hash: hash(1),
+            demand: DhtDemandState {
+                awaiting_metadata: false,
+                connected_peers: 0,
+            },
+            next_eligible_at: now + Duration::from_secs(40),
+            subscriber_count: 1,
+            in_progress: false,
+            retrigger_pending: false,
+            no_connected_peers_backoff_step: 3,
+        }];
+
+        let selected = select_spare_research_launches(
+            &snapshots,
+            DemandSlotCounts {
+                awaiting_metadata: 0,
+                no_connected_peers: 1,
+                routine_refresh: 0,
+            },
+            &HashMap::new(),
+            &HashMap::new(),
+            now,
+            4,
+        );
+
+        assert!(selected.is_empty());
     }
 
     #[test]
