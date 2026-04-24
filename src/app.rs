@@ -48,6 +48,7 @@ use crate::token_bucket::TokenBucket;
 
 use crate::tui::effects::compute_effects_activity_speed_multiplier;
 use crate::tui::events;
+use crate::tui::layout::common::{ColumnId, PeerColumnId};
 use crate::tui::paste_burst::PasteBurst;
 use crate::tui::tree;
 use crate::tui::tree::RawNode;
@@ -561,12 +562,12 @@ impl ChartPanelView {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SelectedHeader {
-    Torrent(usize),
-    Peer(usize),
+    Torrent(ColumnId),
+    Peer(PeerColumnId),
 }
 impl Default for SelectedHeader {
     fn default() -> Self {
-        SelectedHeader::Torrent(0)
+        SelectedHeader::Torrent(ColumnId::Name)
     }
 }
 
@@ -1275,7 +1276,9 @@ pub struct AppState {
     pub theme: Theme,
 
     pub torrent_sort: (TorrentSortColumn, SortDirection),
+    pub torrent_sort_pinned: bool,
     pub peer_sort: (PeerSortColumn, SortDirection),
+    pub peer_sort_pinned: bool,
 
     pub chart_panel_view: ChartPanelView,
     pub graph_mode: GraphDisplayMode,
@@ -1746,6 +1749,16 @@ impl App {
 
         let tuning_controller = TuningController::new_adaptive(limits.clone());
         let tuning_state = tuning_controller.state().clone();
+        let torrent_sort_direction = if client_configs.torrent_sort_pinned {
+            client_configs.torrent_sort_direction
+        } else {
+            client_configs.torrent_sort_column.default_direction()
+        };
+        let peer_sort_direction = if client_configs.peer_sort_pinned {
+            client_configs.peer_sort_direction
+        } else {
+            client_configs.peer_sort_column.default_direction()
+        };
         let app_state = AppState {
             system_warning: None,
             system_error: None,
@@ -1755,14 +1768,10 @@ impl App {
                 ..Default::default()
             },
             theme: Theme::builtin(client_configs.ui_theme),
-            torrent_sort: (
-                client_configs.torrent_sort_column,
-                client_configs.torrent_sort_direction,
-            ),
-            peer_sort: (
-                client_configs.peer_sort_column,
-                client_configs.peer_sort_direction,
-            ),
+            torrent_sort: (client_configs.torrent_sort_column, torrent_sort_direction),
+            peer_sort: (client_configs.peer_sort_column, peer_sort_direction),
+            torrent_sort_pinned: client_configs.torrent_sort_pinned,
+            peer_sort_pinned: client_configs.peer_sort_pinned,
             rss_runtime: RssRuntimeState {
                 history: persisted_rss_state.history,
                 preview_items: Vec::new(),
@@ -4382,7 +4391,17 @@ impl App {
 
     fn calculate_stats(&mut self, sys: &mut System) {
         let was_seeding = self.app_state.is_seeding;
+        let previous_torrent_sort = self.app_state.torrent_sort;
+        let previous_peer_sort = self.app_state.peer_sort;
         UiTelemetry::on_second_tick(&mut self.app_state, sys);
+        align_unpinned_sort_with_visible_activity(&mut self.app_state);
+        if refresh_autosort_after_stats(
+            &mut self.app_state,
+            previous_torrent_sort,
+            previous_peer_sort,
+        ) {
+            self.app_state.ui.needs_redraw = true;
+        }
         NetworkHistoryTelemetry::on_second_tick(&mut self.app_state);
         self.tuning_controller.on_second_tick();
         self.app_state.tuning_countdown = self.tuning_controller.countdown_secs();
@@ -6464,12 +6483,14 @@ pub(crate) fn sort_and_filter_torrent_list_state(app_state: &mut AppState) {
             return std::cmp::Ordering::Equal;
         };
 
-        let availability_ordering = a_torrent
-            .latest_state
-            .data_available
-            .cmp(&b_torrent.latest_state.data_available);
-        if availability_ordering != std::cmp::Ordering::Equal {
-            return availability_ordering;
+        if !app_state.torrent_sort_pinned {
+            let availability_ordering = a_torrent
+                .latest_state
+                .data_available
+                .cmp(&b_torrent.latest_state.data_available);
+            if availability_ordering != std::cmp::Ordering::Equal {
+                return availability_ordering;
+            }
         }
 
         let ordering = match sort_by {
@@ -6495,14 +6516,11 @@ pub(crate) fn sort_and_filter_torrent_list_state(app_state: &mut AppState) {
 
                 let a_prog = calc_progress(a_torrent);
                 let b_prog = calc_progress(b_torrent);
-                a_prog.total_cmp(&b_prog)
+                b_prog.total_cmp(&a_prog)
             }
         };
 
-        let default_direction = match sort_by {
-            TorrentSortColumn::Name => SortDirection::Ascending,
-            _ => SortDirection::Descending,
-        };
+        let default_direction = sort_by.default_direction();
         let primary_ordering = if sort_direction != default_direction {
             ordering.reverse()
         } else {
@@ -6537,6 +6555,93 @@ pub(crate) fn sort_and_filter_torrent_list_state(app_state: &mut AppState) {
     clamp_selected_indices_in_state(app_state);
 }
 
+pub(crate) fn refresh_autosort_after_stats(
+    app_state: &mut AppState,
+    previous_torrent_sort: (TorrentSortColumn, SortDirection),
+    previous_peer_sort: (PeerSortColumn, SortDirection),
+) -> bool {
+    let torrent_sort_changed = app_state.torrent_sort != previous_torrent_sort;
+    if torrent_sort_changed {
+        sort_and_filter_torrent_list_state(app_state);
+    }
+
+    torrent_sort_changed || app_state.peer_sort != previous_peer_sort
+}
+
+fn set_torrent_sort_to_column(app_state: &mut AppState, column: TorrentSortColumn) {
+    app_state.torrent_sort = (column, column.default_direction());
+}
+
+fn set_peer_sort_to_column(app_state: &mut AppState, column: PeerSortColumn) {
+    app_state.peer_sort = (column, column.default_direction());
+}
+
+pub(crate) fn align_unpinned_sort_with_visible_activity(app_state: &mut AppState) {
+    if !app_state.torrent_sort_pinned {
+        let has_download_activity = app_state
+            .torrents
+            .values()
+            .any(|torrent| torrent.smoothed_download_speed_bps > 0);
+        let has_upload_activity = app_state
+            .torrents
+            .values()
+            .any(|torrent| torrent.smoothed_upload_speed_bps > 0);
+        let has_incomplete = app_state
+            .torrents
+            .values()
+            .any(|torrent| torrent_is_effectively_incomplete(&torrent.latest_state));
+
+        let target = if has_download_activity && (!app_state.is_seeding || !has_upload_activity) {
+            TorrentSortColumn::Down
+        } else if has_upload_activity {
+            TorrentSortColumn::Up
+        } else if has_incomplete {
+            TorrentSortColumn::Progress
+        } else {
+            TorrentSortColumn::Name
+        };
+
+        if app_state.torrent_sort.0 != target {
+            set_torrent_sort_to_column(app_state, target);
+        }
+    }
+
+    if !app_state.peer_sort_pinned {
+        let selected_torrent = app_state
+            .torrent_list_order
+            .get(app_state.ui.selected_torrent_index)
+            .and_then(|info_hash| app_state.torrents.get(info_hash));
+        let has_download_activity = selected_torrent.is_some_and(|torrent| {
+            torrent
+                .latest_state
+                .peers
+                .iter()
+                .any(|peer| peer.download_speed_bps > 0)
+        });
+        let has_upload_activity = selected_torrent.is_some_and(|torrent| {
+            torrent
+                .latest_state
+                .peers
+                .iter()
+                .any(|peer| peer.upload_speed_bps > 0)
+        });
+
+        let target = if has_download_activity && (!app_state.is_seeding || !has_upload_activity) {
+            PeerSortColumn::DL
+        } else if has_upload_activity {
+            PeerSortColumn::UL
+        } else if app_state.is_seeding {
+            PeerSortColumn::UL
+        } else {
+            PeerSortColumn::DL
+        };
+
+        if app_state.peer_sort.0 != target {
+            set_peer_sort_to_column(app_state, target);
+        }
+    }
+}
+
 fn rss_settings_changed(old_settings: &Settings, new_settings: &Settings) -> bool {
     new_settings.rss != old_settings.rss
 }
@@ -6557,8 +6662,10 @@ fn build_persist_payload(
 
     client_configs.torrent_sort_column = app_state.torrent_sort.0;
     client_configs.torrent_sort_direction = app_state.torrent_sort.1;
+    client_configs.torrent_sort_pinned = app_state.torrent_sort_pinned;
     client_configs.peer_sort_column = app_state.peer_sort.0;
     client_configs.peer_sort_direction = app_state.peer_sort.1;
+    client_configs.peer_sort_pinned = app_state.peer_sort_pinned;
     let old_validation_statuses: HashMap<String, bool> = client_configs
         .torrents
         .iter()
@@ -6744,16 +6851,18 @@ mod tests {
     #![allow(clippy::await_holding_lock)]
 
     use super::{
-        advance_dht_wave_state, apply_network_history_persist_result, build_persist_payload,
-        build_torrent_preview_tree, clamp_selected_indices_in_state, compose_system_warning,
-        extract_magnet_display_name, flush_persistence_writer_parts, format_filesystem_path_error,
+        advance_dht_wave_state, align_unpinned_sort_with_visible_activity,
+        apply_network_history_persist_result, build_persist_payload, build_torrent_preview_tree,
+        clamp_selected_indices_in_state, compose_system_warning, extract_magnet_display_name,
+        flush_persistence_writer_parts, format_filesystem_path_error,
         is_valid_incoming_bittorrent_handshake, move_file_with_fallback_impl, parse_hybrid_hashes,
         persisted_validation_status_from_metrics, prune_rss_feed_errors, queue_persistence_payload,
-        resolve_magnet_torrent_name, rss_settings_changed, should_load_persisted_torrent,
-        should_persist_network_history_on_interval, sort_and_filter_torrent_list_state,
-        torrent_completion_percent, torrent_is_effectively_incomplete, watched_parent_matches, App,
-        AppClusterRole, AppCommand, AppMode, AppRuntimeMode, AppState, CommandIngestResult,
-        DhtWaveTargets, DhtWaveUiState, FilePriority, IngestSource, ListenerSet, PeerInfo,
+        refresh_autosort_after_stats, resolve_magnet_torrent_name, rss_settings_changed,
+        should_load_persisted_torrent, should_persist_network_history_on_interval,
+        sort_and_filter_torrent_list_state, torrent_completion_percent,
+        torrent_is_effectively_incomplete, watched_parent_matches, App, AppClusterRole, AppCommand,
+        AppMode, AppRuntimeMode, AppState, ColumnId, CommandIngestResult, DhtWaveTargets,
+        DhtWaveUiState, FilePriority, IngestSource, ListenerSet, PeerInfo, PeerSortColumn,
         PersistPayload, SelectedHeader, SortDirection, TorrentControlState, TorrentDisplayState,
         TorrentMetrics, TorrentPreviewPayload, TorrentSortColumn, UiState, BITTORRENT_PROTOCOL_STR,
         DHT_WAVE_PHASE_WRAP_PERIOD,
@@ -7210,7 +7319,7 @@ mod tests {
         let mut app_state = AppState {
             torrent_sort: (TorrentSortColumn::Name, SortDirection::Ascending),
             ui: UiState {
-                selected_header: SelectedHeader::Torrent(0),
+                selected_header: SelectedHeader::Torrent(ColumnId::Name),
                 selected_torrent_index: 5,
                 search_query: "spha".to_string(),
                 ..Default::default()
@@ -7260,6 +7369,214 @@ mod tests {
         assert_eq!(
             app_state.torrent_list_order,
             vec![unavailable_hash, available_hash]
+        );
+    }
+
+    #[test]
+    fn sort_and_filter_respects_pinned_sort_over_availability_priority() {
+        let mut app_state = AppState {
+            torrent_sort: (TorrentSortColumn::Name, SortDirection::Ascending),
+            torrent_sort_pinned: true,
+            ..Default::default()
+        };
+
+        let unavailable_hash = b"unavailable_hash".to_vec();
+        let available_hash = b"available_hash".to_vec();
+
+        let mut unavailable = mock_display("zeta-sample.iso", 0);
+        unavailable.latest_state.data_available = false;
+
+        let available = mock_display("alpha-sample.iso", 0);
+
+        app_state
+            .torrents
+            .insert(unavailable_hash.clone(), unavailable);
+        app_state.torrents.insert(available_hash.clone(), available);
+
+        sort_and_filter_torrent_list_state(&mut app_state);
+
+        assert_eq!(
+            app_state.torrent_list_order,
+            vec![available_hash, unavailable_hash]
+        );
+    }
+
+    #[test]
+    fn sort_and_filter_progress_descending_puts_most_complete_first() {
+        let mut app_state = AppState {
+            torrent_sort: (TorrentSortColumn::Progress, SortDirection::Descending),
+            torrent_sort_pinned: true,
+            ..Default::default()
+        };
+
+        let lower_hash = b"lower_hash".to_vec();
+        let higher_hash = b"higher_hash".to_vec();
+
+        let mut lower = mock_display("sample-lower.iso", 0);
+        lower.latest_state.number_of_pieces_total = 10;
+        lower.latest_state.number_of_pieces_completed = 2;
+
+        let mut higher = mock_display("sample-higher.iso", 0);
+        higher.latest_state.number_of_pieces_total = 10;
+        higher.latest_state.number_of_pieces_completed = 8;
+
+        app_state.torrents.insert(lower_hash.clone(), lower);
+        app_state.torrents.insert(higher_hash.clone(), higher);
+
+        sort_and_filter_torrent_list_state(&mut app_state);
+
+        assert_eq!(app_state.torrent_list_order, vec![higher_hash, lower_hash]);
+    }
+
+    #[test]
+    fn stats_autosort_refresh_reorders_torrents_when_sort_mode_changes() {
+        let mut app_state = AppState {
+            torrent_sort: (TorrentSortColumn::Up, SortDirection::Descending),
+            peer_sort: (PeerSortColumn::UL, SortDirection::Descending),
+            ..Default::default()
+        };
+        let slow_hash = b"slow_hash".to_vec();
+        let fast_hash = b"fast_hash".to_vec();
+
+        let mut slow = mock_display("sample-slow.iso", 0);
+        slow.latest_state.data_available = true;
+        slow.smoothed_upload_speed_bps = 10;
+
+        let mut fast = mock_display("sample-fast.iso", 0);
+        fast.latest_state.data_available = true;
+        fast.smoothed_upload_speed_bps = 10_000;
+
+        app_state.torrents.insert(slow_hash.clone(), slow);
+        app_state.torrents.insert(fast_hash.clone(), fast);
+        app_state.torrent_list_order = vec![slow_hash.clone(), fast_hash.clone()];
+
+        let changed = refresh_autosort_after_stats(
+            &mut app_state,
+            (TorrentSortColumn::Down, SortDirection::Descending),
+            (PeerSortColumn::DL, SortDirection::Descending),
+        );
+
+        assert!(changed);
+        assert_eq!(app_state.torrent_list_order, vec![fast_hash, slow_hash]);
+    }
+
+    #[test]
+    fn stats_autosort_refresh_marks_change_when_only_peer_sort_changes() {
+        let mut app_state = AppState {
+            torrent_sort: (TorrentSortColumn::Down, SortDirection::Descending),
+            peer_sort: (PeerSortColumn::UL, SortDirection::Descending),
+            ..Default::default()
+        };
+
+        let changed = refresh_autosort_after_stats(
+            &mut app_state,
+            (TorrentSortColumn::Down, SortDirection::Descending),
+            (PeerSortColumn::DL, SortDirection::Descending),
+        );
+
+        assert!(changed);
+    }
+
+    #[test]
+    fn align_unpinned_sort_uses_upload_when_only_upload_is_visible() {
+        let mut app_state = AppState {
+            torrent_sort: (TorrentSortColumn::Down, SortDirection::Descending),
+            ..Default::default()
+        };
+        let hash = b"hash_a".to_vec();
+        let mut torrent = mock_display("sample-upload.iso", 0);
+        torrent.latest_state.data_available = true;
+        torrent.smoothed_upload_speed_bps = 4_096;
+        app_state.torrents.insert(hash, torrent);
+
+        align_unpinned_sort_with_visible_activity(&mut app_state);
+
+        assert_eq!(
+            app_state.torrent_sort,
+            (TorrentSortColumn::Up, SortDirection::Descending)
+        );
+    }
+
+    #[test]
+    fn align_unpinned_sort_uses_name_when_idle_and_complete() {
+        let mut app_state = AppState {
+            torrent_sort: (TorrentSortColumn::Down, SortDirection::Descending),
+            ..Default::default()
+        };
+        let hash = b"hash_a".to_vec();
+        let mut torrent = mock_display("sample-complete.iso", 0);
+        torrent.latest_state.data_available = true;
+        torrent.latest_state.number_of_pieces_total = 10;
+        torrent.latest_state.number_of_pieces_completed = 10;
+        app_state.torrents.insert(hash, torrent);
+
+        align_unpinned_sort_with_visible_activity(&mut app_state);
+
+        assert_eq!(
+            app_state.torrent_sort,
+            (TorrentSortColumn::Name, SortDirection::Ascending)
+        );
+    }
+
+    #[test]
+    fn align_unpinned_sort_preserves_pinned_torrent_sort() {
+        let mut app_state = AppState {
+            torrent_sort: (TorrentSortColumn::Down, SortDirection::Descending),
+            torrent_sort_pinned: true,
+            ..Default::default()
+        };
+        let hash = b"hash_a".to_vec();
+        let mut torrent = mock_display("sample-upload.iso", 0);
+        torrent.latest_state.data_available = true;
+        torrent.smoothed_upload_speed_bps = 4_096;
+        app_state.torrents.insert(hash, torrent);
+
+        align_unpinned_sort_with_visible_activity(&mut app_state);
+
+        assert_eq!(
+            app_state.torrent_sort,
+            (TorrentSortColumn::Down, SortDirection::Descending)
+        );
+    }
+
+    #[test]
+    fn align_unpinned_sort_uses_peer_upload_when_only_peer_upload_is_visible() {
+        let mut app_state = AppState {
+            peer_sort: (PeerSortColumn::DL, SortDirection::Descending),
+            ..Default::default()
+        };
+        let hash = b"hash_a".to_vec();
+        let mut torrent = mock_display("sample-peer-upload.iso", 1);
+        torrent.latest_state.peers[0].upload_speed_bps = 2_048;
+        app_state.torrent_list_order = vec![hash.clone()];
+        app_state.torrents.insert(hash, torrent);
+
+        align_unpinned_sort_with_visible_activity(&mut app_state);
+
+        assert_eq!(
+            app_state.peer_sort,
+            (PeerSortColumn::UL, SortDirection::Descending)
+        );
+    }
+
+    #[test]
+    fn align_unpinned_sort_keeps_peer_speed_sort_when_peer_activity_is_idle() {
+        let mut app_state = AppState {
+            is_seeding: true,
+            peer_sort: (PeerSortColumn::Address, SortDirection::Ascending),
+            ..Default::default()
+        };
+        let hash = b"hash_a".to_vec();
+        app_state
+            .torrents
+            .insert(hash.clone(), mock_display("sample-peer-idle.iso", 1));
+        app_state.torrent_list_order = vec![hash];
+
+        align_unpinned_sort_with_visible_activity(&mut app_state);
+
+        assert_eq!(
+            app_state.peer_sort,
+            (PeerSortColumn::UL, SortDirection::Descending)
         );
     }
 

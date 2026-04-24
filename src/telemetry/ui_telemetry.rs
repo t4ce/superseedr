@@ -408,11 +408,19 @@ impl UiTelemetry {
             );
 
             if is_seeding {
-                app_state.torrent_sort = (TorrentSortColumn::Up, SortDirection::Descending);
-                app_state.peer_sort = (PeerSortColumn::UL, SortDirection::Descending);
+                if !app_state.torrent_sort_pinned {
+                    app_state.torrent_sort = (TorrentSortColumn::Up, SortDirection::Descending);
+                }
+                if !app_state.peer_sort_pinned {
+                    app_state.peer_sort = (PeerSortColumn::UL, SortDirection::Descending);
+                }
             } else {
-                app_state.torrent_sort = (TorrentSortColumn::Down, SortDirection::Descending);
-                app_state.peer_sort = (PeerSortColumn::DL, SortDirection::Descending);
+                if !app_state.torrent_sort_pinned {
+                    app_state.torrent_sort = (TorrentSortColumn::Down, SortDirection::Descending);
+                }
+                if !app_state.peer_sort_pinned {
+                    app_state.peer_sort = (PeerSortColumn::DL, SortDirection::Descending);
+                }
             }
         }
         app_state.is_seeding = is_seeding;
@@ -967,6 +975,36 @@ mod tests {
         assert_eq!(
             app_state.peer_sort,
             (PeerSortColumn::DL, SortDirection::Descending)
+        );
+    }
+
+    #[test]
+    fn objective_switch_preserves_user_pinned_sorting() {
+        let mut app_state = AppState {
+            is_seeding: true,
+            torrent_sort: (TorrentSortColumn::Name, SortDirection::Ascending),
+            torrent_sort_pinned: true,
+            peer_sort: (PeerSortColumn::Address, SortDirection::Ascending),
+            peer_sort_pinned: true,
+            ..Default::default()
+        };
+
+        let mut torrent = TorrentDisplayState::default();
+        torrent.latest_state.number_of_pieces_total = 10;
+        torrent.latest_state.number_of_pieces_completed = 9;
+        app_state.torrents.insert(vec![1; 20], torrent);
+
+        let mut sys = System::new();
+        UiTelemetry::on_second_tick(&mut app_state, &mut sys);
+
+        assert!(!app_state.is_seeding);
+        assert_eq!(
+            app_state.torrent_sort,
+            (TorrentSortColumn::Name, SortDirection::Ascending)
+        );
+        assert_eq!(
+            app_state.peer_sort,
+            (PeerSortColumn::Address, SortDirection::Ascending)
         );
     }
 }

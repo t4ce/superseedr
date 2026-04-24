@@ -604,14 +604,32 @@ pub fn reduce_ui_action(app_state: &mut AppState, action: UiAction) -> ReduceRes
                 compute_visible_torrent_columns(app_state, layout_plan.list.width);
             let (_, visible_peer_columns) =
                 compute_visible_peer_columns(app_state, layout_plan.peers.width);
+            let raw_selected_header = app_state.ui.selected_header;
+            let selected_torrent_has_peers = selected_torrent_has_peers(app_state);
+            let selected_header = normalize_selected_header(
+                raw_selected_header,
+                selected_torrent_has_peers,
+                &visible_torrent_columns,
+                &visible_peer_columns,
+            );
+            app_state.ui.selected_header = selected_header;
 
-            match app_state.ui.selected_header {
-                SelectedHeader::Torrent(i) => {
+            match selected_header {
+                SelectedHeader::Torrent(column_id) => {
                     let cols = get_torrent_columns();
-                    if let Some(def) = visible_torrent_columns
-                        .get(i)
-                        .and_then(|&real_idx| cols.get(real_idx))
-                    {
+                    if let Some(i) = torrent_column_index(column_id) {
+                        if !visible_torrent_columns.contains(&i) {
+                            return ReduceResult {
+                                redraw: true,
+                                effects: Vec::new(),
+                            };
+                        }
+                        let Some(def) = cols.get(i) else {
+                            return ReduceResult {
+                                redraw: true,
+                                effects: Vec::new(),
+                            };
+                        };
                         if let Some(column) = def.sort_enum {
                             if app_state.torrent_sort.0 == column {
                                 app_state.torrent_sort.1 =
@@ -622,18 +640,28 @@ pub fn reduce_ui_action(app_state: &mut AppState, action: UiAction) -> ReduceRes
                                     };
                             } else {
                                 app_state.torrent_sort.0 = column;
-                                app_state.torrent_sort.1 = SortDirection::Descending;
+                                app_state.torrent_sort.1 = column.default_direction();
                             }
+                            app_state.torrent_sort_pinned = true;
                             sort_and_filter_torrent_list_state(app_state);
                         }
                     }
                 }
-                SelectedHeader::Peer(i) => {
+                SelectedHeader::Peer(column_id) => {
                     let cols = get_peer_columns();
-                    if let Some(def) = visible_peer_columns
-                        .get(i)
-                        .and_then(|&real_idx| cols.get(real_idx))
-                    {
+                    if let Some(i) = peer_column_index(column_id) {
+                        if !visible_peer_columns.contains(&i) {
+                            return ReduceResult {
+                                redraw: true,
+                                effects: Vec::new(),
+                            };
+                        }
+                        let Some(def) = cols.get(i) else {
+                            return ReduceResult {
+                                redraw: true,
+                                effects: Vec::new(),
+                            };
+                        };
                         if let Some(column) = def.sort_enum {
                             if app_state.peer_sort.0 == column {
                                 app_state.peer_sort.1 =
@@ -644,8 +672,9 @@ pub fn reduce_ui_action(app_state: &mut AppState, action: UiAction) -> ReduceRes
                                     };
                             } else {
                                 app_state.peer_sort.0 = column;
-                                app_state.peer_sort.1 = SortDirection::Descending;
+                                app_state.peer_sort.1 = column.default_direction();
                             }
+                            app_state.peer_sort_pinned = true;
                         }
                     }
                 }
@@ -1629,6 +1658,92 @@ fn format_peer_address_for_table(address: &str) -> String {
     }
 }
 
+fn selected_torrent_has_peers(app_state: &AppState) -> bool {
+    app_state
+        .torrent_list_order
+        .get(app_state.ui.selected_torrent_index)
+        .and_then(|info_hash| app_state.torrents.get(info_hash))
+        .is_some_and(|torrent| !torrent.latest_state.peers.is_empty())
+}
+
+fn nearest_visible_column(visible_columns: &[usize], selected_column: usize) -> Option<usize> {
+    visible_columns
+        .iter()
+        .copied()
+        .find(|&idx| idx >= selected_column)
+        .or_else(|| visible_columns.last().copied())
+}
+
+fn torrent_column_id_for_index(index: usize) -> Option<ColumnId> {
+    get_torrent_columns().get(index).map(|column| column.id)
+}
+
+fn peer_column_id_for_index(index: usize) -> Option<PeerColumnId> {
+    get_peer_columns().get(index).map(|column| column.id)
+}
+
+fn torrent_column_index(column_id: ColumnId) -> Option<usize> {
+    get_torrent_columns()
+        .iter()
+        .position(|column| column.id == column_id)
+}
+
+fn peer_column_index(column_id: PeerColumnId) -> Option<usize> {
+    get_peer_columns()
+        .iter()
+        .position(|column| column.id == column_id)
+}
+
+fn nearest_visible_torrent_column(
+    visible_columns: &[usize],
+    selected_column: ColumnId,
+) -> Option<ColumnId> {
+    let selected_index = torrent_column_index(selected_column).unwrap_or(usize::MAX);
+    nearest_visible_column(visible_columns, selected_index).and_then(torrent_column_id_for_index)
+}
+
+fn nearest_visible_peer_column(
+    visible_columns: &[usize],
+    selected_column: PeerColumnId,
+) -> Option<PeerColumnId> {
+    let selected_index = peer_column_index(selected_column).unwrap_or(usize::MAX);
+    nearest_visible_column(visible_columns, selected_index).and_then(peer_column_id_for_index)
+}
+
+fn last_visible_torrent_column(visible_columns: &[usize]) -> Option<ColumnId> {
+    nearest_visible_column(visible_columns, usize::MAX).and_then(torrent_column_id_for_index)
+}
+
+fn normalize_selected_header(
+    selected_header: SelectedHeader,
+    selected_torrent_has_peers: bool,
+    visible_torrent_columns: &[usize],
+    visible_peer_columns: &[usize],
+) -> SelectedHeader {
+    match selected_header {
+        SelectedHeader::Torrent(column_id) => {
+            nearest_visible_torrent_column(visible_torrent_columns, column_id)
+                .map(SelectedHeader::Torrent)
+                .unwrap_or(SelectedHeader::Torrent(ColumnId::Name))
+        }
+        SelectedHeader::Peer(column_id) => {
+            if selected_torrent_has_peers {
+                nearest_visible_peer_column(visible_peer_columns, column_id)
+                    .map(SelectedHeader::Peer)
+                    .unwrap_or_else(|| {
+                        last_visible_torrent_column(visible_torrent_columns)
+                            .map(SelectedHeader::Torrent)
+                            .unwrap_or(SelectedHeader::Torrent(ColumnId::Name))
+                    })
+            } else {
+                last_visible_torrent_column(visible_torrent_columns)
+                    .map(SelectedHeader::Torrent)
+                    .unwrap_or(SelectedHeader::Torrent(ColumnId::Name))
+            }
+        }
+    }
+}
+
 pub fn draw_torrent_list(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &ThemeContext) {
     let mut table_state = TableState::default();
     if matches!(app_state.ui.selected_header, SelectedHeader::Torrent(_)) {
@@ -1642,9 +1757,9 @@ pub fn draw_torrent_list(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &
     let header_cells: Vec<Cell> = visible_indices
         .iter()
         .enumerate()
-        .map(|(visual_idx, &real_idx)| {
+        .map(|(_visual_idx, &real_idx)| {
             let def = &all_cols[real_idx];
-            let is_selected = app_state.ui.selected_header == SelectedHeader::Torrent(visual_idx);
+            let is_selected = app_state.ui.selected_header == SelectedHeader::Torrent(def.id);
             let is_sorting = def.sort_enum == Some(sort_col);
 
             let mut style = ctx.apply(Style::default().fg(ctx.state_warning()));
@@ -4256,11 +4371,11 @@ pub fn draw_peers_table(
                     let header_cells: Vec<Cell> = visible_indices
                         .iter()
                         .enumerate()
-                        .map(|(visual_idx, &real_idx)| {
+                        .map(|(_visual_idx, &real_idx)| {
                             let def = &all_peer_cols[real_idx];
 
                             let is_selected =
-                                app_state.ui.selected_header == SelectedHeader::Peer(visual_idx);
+                                app_state.ui.selected_header == SelectedHeader::Peer(def.id);
                             let is_sorting = def.sort_enum == Some(sort_by);
 
                             let mut style = ctx.apply(Style::default().fg(ctx.state_warning()));
@@ -5383,8 +5498,7 @@ pub(crate) fn handle_navigation(app_state: &mut AppState, key_code: KeyCode) {
         .get(app_state.ui.selected_torrent_index)
         .and_then(|info_hash| app_state.torrents.get(info_hash));
 
-    let selected_torrent_has_peers =
-        selected_torrent.is_some_and(|torrent| !torrent.latest_state.peers.is_empty());
+    let selected_torrent_has_peers = selected_torrent_has_peers(app_state);
 
     let selected_torrent_peer_count =
         selected_torrent.map_or(0, |torrent| torrent.latest_state.peers.len());
@@ -5395,25 +5509,13 @@ pub(crate) fn handle_navigation(app_state: &mut AppState, key_code: KeyCode) {
         compute_visible_torrent_columns(app_state, layout_plan.list.width);
     let (_, visible_peer_columns) =
         compute_visible_peer_columns(app_state, layout_plan.peers.width);
-    let torrent_col_count = visible_torrent_columns.len();
-    let peer_col_count = visible_peer_columns.len();
 
-    app_state.ui.selected_header = match app_state.ui.selected_header {
-        SelectedHeader::Torrent(i) => {
-            if torrent_col_count == 0 {
-                SelectedHeader::Torrent(0)
-            } else {
-                SelectedHeader::Torrent(i.min(torrent_col_count - 1))
-            }
-        }
-        SelectedHeader::Peer(i) => {
-            if !selected_torrent_has_peers || peer_col_count == 0 {
-                SelectedHeader::Torrent(torrent_col_count.saturating_sub(1))
-            } else {
-                SelectedHeader::Peer(i.min(peer_col_count - 1))
-            }
-        }
-    };
+    app_state.ui.selected_header = normalize_selected_header(
+        app_state.ui.selected_header,
+        selected_torrent_has_peers,
+        &visible_torrent_columns,
+        &visible_peer_columns,
+    );
 
     match key_code {
         KeyCode::Up | KeyCode::Char('k') => match app_state.ui.selected_header {
@@ -5448,36 +5550,88 @@ pub(crate) fn handle_navigation(app_state: &mut AppState, key_code: KeyCode) {
         },
         KeyCode::Left | KeyCode::Char('h') => {
             app_state.ui.selected_header = match app_state.ui.selected_header {
-                SelectedHeader::Torrent(0) => {
-                    if selected_torrent_has_peers && peer_col_count > 0 {
-                        SelectedHeader::Peer(peer_col_count - 1)
+                SelectedHeader::Torrent(column_id) => {
+                    let real_idx = torrent_column_index(column_id).unwrap_or(0);
+                    let pos = visible_torrent_columns
+                        .iter()
+                        .position(|&idx| idx == real_idx)
+                        .unwrap_or(0);
+                    if pos > 0 {
+                        torrent_column_id_for_index(visible_torrent_columns[pos - 1])
+                            .map(SelectedHeader::Torrent)
+                            .unwrap_or(SelectedHeader::Torrent(column_id))
+                    } else if selected_torrent_has_peers {
+                        visible_peer_columns
+                            .last()
+                            .copied()
+                            .and_then(peer_column_id_for_index)
+                            .map(SelectedHeader::Peer)
+                            .unwrap_or(SelectedHeader::Torrent(column_id))
                     } else {
-                        SelectedHeader::Torrent(0)
+                        SelectedHeader::Torrent(column_id)
                     }
                 }
-                SelectedHeader::Torrent(i) => SelectedHeader::Torrent(i - 1),
-                SelectedHeader::Peer(0) => {
-                    SelectedHeader::Torrent(torrent_col_count.saturating_sub(1))
+                SelectedHeader::Peer(column_id) => {
+                    let real_idx = peer_column_index(column_id).unwrap_or(0);
+                    let pos = visible_peer_columns
+                        .iter()
+                        .position(|&idx| idx == real_idx)
+                        .unwrap_or(0);
+                    if pos > 0 {
+                        peer_column_id_for_index(visible_peer_columns[pos - 1])
+                            .map(SelectedHeader::Peer)
+                            .unwrap_or(SelectedHeader::Peer(column_id))
+                    } else {
+                        visible_torrent_columns
+                            .last()
+                            .copied()
+                            .and_then(torrent_column_id_for_index)
+                            .map(SelectedHeader::Torrent)
+                            .unwrap_or(SelectedHeader::Torrent(ColumnId::Name))
+                    }
                 }
-                SelectedHeader::Peer(i) => SelectedHeader::Peer(i - 1),
             };
         }
         KeyCode::Right | KeyCode::Char('l') => {
             app_state.ui.selected_header = match app_state.ui.selected_header {
-                SelectedHeader::Torrent(i) => {
-                    if i < torrent_col_count.saturating_sub(1) {
-                        SelectedHeader::Torrent(i + 1)
-                    } else if selected_torrent_has_peers && peer_col_count > 0 {
-                        SelectedHeader::Peer(0)
+                SelectedHeader::Torrent(column_id) => {
+                    let real_idx = torrent_column_index(column_id).unwrap_or(0);
+                    let pos = visible_torrent_columns
+                        .iter()
+                        .position(|&idx| idx == real_idx)
+                        .unwrap_or(0);
+                    if pos + 1 < visible_torrent_columns.len() {
+                        torrent_column_id_for_index(visible_torrent_columns[pos + 1])
+                            .map(SelectedHeader::Torrent)
+                            .unwrap_or(SelectedHeader::Torrent(column_id))
+                    } else if selected_torrent_has_peers {
+                        visible_peer_columns
+                            .first()
+                            .copied()
+                            .and_then(peer_column_id_for_index)
+                            .map(SelectedHeader::Peer)
+                            .unwrap_or(SelectedHeader::Torrent(column_id))
                     } else {
-                        SelectedHeader::Torrent(i)
+                        SelectedHeader::Torrent(column_id)
                     }
                 }
-                SelectedHeader::Peer(i) => {
-                    if i < peer_col_count.saturating_sub(1) {
-                        SelectedHeader::Peer(i + 1)
+                SelectedHeader::Peer(column_id) => {
+                    let real_idx = peer_column_index(column_id).unwrap_or(0);
+                    let pos = visible_peer_columns
+                        .iter()
+                        .position(|&idx| idx == real_idx)
+                        .unwrap_or(0);
+                    if pos + 1 < visible_peer_columns.len() {
+                        peer_column_id_for_index(visible_peer_columns[pos + 1])
+                            .map(SelectedHeader::Peer)
+                            .unwrap_or(SelectedHeader::Peer(column_id))
                     } else {
-                        SelectedHeader::Torrent(0)
+                        visible_torrent_columns
+                            .first()
+                            .copied()
+                            .and_then(torrent_column_id_for_index)
+                            .map(SelectedHeader::Torrent)
+                            .unwrap_or(SelectedHeader::Torrent(ColumnId::Name))
                     }
                 }
             };
@@ -5881,7 +6035,7 @@ mod tests {
     fn reducer_navigate_updates_selection() {
         let mut app_state = create_test_app_state();
         app_state.ui.selected_torrent_index = 0;
-        app_state.ui.selected_header = SelectedHeader::Torrent(0);
+        app_state.ui.selected_header = SelectedHeader::Torrent(ColumnId::Name);
 
         let result = reduce_ui_action(&mut app_state, UiAction::Navigate(KeyCode::Down));
 
@@ -6817,7 +6971,7 @@ mod tests {
     fn reducer_sort_by_selected_column_updates_torrent_sort() {
         let mut app_state = create_test_app_state();
         app_state.screen_area = Rect::new(0, 0, 220, 80);
-        app_state.ui.selected_header = SelectedHeader::Torrent(1);
+        app_state.ui.selected_header = SelectedHeader::Torrent(ColumnId::Name);
         app_state.torrent_sort = (TorrentSortColumn::Down, SortDirection::Descending);
 
         if let Some(t) = app_state.torrents.get_mut("hash_a".as_bytes()) {
@@ -6836,7 +6990,67 @@ mod tests {
         let _ = reduce_ui_action(&mut app_state, UiAction::SortBySelectedColumn);
 
         assert_eq!(app_state.torrent_sort.0, TorrentSortColumn::Name);
-        assert_eq!(app_state.torrent_sort.1, SortDirection::Descending);
+        assert_eq!(app_state.torrent_sort.1, SortDirection::Ascending);
+        assert!(app_state.torrent_sort_pinned);
+    }
+
+    #[test]
+    fn reducer_sort_by_selected_column_keeps_dynamic_torrent_column_identity() {
+        let mut app_state = create_test_app_state();
+        app_state.screen_area = Rect::new(0, 0, 220, 80);
+        app_state.ui.selected_header = SelectedHeader::Torrent(ColumnId::Status);
+        app_state.torrent_sort = (TorrentSortColumn::Down, SortDirection::Descending);
+
+        let _ = reduce_ui_action(&mut app_state, UiAction::SortBySelectedColumn);
+
+        assert_eq!(
+            app_state.ui.selected_header,
+            SelectedHeader::Torrent(ColumnId::Name)
+        );
+        assert_eq!(app_state.torrent_sort.0, TorrentSortColumn::Name);
+
+        for torrent in app_state.torrents.values_mut() {
+            torrent.latest_state.number_of_pieces_total = 10;
+            torrent.latest_state.number_of_pieces_completed = 5;
+        }
+        app_state.torrent_sort = (TorrentSortColumn::Down, SortDirection::Descending);
+
+        let _ = reduce_ui_action(&mut app_state, UiAction::SortBySelectedColumn);
+
+        assert_eq!(
+            app_state.ui.selected_header,
+            SelectedHeader::Torrent(ColumnId::Name)
+        );
+        assert_eq!(app_state.torrent_sort.0, TorrentSortColumn::Name);
+    }
+
+    #[test]
+    fn reducer_sort_by_selected_column_sorts_visible_dynamic_download_column() {
+        let mut app_state = create_test_app_state();
+        app_state.screen_area = Rect::new(0, 0, 220, 80);
+        app_state.ui.selected_header = SelectedHeader::Torrent(ColumnId::DownSpeed);
+
+        if let Some(t) = app_state.torrents.get_mut("hash_a".as_bytes()) {
+            t.smoothed_download_speed_bps = 100;
+        }
+        if let Some(t) = app_state.torrents.get_mut("hash_b".as_bytes()) {
+            t.smoothed_download_speed_bps = 2_000;
+        }
+
+        let _ = reduce_ui_action(&mut app_state, UiAction::SortBySelectedColumn);
+
+        assert_eq!(
+            app_state.ui.selected_header,
+            SelectedHeader::Torrent(ColumnId::DownSpeed)
+        );
+        assert_eq!(
+            app_state.torrent_sort,
+            (TorrentSortColumn::Down, SortDirection::Descending)
+        );
+        assert_eq!(
+            app_state.torrent_list_order,
+            vec!["hash_b".as_bytes().to_vec(), "hash_a".as_bytes().to_vec()]
+        );
     }
 
     #[test]
@@ -6844,13 +7058,40 @@ mod tests {
         let mut app_state = create_test_app_state();
         app_state.screen_area = Rect::new(0, 0, 220, 80);
         app_state.ui.selected_torrent_index = 0;
-        app_state.ui.selected_header = SelectedHeader::Peer(0);
+        app_state.ui.selected_header = SelectedHeader::Peer(PeerColumnId::Flags);
         app_state.peer_sort = (PeerSortColumn::Address, SortDirection::Ascending);
 
         let _ = reduce_ui_action(&mut app_state, UiAction::SortBySelectedColumn);
 
         assert_eq!(app_state.peer_sort.0, PeerSortColumn::Flags);
         assert_eq!(app_state.peer_sort.1, SortDirection::Descending);
+        assert!(app_state.peer_sort_pinned);
+    }
+
+    #[test]
+    fn reducer_sort_by_selected_column_selects_visible_dynamic_peer_download_column() {
+        let mut app_state = create_test_app_state();
+        app_state.screen_area = Rect::new(0, 0, 220, 80);
+        app_state.ui.selected_torrent_index = 0;
+        app_state.ui.selected_header = SelectedHeader::Peer(PeerColumnId::DownSpeed);
+
+        let torrent = app_state
+            .torrents
+            .get_mut("hash_a".as_bytes())
+            .expect("test torrent exists");
+        torrent.latest_state.peers[0].download_speed_bps = 2_000;
+
+        let _ = reduce_ui_action(&mut app_state, UiAction::SortBySelectedColumn);
+
+        assert_eq!(
+            app_state.ui.selected_header,
+            SelectedHeader::Peer(PeerColumnId::DownSpeed)
+        );
+        assert_eq!(
+            app_state.peer_sort,
+            (PeerSortColumn::DL, SortDirection::Descending)
+        );
+        assert!(app_state.peer_sort_pinned);
     }
 
     #[test]

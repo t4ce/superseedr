@@ -36,6 +36,15 @@ pub enum TorrentSortColumn {
     Progress,
 }
 
+impl TorrentSortColumn {
+    pub fn default_direction(self) -> SortDirection {
+        match self {
+            Self::Name => SortDirection::Ascending,
+            Self::Up | Self::Down | Self::Progress => SortDirection::Descending,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default, EnumIter, EnumCount)]
 pub enum PeerSortColumn {
     Flags,
@@ -48,6 +57,15 @@ pub enum PeerSortColumn {
     UL,
     #[serde(alias = "TotalDL")]
     DL,
+}
+
+impl PeerSortColumn {
+    pub fn default_direction(self) -> SortDirection {
+        match self {
+            Self::Address | Self::Client | Self::Action => SortDirection::Ascending,
+            Self::Flags | Self::Completed | Self::UL | Self::DL => SortDirection::Descending,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]
@@ -160,8 +178,10 @@ pub struct Settings {
     pub private_client: bool,
     pub torrent_sort_column: TorrentSortColumn,
     pub torrent_sort_direction: SortDirection,
+    pub torrent_sort_pinned: bool,
     pub peer_sort_column: PeerSortColumn,
     pub peer_sort_direction: SortDirection,
+    pub peer_sort_pinned: bool,
     pub ui_theme: ThemeName,
     pub watch_folder: Option<PathBuf>,
     pub default_download_folder: Option<PathBuf>,
@@ -194,9 +214,11 @@ impl Default for Settings {
             global_download_limit_bps: 0,
             global_upload_limit_bps: 0,
             torrent_sort_column: TorrentSortColumn::default(),
-            torrent_sort_direction: SortDirection::default(),
+            torrent_sort_direction: TorrentSortColumn::default().default_direction(),
+            torrent_sort_pinned: false,
             peer_sort_column: PeerSortColumn::default(),
-            peer_sort_direction: SortDirection::default(),
+            peer_sort_direction: PeerSortColumn::default().default_direction(),
+            peer_sort_pinned: false,
             ui_theme: ThemeName::default(),
             max_connected_peers: 2000,
             bootstrap_nodes: vec![
@@ -363,8 +385,10 @@ struct SharedSettingsConfig {
     pub private_client: bool,
     pub torrent_sort_column: TorrentSortColumn,
     pub torrent_sort_direction: SortDirection,
+    pub torrent_sort_pinned: bool,
     pub peer_sort_column: PeerSortColumn,
     pub peer_sort_direction: SortDirection,
+    pub peer_sort_pinned: bool,
     pub ui_theme: ThemeName,
     pub default_download_folder: Option<PathBuf>,
     pub max_connected_peers: usize,
@@ -392,8 +416,10 @@ impl Default for SharedSettingsConfig {
             private_client: settings.private_client,
             torrent_sort_column: settings.torrent_sort_column,
             torrent_sort_direction: settings.torrent_sort_direction,
+            torrent_sort_pinned: settings.torrent_sort_pinned,
             peer_sort_column: settings.peer_sort_column,
             peer_sort_direction: settings.peer_sort_direction,
+            peer_sort_pinned: settings.peer_sort_pinned,
             ui_theme: settings.ui_theme,
             default_download_folder: None,
             max_connected_peers: settings.max_connected_peers,
@@ -714,8 +740,10 @@ impl SharedSettingsConfig {
             private_client: settings.private_client,
             torrent_sort_column: settings.torrent_sort_column,
             torrent_sort_direction: settings.torrent_sort_direction,
+            torrent_sort_pinned: settings.torrent_sort_pinned,
             peer_sort_column: settings.peer_sort_column,
             peer_sort_direction: settings.peer_sort_direction,
+            peer_sort_pinned: settings.peer_sort_pinned,
             ui_theme: settings.ui_theme,
             default_download_folder: settings
                 .default_download_folder
@@ -749,8 +777,10 @@ impl SharedSettingsConfig {
         settings.private_client = self.private_client;
         settings.torrent_sort_column = self.torrent_sort_column;
         settings.torrent_sort_direction = self.torrent_sort_direction;
+        settings.torrent_sort_pinned = self.torrent_sort_pinned;
         settings.peer_sort_column = self.peer_sort_column;
         settings.peer_sort_direction = self.peer_sort_direction;
+        settings.peer_sort_pinned = self.peer_sort_pinned;
         settings.ui_theme = self.ui_theme;
         settings.default_download_folder = self
             .default_download_folder
@@ -2454,7 +2484,7 @@ mod tests {
         assert_eq!(settings.lifetime_downloaded, 0);
         assert_eq!(settings.global_upload_limit_bps, 0);
         assert_eq!(settings.torrent_sort_column, TorrentSortColumn::Up);
-        assert_eq!(settings.peer_sort_direction, SortDirection::Ascending);
+        assert_eq!(settings.peer_sort_direction, SortDirection::Descending);
         assert!(settings.watch_folder.is_none());
         assert_eq!(settings.max_connected_peers, 2000);
         assert_eq!(settings.bootstrap_nodes, default_settings.bootstrap_nodes);

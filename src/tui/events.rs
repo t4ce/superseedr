@@ -228,6 +228,7 @@ mod tests {
         TorrentPreviewPayload,
     };
     use crate::config::Settings;
+    use crate::tui::layout::common::{ColumnId, PeerColumnId};
     use crate::tui::paste_burst::PasteBurst;
     use crate::tui::tree::RawNode;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -296,7 +297,7 @@ mod tests {
     fn test_nav_down_torrents() {
         let mut app_state = create_test_app_state();
         app_state.ui.selected_torrent_index = 0;
-        app_state.ui.selected_header = SelectedHeader::Torrent(0);
+        app_state.ui.selected_header = SelectedHeader::Torrent(ColumnId::Name);
 
         normal::handle_navigation(&mut app_state, KeyCode::Down);
 
@@ -308,7 +309,7 @@ mod tests {
     fn test_nav_up_torrents() {
         let mut app_state = create_test_app_state();
         app_state.ui.selected_torrent_index = 1;
-        app_state.ui.selected_header = SelectedHeader::Torrent(0);
+        app_state.ui.selected_header = SelectedHeader::Torrent(ColumnId::Name);
 
         normal::handle_navigation(&mut app_state, KeyCode::Up);
 
@@ -321,7 +322,7 @@ mod tests {
         let mut app_state = create_test_app_state();
         app_state.ui.selected_torrent_index = 0; // "hash_a" has 2 peers
         app_state.ui.selected_peer_index = 0;
-        app_state.ui.selected_header = SelectedHeader::Peer(0);
+        app_state.ui.selected_header = SelectedHeader::Peer(PeerColumnId::Flags);
 
         normal::handle_navigation(&mut app_state, KeyCode::Down);
 
@@ -333,33 +334,42 @@ mod tests {
     fn test_nav_right_to_peers_when_peers_exist() {
         let mut app_state = create_test_app_state();
         app_state.ui.selected_torrent_index = 0; // "hash_a" has peers
-        app_state.ui.selected_header = SelectedHeader::Torrent(99);
+        app_state.ui.selected_header = SelectedHeader::Torrent(ColumnId::Name);
 
         normal::handle_navigation(&mut app_state, KeyCode::Right);
 
-        assert_eq!(app_state.ui.selected_header, SelectedHeader::Peer(0));
+        assert_eq!(
+            app_state.ui.selected_header,
+            SelectedHeader::Peer(PeerColumnId::Flags)
+        );
     }
 
     #[test]
     fn test_nav_right_to_peers_when_no_peers() {
         let mut app_state = create_test_app_state();
         app_state.ui.selected_torrent_index = 1; // "hash_b" has 0 peers
-        app_state.ui.selected_header = SelectedHeader::Torrent(99);
+        app_state.ui.selected_header = SelectedHeader::Torrent(ColumnId::Name);
 
         normal::handle_navigation(&mut app_state, KeyCode::Right);
 
-        assert_eq!(app_state.ui.selected_header, SelectedHeader::Torrent(0));
+        assert_eq!(
+            app_state.ui.selected_header,
+            SelectedHeader::Torrent(ColumnId::Name)
+        );
     }
 
     #[test]
     fn test_nav_left_from_peers() {
         let mut app_state = create_test_app_state();
         app_state.ui.selected_torrent_index = 0;
-        app_state.ui.selected_header = SelectedHeader::Peer(0);
+        app_state.ui.selected_header = SelectedHeader::Peer(PeerColumnId::Flags);
 
         normal::handle_navigation(&mut app_state, KeyCode::Left);
 
-        assert_eq!(app_state.ui.selected_header, SelectedHeader::Torrent(0));
+        assert_eq!(
+            app_state.ui.selected_header,
+            SelectedHeader::Torrent(ColumnId::Name)
+        );
     }
 
     #[test]
@@ -367,7 +377,7 @@ mod tests {
         let mut app_state = create_test_app_state();
         app_state.ui.selected_torrent_index = 0; // "hash_a" has 2 peers
         app_state.ui.selected_peer_index = 1;
-        app_state.ui.selected_header = SelectedHeader::Peer(0);
+        app_state.ui.selected_header = SelectedHeader::Peer(PeerColumnId::Flags);
 
         normal::handle_navigation(&mut app_state, KeyCode::Up);
 
@@ -379,7 +389,7 @@ mod tests {
     fn test_nav_up_at_top_of_list() {
         let mut app_state = create_test_app_state();
         app_state.ui.selected_torrent_index = 0; // At the top
-        app_state.ui.selected_header = SelectedHeader::Torrent(0);
+        app_state.ui.selected_header = SelectedHeader::Torrent(ColumnId::Name);
 
         normal::handle_navigation(&mut app_state, KeyCode::Up);
 
@@ -391,7 +401,7 @@ mod tests {
     fn test_nav_down_at_bottom_of_list() {
         let mut app_state = create_test_app_state();
         app_state.ui.selected_torrent_index = 1; // At the bottom (index 1 of 2)
-        app_state.ui.selected_header = SelectedHeader::Torrent(0);
+        app_state.ui.selected_header = SelectedHeader::Torrent(ColumnId::Name);
 
         normal::handle_navigation(&mut app_state, KeyCode::Down);
 
@@ -404,7 +414,7 @@ mod tests {
         let mut app_state = create_test_app_state();
         app_state.ui.selected_torrent_index = 0; // "hash_a" has 2 peers
         app_state.ui.selected_peer_index = 0; // At the top
-        app_state.ui.selected_header = SelectedHeader::Peer(0);
+        app_state.ui.selected_header = SelectedHeader::Peer(PeerColumnId::Flags);
 
         normal::handle_navigation(&mut app_state, KeyCode::Up);
 
@@ -417,7 +427,7 @@ mod tests {
         let mut app_state = create_test_app_state();
         app_state.ui.selected_torrent_index = 0; // "hash_a" has 2 peers
         app_state.ui.selected_peer_index = 1; // At the bottom (index 1 of 2)
-        app_state.ui.selected_header = SelectedHeader::Peer(0);
+        app_state.ui.selected_header = SelectedHeader::Peer(PeerColumnId::Flags);
 
         normal::handle_navigation(&mut app_state, KeyCode::Down);
 
@@ -429,7 +439,7 @@ mod tests {
     fn test_nav_right_jumps_to_peers_when_only_name_column_visible() {
         let mut app_state = create_test_app_state();
         app_state.ui.selected_torrent_index = 0;
-        app_state.ui.selected_header = SelectedHeader::Torrent(0);
+        app_state.ui.selected_header = SelectedHeader::Torrent(ColumnId::Name);
 
         if let Some(torrent) = app_state.torrents.get_mut("hash_a".as_bytes()) {
             torrent.latest_state.activity_message = "Seeding".to_string();
@@ -444,7 +454,10 @@ mod tests {
 
         normal::handle_navigation(&mut app_state, KeyCode::Right);
 
-        assert_eq!(app_state.ui.selected_header, SelectedHeader::Peer(0));
+        assert_eq!(
+            app_state.ui.selected_header,
+            SelectedHeader::Peer(PeerColumnId::Flags)
+        );
     }
 
     #[test]
