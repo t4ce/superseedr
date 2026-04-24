@@ -483,6 +483,38 @@ impl DemandSlotCounts {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DemandPlannerSelectionStats {
+    offered: DemandSlotCounts,
+    launched: DemandSlotCounts,
+    throttled: DemandSlotCounts,
+    oldest_throttled_awaiting_ms: u64,
+    oldest_throttled_no_peers_ms: u64,
+    oldest_throttled_routine_ms: u64,
+}
+
+impl DemandPlannerSelectionStats {
+    fn record_throttled_age(&mut self, class: DemandSliceClass, age_ms: u64) {
+        match class {
+            DemandSliceClass::AwaitingMetadata => {
+                self.oldest_throttled_awaiting_ms = self.oldest_throttled_awaiting_ms.max(age_ms);
+            }
+            DemandSliceClass::NoConnectedPeers => {
+                self.oldest_throttled_no_peers_ms = self.oldest_throttled_no_peers_ms.max(age_ms);
+            }
+            DemandSliceClass::RoutineRefresh => {
+                self.oldest_throttled_routine_ms = self.oldest_throttled_routine_ms.max(age_ms);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DemandPlannerSelection {
+    launches: Vec<DueDemandCandidate>,
+    stats: DemandPlannerSelectionStats,
+}
+
 #[derive(Debug)]
 struct DemandCrawlState {
     ipv4: Option<LookupState>,
@@ -3332,6 +3364,34 @@ fn spare_research_candidate_ready(
         .unwrap_or(true)
 }
 
+fn demand_planner_selection_stats(
+    offered_candidates: &[DueDemandCandidate],
+    launched_candidates: &[DueDemandCandidate],
+    now: Instant,
+) -> DemandPlannerSelectionStats {
+    let launched_hashes = launched_candidates
+        .iter()
+        .map(|candidate| candidate.info_hash)
+        .collect::<HashSet<_>>();
+    let mut stats = DemandPlannerSelectionStats::default();
+
+    for candidate in offered_candidates {
+        let class = DemandSliceClass::from_demand(candidate.demand);
+        stats.offered.record(class);
+        if launched_hashes.contains(&candidate.info_hash) {
+            stats.launched.record(class);
+        } else {
+            stats.throttled.record(class);
+            stats.record_throttled_age(
+                class,
+                duration_ms(now.saturating_duration_since(candidate.next_eligible_at)),
+            );
+        }
+    }
+
+    stats
+}
+
 fn select_spare_research_launches(
     demand_snapshots: &[DemandEntrySnapshot],
     active_counts: DemandSlotCounts,
@@ -3409,6 +3469,27 @@ fn select_due_demand_launches(
     now: Instant,
     total_budget: usize,
 ) -> Vec<DueDemandCandidate> {
+    select_due_demand_launches_with_stats(
+        due_candidates,
+        active_counts,
+        parked_crawls,
+        planner_state,
+        planner_budget,
+        now,
+        total_budget,
+    )
+    .launches
+}
+
+fn select_due_demand_launches_with_stats(
+    due_candidates: &[DueDemandCandidate],
+    active_counts: DemandSlotCounts,
+    parked_crawls: &HashMap<InfoHash, DemandCrawlState>,
+    planner_state: &HashMap<InfoHash, DemandPlannerState>,
+    planner_budget: &mut DemandPlannerBudget,
+    now: Instant,
+    total_budget: usize,
+) -> DemandPlannerSelection {
     let mut selected = Vec::new();
     let mut planned_counts = active_counts;
     let mut candidates = due_candidates.to_vec();
@@ -3461,7 +3542,10 @@ fn select_due_demand_launches(
         selected.push(candidate);
     }
 
-    selected
+    DemandPlannerSelection {
+        stats: demand_planner_selection_stats(due_candidates, &selected, now),
+        launches: selected,
+    }
 }
 
 async fn start_due_demands(
@@ -3500,7 +3584,7 @@ async fn start_due_demands(
         .into_iter()
         .filter(|snapshot| !draining_demands.contains_key(&snapshot.info_hash))
         .collect::<Vec<_>>();
-    let due_launches = select_due_demand_launches(
+    let due_selection = select_due_demand_launches_with_stats(
         &due_candidates,
         active_counts,
         parked_crawls,
@@ -3509,7 +3593,9 @@ async fn start_due_demands(
         now,
         launch_budget,
     );
-    let mut planned_launches = due_launches
+    let planner_selection_stats = due_selection.stats;
+    let mut planned_launches = due_selection
+        .launches
         .into_iter()
         .map(|candidate| {
             (
@@ -3542,12 +3628,29 @@ async fn start_due_demands(
         soak_metrics.record_launch_batch(planned_launches.len(), spare_selected);
     }
 
-    if demand_log_enabled && !planned_launches.is_empty() {
+    if demand_log_enabled
+        && (!planned_launches.is_empty() || planner_selection_stats.throttled.total() > 0)
+    {
         tracing::info!(
             target: "superseedr::dht_demand",
             launch_budget,
             due_total = due_candidates.len(),
             selected = planned_launches.len(),
+            offered_awaiting = planner_selection_stats.offered.awaiting_metadata,
+            offered_no_peers = planner_selection_stats.offered.no_connected_peers,
+            offered_routine = planner_selection_stats.offered.routine_refresh,
+            launched_awaiting = planner_selection_stats.launched.awaiting_metadata,
+            launched_no_peers = planner_selection_stats.launched.no_connected_peers,
+            launched_routine = planner_selection_stats.launched.routine_refresh,
+            throttled_total = planner_selection_stats.throttled.total(),
+            throttled_awaiting = planner_selection_stats.throttled.awaiting_metadata,
+            throttled_no_peers = planner_selection_stats.throttled.no_connected_peers,
+            throttled_routine = planner_selection_stats.throttled.routine_refresh,
+            oldest_throttled_awaiting_ms =
+                planner_selection_stats.oldest_throttled_awaiting_ms,
+            oldest_throttled_no_peers_ms =
+                planner_selection_stats.oldest_throttled_no_peers_ms,
+            oldest_throttled_routine_ms = planner_selection_stats.oldest_throttled_routine_ms,
             spare_selected,
             active_total = active_counts.total(),
             active_awaiting = active_counts.awaiting_metadata,
@@ -5036,6 +5139,51 @@ mod tests {
                 .saturating_sub(DHT_NO_CONNECTED_PEERS_SLOT_CAP)
         );
         assert!(third.is_empty());
+    }
+
+    #[test]
+    fn demand_planner_selection_stats_report_throttled_due_candidates() {
+        fn hash(index: u32) -> InfoHash {
+            let mut bytes = [0u8; InfoHash::LEN];
+            bytes[..4].copy_from_slice(&index.to_be_bytes());
+            InfoHash::from(bytes)
+        }
+
+        let now = Instant::now();
+        let due = (0..16u32)
+            .map(|index| DueDemandCandidate {
+                info_hash: hash(index),
+                demand: DhtDemandState {
+                    awaiting_metadata: false,
+                    connected_peers: 0,
+                },
+                next_eligible_at: now - Duration::from_secs(u64::from(index + 1)),
+                subscriber_count: 1,
+            })
+            .collect::<Vec<_>>();
+        let mut planner_budget = DemandPlannerBudget::new(now);
+
+        let selection = select_due_demand_launches_with_stats(
+            &due,
+            DemandSlotCounts::default(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut planner_budget,
+            now,
+            DHT_NO_CONNECTED_PEERS_SLOT_CAP,
+        );
+
+        assert_eq!(selection.launches.len(), DHT_NO_CONNECTED_PEERS_SLOT_CAP);
+        assert_eq!(selection.stats.offered.no_connected_peers, 16);
+        assert_eq!(
+            selection.stats.launched.no_connected_peers,
+            DHT_NO_CONNECTED_PEERS_SLOT_CAP
+        );
+        assert_eq!(
+            selection.stats.throttled.no_connected_peers,
+            16 - DHT_NO_CONNECTED_PEERS_SLOT_CAP
+        );
+        assert!(selection.stats.oldest_throttled_no_peers_ms >= 8_000);
     }
 
     #[test]
