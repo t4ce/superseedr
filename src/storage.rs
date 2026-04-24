@@ -122,7 +122,9 @@ pub async fn create_and_allocate_files(
             }
         }
 
-        // Create and set the length of the file if it doesn't exist.
+        // Create and size the file if it doesn't exist. If it already exists
+        // at the wrong size, resize it so validation reads cannot loop forever
+        // on repeated short reads.
         if !try_exists(&file_info.path).await? {
             let file = OpenOptions::new()
                 .write(true)
@@ -131,6 +133,16 @@ pub async fn create_and_allocate_files(
                 .open(&file_info.path)
                 .await?;
             file.set_len(file_info.length).await?;
+        } else {
+            let metadata = fs::metadata(&file_info.path).await?;
+            if metadata.is_file() && metadata.len() != file_info.length {
+                let file = OpenOptions::new()
+                    .write(true)
+                    .truncate(false)
+                    .open(&file_info.path)
+                    .await?;
+                file.set_len(file_info.length).await?;
+            }
         }
     }
     Ok(is_fresh_download)
@@ -441,6 +453,19 @@ mod tests {
 
         let file_path = &mfi.files[0].path;
         assert!(tokio::fs::try_exists(file_path).await.unwrap());
+        let metadata = tokio::fs::metadata(file_path).await.unwrap();
+        assert_eq!(metadata.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn test_create_and_allocate_files_resizes_existing_short_file() {
+        let (_dir, mfi) = setup_single_file();
+        let file_path = &mfi.files[0].path;
+        tokio::fs::write(file_path, []).await.unwrap();
+
+        let is_fresh = create_and_allocate_files(&mfi).await.unwrap();
+
+        assert!(!is_fresh);
         let metadata = tokio::fs::metadata(file_path).await.unwrap();
         assert_eq!(metadata.len(), 100);
     }
