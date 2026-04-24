@@ -189,7 +189,10 @@ impl TorrentManager {
     fn current_dht_demand_state(&self) -> DhtDemandState {
         DhtDemandState {
             awaiting_metadata: self.state.torrent_status == TorrentStatus::AwaitingMetadata,
-            connected_peers: self.state.peers.len(),
+            // The DHT planner only distinguishes starved torrents from torrents
+            // with at least one connected peer. Do not wake it for exact peer
+            // count churn while the torrent remains in the same demand class.
+            connected_peers: usize::from(!self.state.peers.is_empty()),
         }
     }
 
@@ -3344,6 +3347,32 @@ mod resource_tests {
         manager.state.update(Action::RegisterPeer {
             peer_id: "peer-a".into(),
             tx: peer_tx,
+        });
+
+        assert_eq!(
+            manager.current_dht_demand_state(),
+            DhtDemandState {
+                awaiting_metadata: false,
+                connected_peers: 1,
+            }
+        );
+    }
+
+    #[cfg(feature = "dht")]
+    #[tokio::test]
+    async fn test_current_dht_demand_state_normalizes_active_peer_count() {
+        let mut manager =
+            TorrentManager::from_torrent(build_test_params(), create_dummy_torrent(4))
+                .expect("manager from torrent");
+        let (first_peer_tx, _first_peer_rx) = mpsc::channel(1);
+        manager.state.update(Action::RegisterPeer {
+            peer_id: "peer-a".into(),
+            tx: first_peer_tx,
+        });
+        let (second_peer_tx, _second_peer_rx) = mpsc::channel(1);
+        manager.state.update(Action::RegisterPeer {
+            peer_id: "peer-b".into(),
+            tx: second_peer_tx,
         });
 
         assert_eq!(
