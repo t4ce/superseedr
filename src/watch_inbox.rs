@@ -26,7 +26,16 @@ where
     match rename_op(source, destination) {
         Ok(()) => Ok(()),
         Err(error) if is_cross_device_link_error(&error) => {
+            let metadata = fs::metadata(source)?;
+            let mut timestamp = fs::FileTimes::new();
+            if let Ok(mtime) = metadata.modified() {
+                timestamp = timestamp.set_modified(mtime);
+            }
             fs::copy(source, destination)?;
+            fs::OpenOptions::new()
+                .write(true)
+                .open(destination)?
+                .set_times(timestamp)?;
             fs::remove_file(source)?;
             Ok(())
         }
