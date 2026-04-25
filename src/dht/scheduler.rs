@@ -372,6 +372,8 @@ impl DemandScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use std::collections::HashSet;
 
     fn info_hash(byte: u8) -> InfoHash {
         InfoHash::from([byte; InfoHash::LEN])
@@ -382,6 +384,128 @@ mod tests {
             awaiting_metadata,
             connected_peers,
         }
+    }
+
+    #[derive(Debug, Clone)]
+    enum SchedulerOp {
+        Register {
+            key: u8,
+            demand: DhtDemandState,
+            advance_ms: u16,
+        },
+        Update {
+            key: u8,
+            demand: DhtDemandState,
+            advance_ms: u16,
+        },
+        Unregister {
+            key: u8,
+            advance_ms: u16,
+        },
+        MarkInProgress {
+            key: u8,
+            advance_ms: u16,
+        },
+        Finish {
+            key: u8,
+            accelerated: bool,
+            advance_ms: u16,
+        },
+        ResetActive {
+            advance_ms: u16,
+        },
+        TakeDue {
+            limit: u8,
+            advance_ms: u16,
+        },
+    }
+
+    fn demand_strategy() -> impl Strategy<Value = DhtDemandState> {
+        (any::<bool>(), 0usize..=16).prop_map(|(awaiting_metadata, connected_peers)| {
+            DhtDemandState {
+                awaiting_metadata,
+                connected_peers,
+            }
+        })
+    }
+
+    fn scheduler_op_strategy() -> impl Strategy<Value = SchedulerOp> {
+        let key = 0u8..32;
+        let advance_ms = 0u16..=5_000;
+
+        prop_oneof![
+            (key.clone(), demand_strategy(), advance_ms.clone()).prop_map(
+                |(key, demand, advance_ms)| SchedulerOp::Register {
+                    key,
+                    demand,
+                    advance_ms,
+                }
+            ),
+            (key.clone(), demand_strategy(), advance_ms.clone()).prop_map(
+                |(key, demand, advance_ms)| SchedulerOp::Update {
+                    key,
+                    demand,
+                    advance_ms,
+                }
+            ),
+            (key.clone(), advance_ms.clone())
+                .prop_map(|(key, advance_ms)| { SchedulerOp::Unregister { key, advance_ms } }),
+            (key.clone(), advance_ms.clone())
+                .prop_map(|(key, advance_ms)| { SchedulerOp::MarkInProgress { key, advance_ms } }),
+            (key, any::<bool>(), advance_ms.clone()).prop_map(|(key, accelerated, advance_ms)| {
+                SchedulerOp::Finish {
+                    key,
+                    accelerated,
+                    advance_ms,
+                }
+            }),
+            advance_ms
+                .clone()
+                .prop_map(|advance_ms| SchedulerOp::ResetActive { advance_ms }),
+            (0u8..=16, advance_ms)
+                .prop_map(|(limit, advance_ms)| SchedulerOp::TakeDue { limit, advance_ms }),
+        ]
+    }
+
+    fn assert_scheduler_invariants(
+        scheduler: &DemandScheduler,
+        now: Instant,
+    ) -> Result<(), TestCaseError> {
+        let snapshots = scheduler.entry_snapshots();
+        let mut seen = HashSet::new();
+        for snapshot in &snapshots {
+            prop_assert!(seen.insert(snapshot.info_hash));
+            prop_assert!(snapshot.subscriber_count > 0);
+            prop_assert!(
+                snapshot.no_connected_peers_backoff_step
+                    <= scheduler.no_connected_peers_backoff_step_cap()
+            );
+            if DemandClass::from_demand(snapshot.demand) != DemandClass::NoConnectedPeers {
+                prop_assert_eq!(snapshot.no_connected_peers_backoff_step, 0);
+            }
+        }
+
+        let due = scheduler.due_candidates(now);
+        let mut previous_class = None;
+        for candidate in due {
+            let snapshot = scheduler
+                .entry_snapshot(candidate.info_hash)
+                .expect("due candidate must have a scheduler entry");
+            prop_assert!(snapshot.subscriber_count > 0);
+            prop_assert!(!snapshot.in_progress);
+            prop_assert!(snapshot.next_eligible_at <= now);
+            prop_assert_eq!(snapshot.demand, candidate.demand);
+            prop_assert_eq!(snapshot.subscriber_count, candidate.subscriber_count);
+            prop_assert_eq!(snapshot.next_eligible_at, candidate.next_eligible_at);
+
+            let class = DemandClass::from_demand(candidate.demand);
+            if let Some(previous_class) = previous_class {
+                prop_assert!(previous_class >= class);
+            }
+            previous_class = Some(class);
+        }
+
+        Ok(())
     }
 
     #[test]
@@ -610,5 +734,87 @@ mod tests {
                 .no_connected_peers_backoff_step,
             3
         );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 128,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn demand_scheduler_state_fuzz_keeps_entries_consistent(
+            ops in prop::collection::vec(scheduler_op_strategy(), 1..160)
+        ) {
+            let mut now = Instant::now();
+            let mut scheduler = DemandScheduler::new(
+                Duration::from_secs(60),
+                Duration::from_secs(8),
+                Duration::from_secs(60),
+                Duration::from_secs(1),
+            );
+
+            for op in ops {
+                let advance_ms = match &op {
+                    SchedulerOp::Register { advance_ms, .. }
+                    | SchedulerOp::Update { advance_ms, .. }
+                    | SchedulerOp::Unregister { advance_ms, .. }
+                    | SchedulerOp::MarkInProgress { advance_ms, .. }
+                    | SchedulerOp::Finish { advance_ms, .. }
+                    | SchedulerOp::ResetActive { advance_ms }
+                    | SchedulerOp::TakeDue { advance_ms, .. } => *advance_ms,
+                };
+                now += Duration::from_millis(u64::from(advance_ms));
+
+                match op {
+                    SchedulerOp::Register { key, demand, .. } => {
+                        scheduler.register(info_hash(key), demand, now);
+                    }
+                    SchedulerOp::Update { key, demand, .. } => {
+                        scheduler.update(info_hash(key), demand, now);
+                    }
+                    SchedulerOp::Unregister { key, .. } => {
+                        scheduler.unregister(info_hash(key));
+                    }
+                    SchedulerOp::MarkInProgress { key, .. } => {
+                        let hash = info_hash(key);
+                        let marked = scheduler.mark_in_progress(hash);
+                        if marked {
+                            let snapshot = scheduler.entry_snapshot(hash).expect("marked entry");
+                            prop_assert!(snapshot.in_progress);
+                        }
+                    }
+                    SchedulerOp::Finish {
+                        key, accelerated, ..
+                    } => {
+                        let mode = if accelerated {
+                            DemandFinishMode::AcceleratedNoConnectedPeersBackoff
+                        } else {
+                            DemandFinishMode::Standard
+                        };
+                        scheduler.finish_with_mode(info_hash(key), now, mode);
+                    }
+                    SchedulerOp::ResetActive { .. } => {
+                        scheduler.reset_active(now);
+                    }
+                    SchedulerOp::TakeDue { limit, .. } => {
+                        let expected = scheduler
+                            .due_candidates(now)
+                            .into_iter()
+                            .take(usize::from(limit))
+                            .map(|candidate| candidate.info_hash)
+                            .collect::<Vec<_>>();
+                        let actual = scheduler.take_due(now, usize::from(limit));
+                        prop_assert_eq!(&actual, &expected);
+                        for hash in actual {
+                            let snapshot = scheduler.entry_snapshot(hash).expect("taken entry");
+                            prop_assert!(snapshot.in_progress);
+                        }
+                    }
+                }
+
+                assert_scheduler_invariants(&scheduler, now)?;
+            }
+        }
     }
 }

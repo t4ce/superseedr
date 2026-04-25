@@ -517,6 +517,246 @@ struct DemandPlannerSelection {
 }
 
 #[derive(Debug)]
+enum DemandPlannerAction<'a> {
+    RuntimeReset {
+        now: Instant,
+    },
+    DemandRegistered {
+        info_hash: InfoHash,
+        demand: DhtDemandState,
+        now: Instant,
+    },
+    DemandUpdated {
+        info_hash: InfoHash,
+        demand: DhtDemandState,
+        now: Instant,
+    },
+    DemandSubscriberRemoved {
+        info_hash: InfoHash,
+    },
+    PeersReceived {
+        info_hash: InfoHash,
+        peers: &'a [SocketAddr],
+    },
+    DrainTick {
+        now: Instant,
+        runtime_ready: HashMap<InfoHash, bool>,
+    },
+    PlanDue {
+        now: Instant,
+        runtime_available: bool,
+    },
+    LookupStarted {
+        info_hash: InfoHash,
+        slice_class: DemandSliceClass,
+        lookup_ids: Arc<StdMutex<Vec<LookupId>>>,
+    },
+    LookupStartFailed {
+        info_hash: InfoHash,
+        slice_class: DemandSliceClass,
+        now: Instant,
+    },
+    LookupFinished {
+        info_hash: InfoHash,
+        slice_class: DemandSliceClass,
+        total_peers: usize,
+        unique_peers: usize,
+        now: Instant,
+    },
+    LookupParkRequested {
+        info_hash: InfoHash,
+        slice_class: DemandSliceClass,
+        stop_reason: DemandSliceStopReason,
+        total_peers: usize,
+        unique_peers: HashSet<SocketAddr>,
+        lookup_ids: Arc<StdMutex<Vec<LookupId>>>,
+    },
+    LookupParkResolved {
+        info_hash: InfoHash,
+        slice_class: DemandSliceClass,
+        stop_reason: DemandSliceStopReason,
+        total_peers: usize,
+        unique_peers: usize,
+        parked_outcome: Option<DemandParkedSliceOutcome>,
+        drain_admission: Option<DemandDrainAdmissionSnapshot>,
+        previous: Option<DemandEntrySnapshot>,
+        now: Instant,
+    },
+    DrainedLookupFinalized {
+        info_hash: InfoHash,
+        outcome: DrainedDemandOutcome,
+        previous: Option<DemandEntrySnapshot>,
+        now: Instant,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DemandStartLookupEffect {
+    candidate: DueDemandCandidate,
+    plan: DemandLookupPlan,
+    selection_reason: DemandSelectionReason,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DemandLookupFinishedEffect {
+    info_hash: InfoHash,
+    slice_class: DemandSliceClass,
+    total_peers: usize,
+    unique_peers: usize,
+    previous: Option<DemandEntrySnapshot>,
+    current: Option<DemandEntrySnapshot>,
+    finished_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DemandDrainAdmissionSnapshot {
+    initial_inflight_queries: usize,
+    score: i32,
+    deadline_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct DemandAdmitDrainEffect {
+    info_hash: InfoHash,
+    slice_class: DemandSliceClass,
+    stop_reason: DemandSliceStopReason,
+    total_peers: usize,
+    unique_peers: HashSet<SocketAddr>,
+    lookup_ids: Arc<StdMutex<Vec<LookupId>>>,
+    previous: Option<DemandEntrySnapshot>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DemandLookupParkedEffect {
+    info_hash: InfoHash,
+    slice_class: DemandSliceClass,
+    stop_reason: DemandSliceStopReason,
+    total_peers: usize,
+    unique_peers: usize,
+    parked_outcome: Option<DemandParkedSliceOutcome>,
+    drain_admission: Option<DemandDrainAdmissionSnapshot>,
+    previous: Option<DemandEntrySnapshot>,
+    current: Option<DemandEntrySnapshot>,
+    parked_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DemandDrainFinalizedEffect {
+    info_hash: InfoHash,
+    outcome: DrainedDemandOutcome,
+    finish_mode: DemandFinishMode,
+    previous: Option<DemandEntrySnapshot>,
+    current: Option<DemandEntrySnapshot>,
+    finalized_at: Instant,
+    parked: bool,
+}
+
+#[derive(Debug, Clone)]
+struct DemandParkActiveLookupEffect {
+    info_hash: InfoHash,
+    slice_class: DemandSliceClass,
+    lookup_ids: Arc<StdMutex<Vec<LookupId>>>,
+}
+
+#[derive(Debug, Clone)]
+struct DemandCancelDrainingLookupEffect {
+    info_hash: InfoHash,
+    lookup_ids: Vec<LookupId>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DemandFinalizeDrainingLookupEffect {
+    info_hash: InfoHash,
+    force: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DemandDrainPeersRecordedEffect {
+    info_hash: InfoHash,
+    peer_count: usize,
+    unique_added: usize,
+    initial_unique_peers: usize,
+}
+
+#[derive(Debug, Clone)]
+enum DemandPlannerEffect {
+    StartLookup(DemandStartLookupEffect),
+    LookupFinished(DemandLookupFinishedEffect),
+    AdmitDrain(DemandAdmitDrainEffect),
+    LookupParked(DemandLookupParkedEffect),
+    DrainFinalized(DemandDrainFinalizedEffect),
+    ParkActiveLookup(DemandParkActiveLookupEffect),
+    CancelDrainingLookup(DemandCancelDrainingLookupEffect),
+    FinalizeDrainingLookup(DemandFinalizeDrainingLookupEffect),
+    DrainPeersRecorded(DemandDrainPeersRecordedEffect),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DemandPlannerPlanStats {
+    launch_budget: usize,
+    due_total: usize,
+    selection_stats: DemandPlannerSelectionStats,
+    spare_selected: usize,
+    active_counts: DemandSlotCounts,
+    parked_count: usize,
+    draining_count: usize,
+    drain_virtual_slots: usize,
+    budget_awaiting: usize,
+    budget_no_peers: usize,
+    budget_routine: usize,
+}
+
+#[derive(Debug, Default)]
+struct DemandPlannerReduction {
+    effects: Vec<DemandPlannerEffect>,
+    plan_stats: Option<DemandPlannerPlanStats>,
+}
+
+#[derive(Debug)]
+struct DemandPlannerModel {
+    scheduler: DemandScheduler,
+    active: HashMap<InfoHash, ActiveDemandLookup>,
+    parked_crawls: HashMap<InfoHash, DemandCrawlState>,
+    draining_demands: HashMap<InfoHash, DrainingDemandLookup>,
+    state: HashMap<InfoHash, DemandPlannerState>,
+    budget: DemandPlannerBudget,
+}
+
+impl DemandPlannerModel {
+    fn new(now: Instant) -> Self {
+        Self {
+            scheduler: DemandScheduler::new(
+                DHT_ROUTINE_LOOKUP_REFRESH_INTERVAL,
+                DHT_NO_CONNECTED_PEERS_BASE_INTERVAL,
+                DHT_NO_CONNECTED_PEERS_MAX_INTERVAL,
+                DHT_AWAITING_METADATA_REFRESH_INTERVAL,
+            ),
+            active: HashMap::new(),
+            parked_crawls: HashMap::new(),
+            draining_demands: HashMap::new(),
+            state: HashMap::new(),
+            budget: DemandPlannerBudget::new(now),
+        }
+    }
+
+    fn has_draining_demands(&self) -> bool {
+        !self.draining_demands.is_empty()
+    }
+
+    fn metadata_waiter_count(&self) -> usize {
+        self.scheduler
+            .entry_snapshots()
+            .into_iter()
+            .filter(|snapshot| snapshot.demand.awaiting_metadata && snapshot.subscriber_count > 0)
+            .count()
+    }
+
+    fn entry_snapshot(&self, info_hash: InfoHash) -> Option<DemandEntrySnapshot> {
+        self.scheduler.entry_snapshot(info_hash)
+    }
+}
+
+#[derive(Debug)]
 struct DemandCrawlState {
     ipv4: Option<LookupState>,
     ipv6: Option<LookupState>,
@@ -789,58 +1029,6 @@ enum DemandSelectionReason {
 }
 
 #[derive(Debug, Clone, Default)]
-struct DhtSoakMetrics;
-
-impl DhtSoakMetrics {
-    fn new(_now: Instant) -> Self {
-        Self
-    }
-
-    fn record_launch_batch(&mut self, _selected: usize, _spare_selected: usize) {}
-
-    fn record_launch_failure(&mut self) {}
-
-    fn record_peer_batch(&mut self, _peer_count: usize, _delivered: bool) {}
-
-    fn record_drain_peer_batch(
-        &mut self,
-        _peer_count: usize,
-        _unique_added: usize,
-        _initial_unique_peers: usize,
-    ) {
-    }
-
-    fn record_drain_start(
-        &mut self,
-        _total_peers: usize,
-        _unique_peers: usize,
-        _outcome: Option<DemandParkedSliceOutcome>,
-    ) {
-    }
-
-    fn record_drain_replaced(&mut self) {}
-
-    fn record_drain_rejected(&mut self, _inflight_queries: usize) {}
-
-    fn record_natural_finish(&mut self, _total_peers: usize, _unique_peers: usize) {}
-
-    fn record_drain_finalize(
-        &mut self,
-        _outcome: DrainedDemandOutcome,
-        _duration_ms: u64,
-        _after_deadline: bool,
-    ) {
-    }
-}
-fn ratio_u64(part: u64, total: u64) -> u64 {
-    if total == 0 {
-        0
-    } else {
-        part / total
-    }
-}
-
-#[derive(Debug, Clone, Default)]
 struct DemandSliceClassMetrics {
     fresh_starts: u64,
     resumed_starts: u64,
@@ -1021,186 +1209,8 @@ impl DemandSliceMetrics {
     }
 }
 
-fn short_info_hash_hex(info_hash: InfoHash) -> String {
-    hex::encode(&info_hash.as_ref()[..4])
-}
-
 fn duration_ms(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
-}
-
-fn due_in_ms(snapshot: DemandEntrySnapshot, now: Instant) -> u64 {
-    duration_ms(snapshot.next_eligible_at.saturating_duration_since(now))
-}
-
-fn demand_slice_class_label(class: DemandSliceClass) -> &'static str {
-    match class {
-        DemandSliceClass::AwaitingMetadata => "awaiting_metadata",
-        DemandSliceClass::NoConnectedPeers => "no_connected_peers",
-        DemandSliceClass::RoutineRefresh => "routine_refresh",
-    }
-}
-
-fn demand_selection_reason_label(reason: DemandSelectionReason) -> &'static str {
-    match reason {
-        DemandSelectionReason::ReusableParked => "reusable_parked",
-        DemandSelectionReason::UsefulYieldHistory => "useful_yield_history",
-        DemandSelectionReason::OverdueScarce => "overdue_scarce",
-        DemandSelectionReason::SpareCapacity => "spare_capacity",
-    }
-}
-
-fn demand_stop_reason_label(reason: DemandSliceStopReason) -> &'static str {
-    match reason {
-        DemandSliceStopReason::NaturalFinish => "natural_finish",
-        DemandSliceStopReason::WallTime => "wall_time",
-        DemandSliceStopReason::IdleTimeout => "idle_timeout",
-        DemandSliceStopReason::FirstBatch => "first_batch",
-        DemandSliceStopReason::UniquePeerCap => "unique_peer_cap",
-    }
-}
-
-fn demand_parked_slice_outcome_label(outcome: DemandParkedSliceOutcome) -> &'static str {
-    match outcome {
-        DemandParkedSliceOutcome::UsefulYield => "useful_yield",
-        DemandParkedSliceOutcome::WeakLowYield => "weak_low_yield",
-        DemandParkedSliceOutcome::HealthyZeroYield => "healthy_zero_yield",
-        DemandParkedSliceOutcome::HealthyLowYield => "healthy_low_yield",
-        DemandParkedSliceOutcome::Ignored => "ignored",
-    }
-}
-
-fn demand_reset_reason_label(reason: DemandCrawlResetReason) -> &'static str {
-    match reason {
-        DemandCrawlResetReason::Stale => "stale",
-        DemandCrawlResetReason::ClassChanged => "class_changed",
-        DemandCrawlResetReason::LowQuality => "low_quality",
-    }
-}
-
-fn demand_diagnostics_log_enabled() -> bool {
-    env::var_os("SUPERSEEDR_DHT_DEMAND_LOG").is_some()
-}
-
-fn snapshot_class_label(snapshot: Option<DemandEntrySnapshot>) -> &'static str {
-    snapshot
-        .map(|snapshot| demand_slice_class_label(DemandSliceClass::from_demand(snapshot.demand)))
-        .unwrap_or("none")
-}
-
-fn log_demand_state_event(
-    action: &'static str,
-    info_hash: InfoHash,
-    requested_demand: Option<DhtDemandState>,
-    before: Option<DemandEntrySnapshot>,
-    after: Option<DemandEntrySnapshot>,
-    demand_lookup_ids: &HashMap<InfoHash, ActiveDemandLookup>,
-    parked_crawls: &HashMap<InfoHash, DemandCrawlState>,
-    now: Instant,
-) {
-    let active_lookup_class = demand_lookup_ids
-        .get(&info_hash)
-        .map(|lookup| demand_slice_class_label(lookup.slice_class))
-        .unwrap_or("none");
-    let parked_class = parked_crawls
-        .get(&info_hash)
-        .map(|crawl| demand_slice_class_label(crawl.class))
-        .unwrap_or("none");
-
-    tracing::info!(
-        target: "superseedr::dht_demand",
-        action = action,
-        info_hash = %short_info_hash_hex(info_hash),
-        requested_demand = ?requested_demand,
-        previous_demand = ?before.map(|snapshot| snapshot.demand),
-        current_demand = ?after.map(|snapshot| snapshot.demand),
-        previous_class = snapshot_class_label(before),
-        current_class = snapshot_class_label(after),
-        current_subscribers = after.map(|snapshot| snapshot.subscriber_count).unwrap_or(0),
-        current_in_progress = after.map(|snapshot| snapshot.in_progress).unwrap_or(false),
-        current_retrigger_pending = after.map(|snapshot| snapshot.retrigger_pending).unwrap_or(false),
-        current_no_peers_backoff_step = after
-            .map(|snapshot| snapshot.no_connected_peers_backoff_step)
-            .unwrap_or(0),
-        current_due_in_ms = after.map(|snapshot| due_in_ms(snapshot, now)).unwrap_or(0),
-        active_lookup_class,
-        parked_class,
-        "dht demand state"
-    );
-}
-
-fn log_demand_scheduler_summary(
-    demand_scheduler: &DemandScheduler,
-    demand_lookup_ids: &HashMap<InfoHash, ActiveDemandLookup>,
-    draining_demands: &HashMap<InfoHash, DrainingDemandLookup>,
-    parked_crawls: &HashMap<InfoHash, DemandCrawlState>,
-    planner_budget: &mut DemandPlannerBudget,
-    now: Instant,
-) {
-    let mut entries = DemandSlotCounts::default();
-    let mut due = DemandSlotCounts::default();
-    let mut in_progress = DemandSlotCounts::default();
-    let mut retrigger_pending = 0usize;
-    let mut subscribers = 0usize;
-    let mut max_no_peers_backoff_step = 0u8;
-    let mut next_due_ms: Option<u64> = None;
-
-    for snapshot in demand_scheduler.entry_snapshots() {
-        let class = DemandSliceClass::from_demand(snapshot.demand);
-        entries.record(class);
-        subscribers = subscribers.saturating_add(snapshot.subscriber_count);
-        max_no_peers_backoff_step =
-            max_no_peers_backoff_step.max(snapshot.no_connected_peers_backoff_step);
-        if snapshot.in_progress {
-            in_progress.record(class);
-        }
-        if snapshot.retrigger_pending {
-            retrigger_pending = retrigger_pending.saturating_add(1);
-        }
-        if snapshot.subscriber_count > 0 && !snapshot.in_progress {
-            if snapshot.next_eligible_at <= now {
-                due.record(class);
-            } else {
-                let candidate_due_ms = due_in_ms(snapshot, now);
-                next_due_ms = Some(
-                    next_due_ms.map_or(candidate_due_ms, |current| current.min(candidate_due_ms)),
-                );
-            }
-        }
-    }
-
-    let active = active_demand_lookup_slot_counts(demand_lookup_ids);
-    let drain_virtual_slots = drain_virtual_slot_count(draining_demands.len());
-    planner_budget.refill(now);
-    tracing::info!(
-        target: "superseedr::dht_demand",
-        entries_total = entries.total(),
-        entries_awaiting = entries.awaiting_metadata,
-        entries_no_peers = entries.no_connected_peers,
-        entries_routine = entries.routine_refresh,
-        subscribers,
-        due_total = due.total(),
-        due_awaiting = due.awaiting_metadata,
-        due_no_peers = due.no_connected_peers,
-        due_routine = due.routine_refresh,
-        active_total = active.total(),
-        active_awaiting = active.awaiting_metadata,
-        active_no_peers = active.no_connected_peers,
-        active_routine = active.routine_refresh,
-        retrigger_pending,
-        parked = parked_crawls.len(),
-        draining = draining_demands.len(),
-        drain_virtual_slots,
-        launch_budget = demand_lookup_launch_budget(demand_lookup_ids, draining_demands.len()),
-        budget_awaiting = planner_budget.available(DemandSliceClass::AwaitingMetadata, now),
-        budget_no_peers = planner_budget.available(DemandSliceClass::NoConnectedPeers, now),
-        budget_routine = planner_budget.available(DemandSliceClass::RoutineRefresh, now),
-        next_due_ms = next_due_ms
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "none".to_string()),
-        max_no_peers_backoff_step,
-        "dht demand summary"
-    );
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1240,8 +1250,18 @@ impl DemandLookupPlan {
     }
 }
 
+type DhtCommandSender = mpsc::UnboundedSender<DhtCommand>;
+type DhtCommandReceiver = mpsc::UnboundedReceiver<DhtCommand>;
+
+fn send_dht_command(
+    command_tx: &DhtCommandSender,
+    command: DhtCommand,
+) -> Result<(), mpsc::error::SendError<DhtCommand>> {
+    command_tx.send(command)
+}
+
 struct LookupCancelGuard {
-    command_tx: mpsc::UnboundedSender<DhtCommand>,
+    command_tx: DhtCommandSender,
     lookup_ids: Arc<StdMutex<Vec<LookupId>>>,
 }
 
@@ -1251,9 +1271,12 @@ impl Drop for LookupCancelGuard {
         if lookup_ids.is_empty() {
             return;
         }
-        let _ = self.command_tx.send(DhtCommand::CancelLookups {
-            lookup_ids: std::mem::take(&mut *lookup_ids),
-        });
+        let _ = send_dht_command(
+            &self.command_tx,
+            DhtCommand::CancelLookups {
+                lookup_ids: std::mem::take(&mut *lookup_ids),
+            },
+        );
     }
 }
 
@@ -1265,7 +1288,7 @@ struct ManagedLookupReceiver {
 impl ManagedLookupReceiver {
     fn new(
         receiver: mpsc::UnboundedReceiver<Vec<SocketAddr>>,
-        command_tx: mpsc::UnboundedSender<DhtCommand>,
+        command_tx: DhtCommandSender,
         lookup_ids: Arc<StdMutex<Vec<LookupId>>>,
     ) -> Self {
         let has_lookup_ids = !lookup_ids
@@ -1298,7 +1321,7 @@ impl ManagedLookupReceiver {
 #[derive(Debug)]
 enum DhtDemandSubscriptionInner {
     Service {
-        command_tx: mpsc::UnboundedSender<DhtCommand>,
+        command_tx: DhtCommandSender,
         info_hash: InfoHash,
         subscriber_id: u64,
     },
@@ -1335,10 +1358,13 @@ impl Drop for DhtDemandSubscription {
             subscriber_id,
         } = &self.inner
         {
-            let _ = command_tx.send(DhtCommand::UnregisterDemand {
-                info_hash: *info_hash,
-                subscriber_id: *subscriber_id,
-            });
+            let _ = send_dht_command(
+                command_tx,
+                DhtCommand::UnregisterDemand {
+                    info_hash: *info_hash,
+                    subscriber_id: *subscriber_id,
+                },
+            );
         }
     }
 }
@@ -1433,6 +1459,13 @@ enum LoopEvent {
     CommandClosed,
 }
 
+fn command_event(maybe_command: Option<DhtCommand>) -> LoopEvent {
+    match maybe_command {
+        Some(command) => LoopEvent::Command(command),
+        None => LoopEvent::CommandClosed,
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct BootstrapSummary {
     total: usize,
@@ -1461,7 +1494,7 @@ pub struct DhtService {
     handle: DhtHandle,
     status_rx: watch::Receiver<DhtStatus>,
     wave_telemetry_rx: watch::Receiver<DhtWaveTelemetry>,
-    command_tx: mpsc::UnboundedSender<DhtCommand>,
+    command_tx: DhtCommandSender,
     #[allow(dead_code)]
     task: Option<JoinHandle<()>>,
 }
@@ -1534,7 +1567,7 @@ impl DhtService {
     }
 
     pub fn reconfigure(&self, config: DhtServiceConfig) {
-        let _ = self.command_tx.send(DhtCommand::Reconfigure(config));
+        let _ = send_dht_command(&self.command_tx, DhtCommand::Reconfigure(config));
     }
 }
 
@@ -1603,7 +1636,7 @@ pub struct DhtHandle {
 #[derive(Clone)]
 enum DhtHandleInner {
     Service {
-        command_tx: mpsc::UnboundedSender<DhtCommand>,
+        command_tx: DhtCommandSender,
         status_rx: watch::Receiver<DhtStatus>,
     },
     #[cfg(test)]
@@ -1773,7 +1806,7 @@ impl DhtHandle {
                     port,
                     response_tx,
                 };
-                if command_tx.send(command).is_err() {
+                if send_dht_command(command_tx, command).is_err() {
                     return false;
                 }
                 response_rx.await.unwrap_or(false)
@@ -1810,7 +1843,7 @@ impl DhtHandle {
                     subscriber_tx,
                     response_tx,
                 };
-                if command_tx.send(command).is_err() {
+                if send_dht_command(command_tx, command).is_err() {
                     return None;
                 }
 
@@ -1839,12 +1872,14 @@ impl DhtHandle {
         };
 
         match &self.inner {
-            DhtHandleInner::Service { command_tx, .. } => command_tx
-                .send(DhtCommand::UpdateDemand {
+            DhtHandleInner::Service { command_tx, .. } => send_dht_command(
+                command_tx,
+                DhtCommand::UpdateDemand {
                     info_hash: InfoHash::from(info_hash),
                     demand,
-                })
-                .is_ok(),
+                },
+            )
+            .is_ok(),
             #[cfg(test)]
             DhtHandleInner::Recorder { .. } => true,
             DhtHandleInner::Disabled { .. } => true,
@@ -1866,7 +1901,7 @@ impl DhtHandle {
                     info_hash,
                     response_tx,
                 };
-                if command_tx.send(command).is_err() {
+                if send_dht_command(command_tx, command).is_err() {
                     return if matches!(status_rx.borrow().health.backend, DhtBackendKind::Disabled)
                     {
                         Some(ManagedLookupReceiver::empty())
@@ -1905,12 +1940,10 @@ async fn run_service(
     mut warning: Option<String>,
     status_tx: watch::Sender<DhtStatus>,
     wave_telemetry_tx: watch::Sender<DhtWaveTelemetry>,
-    command_tx: mpsc::UnboundedSender<DhtCommand>,
-    mut command_rx: mpsc::UnboundedReceiver<DhtCommand>,
+    command_tx: DhtCommandSender,
+    mut command_rx: DhtCommandReceiver,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
-    let slice_metrics_log_enabled = env::var_os("SUPERSEEDR_DHT_SLICE_LOG").is_some();
-    let demand_log_enabled = env::var_os("SUPERSEEDR_DHT_DEMAND_LOG").is_some();
     let mut demand_tick = tokio::time::interval(DHT_DEMAND_SCHEDULER_INTERVAL);
     demand_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut drain_interval = tokio::time::interval(DHT_DEMAND_DRAIN_POLL_INTERVAL);
@@ -1918,23 +1951,12 @@ async fn run_service(
     let mut maintenance_interval = tokio::time::interval(DHT_MAINTENANCE_INTERVAL);
     let mut health_interval = tokio::time::interval(DHT_HEALTH_REFRESH_INTERVAL);
     let mut generation = status_tx.borrow().generation;
-    let mut demand_scheduler = DemandScheduler::new(
-        DHT_ROUTINE_LOOKUP_REFRESH_INTERVAL,
-        DHT_NO_CONNECTED_PEERS_BASE_INTERVAL,
-        DHT_NO_CONNECTED_PEERS_MAX_INTERVAL,
-        DHT_AWAITING_METADATA_REFRESH_INTERVAL,
-    );
+    let mut demand_planner = DemandPlannerModel::new(Instant::now());
     let mut demand_subscribers: HashMap<
         InfoHash,
         HashMap<u64, mpsc::UnboundedSender<Vec<SocketAddr>>>,
     > = HashMap::new();
-    let mut demand_lookup_ids: HashMap<InfoHash, ActiveDemandLookup> = HashMap::new();
-    let mut parked_crawls: HashMap<InfoHash, DemandCrawlState> = HashMap::new();
-    let mut draining_demands: HashMap<InfoHash, DrainingDemandLookup> = HashMap::new();
-    let mut planner_state: HashMap<InfoHash, DemandPlannerState> = HashMap::new();
-    let mut planner_budget = DemandPlannerBudget::new(Instant::now());
     let mut slice_metrics = DemandSliceMetrics::default();
-    let mut soak_metrics = DhtSoakMetrics::new(Instant::now());
     let mut recent_unique_peers = RecentUniquePeers::new(DHT_UNIQUE_PEERS_FOUND_WINDOW);
     let mut next_subscriber_id = 1u64;
 
@@ -1958,8 +1980,8 @@ async fn run_service(
             tokio::select! {
                 biased;
                 _ = shutdown_rx.recv() => LoopEvent::Shutdown,
-                _ = drain_interval.tick(), if !draining_demands.is_empty() => LoopEvent::DrainTick,
-                maybe_command = command_rx.recv() => maybe_command.map_or(LoopEvent::CommandClosed, LoopEvent::Command),
+                _ = drain_interval.tick(), if demand_planner.has_draining_demands() => LoopEvent::DrainTick,
+                maybe_command = command_rx.recv() => command_event(maybe_command),
                 _ = demand_tick.tick() => LoopEvent::DemandTick,
                 _ = maintenance_interval.tick() => LoopEvent::MaintenanceTick,
                 _ = health_interval.tick() => LoopEvent::HealthTick,
@@ -1968,8 +1990,8 @@ async fn run_service(
         } else {
             tokio::select! {
                 _ = shutdown_rx.recv() => LoopEvent::Shutdown,
-                _ = drain_interval.tick(), if !draining_demands.is_empty() => LoopEvent::DrainTick,
-                maybe_command = command_rx.recv() => maybe_command.map_or(LoopEvent::CommandClosed, LoopEvent::Command),
+                _ = drain_interval.tick(), if demand_planner.has_draining_demands() => LoopEvent::DrainTick,
+                maybe_command = command_rx.recv() => command_event(maybe_command),
                 _ = demand_tick.tick() => LoopEvent::DemandTick,
                 _ = maintenance_interval.tick() => LoopEvent::MaintenanceTick,
                 _ = health_interval.tick() => LoopEvent::HealthTick,
@@ -1998,12 +2020,9 @@ async fn run_service(
                         warning = Some(error);
                     }
                 }
-                demand_scheduler.reset_active(Instant::now());
-                demand_lookup_ids.clear();
-                parked_crawls.clear();
-                draining_demands.clear();
-                planner_state.clear();
-                planner_budget = DemandPlannerBudget::new(Instant::now());
+                demand_planner.update(DemandPlannerAction::RuntimeReset {
+                    now: Instant::now(),
+                });
                 publish_status(
                     &status_tx,
                     active_runtime.as_ref(),
@@ -2014,15 +2033,8 @@ async fn run_service(
                 start_due_demands(
                     active_runtime.as_mut(),
                     &command_tx,
-                    &mut demand_scheduler,
-                    &mut demand_lookup_ids,
-                    &mut parked_crawls,
-                    &draining_demands,
-                    &mut planner_state,
-                    &mut planner_budget,
+                    &mut demand_planner,
                     &mut slice_metrics,
-                    &mut soak_metrics,
-                    demand_log_enabled,
                 )
                 .await;
             }
@@ -2039,91 +2051,39 @@ async fn run_service(
                     .or_default()
                     .insert(subscriber_id, subscriber_tx);
                 let now = Instant::now();
-                let previous = if demand_log_enabled {
-                    demand_scheduler.entry_snapshot(info_hash)
-                } else {
-                    None
-                };
-                demand_scheduler.register(info_hash, demand, now);
-                if demand_log_enabled {
-                    log_demand_state_event(
-                        "register",
-                        info_hash,
-                        Some(demand),
-                        previous,
-                        demand_scheduler.entry_snapshot(info_hash),
-                        &demand_lookup_ids,
-                        &parked_crawls,
-                        now,
-                    );
-                }
+                demand_planner.update(DemandPlannerAction::DemandRegistered {
+                    info_hash,
+                    demand,
+                    now,
+                });
                 let _ = response_tx.send(Some(subscriber_id));
                 start_due_demands(
                     active_runtime.as_mut(),
                     &command_tx,
-                    &mut demand_scheduler,
-                    &mut demand_lookup_ids,
-                    &mut parked_crawls,
-                    &draining_demands,
-                    &mut planner_state,
-                    &mut planner_budget,
+                    &mut demand_planner,
                     &mut slice_metrics,
-                    &mut soak_metrics,
-                    demand_log_enabled,
                 )
                 .await;
             }
             LoopEvent::Command(DhtCommand::UpdateDemand { info_hash, demand }) => {
                 let now = Instant::now();
-                let previous = if demand_log_enabled {
-                    demand_scheduler.entry_snapshot(info_hash)
-                } else {
-                    None
-                };
-                demand_scheduler.update(info_hash, demand, now);
-                if demand_log_enabled {
-                    log_demand_state_event(
-                        "update",
-                        info_hash,
-                        Some(demand),
-                        previous,
-                        demand_scheduler.entry_snapshot(info_hash),
-                        &demand_lookup_ids,
-                        &parked_crawls,
-                        now,
-                    );
-                }
-                if draining_demands
-                    .get(&info_hash)
-                    .is_some_and(|drain| drain.slice_class != DemandSliceClass::from_demand(demand))
-                {
-                    finish_drained_demand_lookup(
-                        active_runtime.as_mut(),
-                        &mut parked_crawls,
-                        &mut draining_demands,
-                        &command_tx,
-                        &mut demand_scheduler,
-                        &demand_lookup_ids,
-                        &mut planner_state,
-                        &mut slice_metrics,
-                        &mut soak_metrics,
-                        info_hash,
-                        true,
-                        demand_log_enabled,
-                    );
-                }
+                let reduction = demand_planner.update(DemandPlannerAction::DemandUpdated {
+                    info_hash,
+                    demand,
+                    now,
+                });
+                apply_demand_planner_effects(
+                    active_runtime.as_mut(),
+                    &mut demand_planner,
+                    &command_tx,
+                    &mut slice_metrics,
+                    reduction.effects,
+                );
                 start_due_demands(
                     active_runtime.as_mut(),
                     &command_tx,
-                    &mut demand_scheduler,
-                    &mut demand_lookup_ids,
-                    &mut parked_crawls,
-                    &draining_demands,
-                    &mut planner_state,
-                    &mut planner_budget,
+                    &mut demand_planner,
                     &mut slice_metrics,
-                    &mut soak_metrics,
-                    demand_log_enabled,
                 )
                 .await;
             }
@@ -2131,10 +2091,6 @@ async fn run_service(
                 info_hash,
                 subscriber_id,
             }) => {
-                let slice_class = demand_scheduler
-                    .demand_state(info_hash)
-                    .map(DemandSliceClass::from_demand)
-                    .unwrap_or(DemandSliceClass::RoutineRefresh);
                 let mut removed = false;
                 if let Some(subscribers) = demand_subscribers.get_mut(&info_hash) {
                     removed = subscribers.remove(&subscriber_id).is_some();
@@ -2142,121 +2098,54 @@ async fn run_service(
                         demand_subscribers.remove(&info_hash);
                     }
                 }
-                if removed && demand_scheduler.unregister(info_hash) {
-                    if let Some(lookup) = demand_lookup_ids.remove(&info_hash) {
-                        park_lookup_ids(
-                            active_runtime.as_mut(),
-                            &mut parked_crawls,
-                            info_hash,
-                            slice_class,
-                            None,
-                            0,
-                            lookup.lookup_ids,
-                        );
-                    }
-                    if let Some(drain) = draining_demands.remove(&info_hash) {
-                        if let Some(active_runtime) = active_runtime.as_mut() {
-                            for lookup_id in drain.lookup_ids {
-                                active_runtime.runtime.cancel_lookup(lookup_id);
-                            }
-                        }
-                    }
-                }
-                if demand_log_enabled && removed {
-                    log_demand_state_event(
-                        "unregister",
-                        info_hash,
-                        None,
-                        None,
-                        demand_scheduler.entry_snapshot(info_hash),
-                        &demand_lookup_ids,
-                        &parked_crawls,
-                        Instant::now(),
+                if removed {
+                    let reduction = demand_planner
+                        .update(DemandPlannerAction::DemandSubscriberRemoved { info_hash });
+                    apply_demand_planner_effects(
+                        active_runtime.as_mut(),
+                        &mut demand_planner,
+                        &command_tx,
+                        &mut slice_metrics,
+                        reduction.effects,
                     );
                 }
             }
             LoopEvent::Command(DhtCommand::DemandPeers { info_hash, peers }) => {
                 recent_unique_peers.record_batch(Instant::now(), &peers);
-                if let Some(drain) = draining_demands.get_mut(&info_hash) {
-                    let unique_added = drain.record_peers(&peers);
-                    soak_metrics.record_drain_peer_batch(
-                        peers.len(),
-                        unique_added,
-                        drain.initial_unique_peers,
-                    );
-                }
+                let reduction = demand_planner.update(DemandPlannerAction::PeersReceived {
+                    info_hash,
+                    peers: &peers,
+                });
+                apply_demand_planner_effects(
+                    active_runtime.as_mut(),
+                    &mut demand_planner,
+                    &command_tx,
+                    &mut slice_metrics,
+                    reduction.effects,
+                );
                 let Some(subscribers) = demand_subscribers.get_mut(&info_hash) else {
-                    soak_metrics.record_peer_batch(peers.len(), false);
-                    if demand_log_enabled {
-                        tracing::info!(
-                            target: "superseedr::dht_demand",
-                            info_hash = %short_info_hash_hex(info_hash),
-                            peers = peers.len(),
-                            "dht demand peers dropped without subscribers"
-                        );
-                    }
                     continue;
                 };
 
                 let subscriber_count_before = subscribers.len();
-                soak_metrics.record_peer_batch(peers.len(), true);
-                if demand_log_enabled {
-                    tracing::info!(
-                        target: "superseedr::dht_demand",
-                        info_hash = %short_info_hash_hex(info_hash),
-                        peers = peers.len(),
-                        subscriber_count = subscriber_count_before,
-                        "dht demand peers"
-                    );
-                }
                 subscribers.retain(|_, subscriber_tx| subscriber_tx.send(peers.clone()).is_ok());
                 let removed = subscriber_count_before.saturating_sub(subscribers.len());
-                let mut drained = false;
-                let slice_class = demand_scheduler
-                    .demand_state(info_hash)
-                    .map(DemandSliceClass::from_demand)
-                    .unwrap_or(DemandSliceClass::RoutineRefresh);
+                let mut cleanup_effects = Vec::new();
                 for _ in 0..removed {
-                    if demand_scheduler.unregister(info_hash) {
-                        drained = true;
-                        break;
-                    }
+                    let reduction = demand_planner
+                        .update(DemandPlannerAction::DemandSubscriberRemoved { info_hash });
+                    cleanup_effects.extend(reduction.effects);
                 }
                 if subscribers.is_empty() {
                     demand_subscribers.remove(&info_hash);
-                    if drained {
-                        if let Some(lookup) = demand_lookup_ids.remove(&info_hash) {
-                            park_lookup_ids(
-                                active_runtime.as_mut(),
-                                &mut parked_crawls,
-                                info_hash,
-                                slice_class,
-                                None,
-                                0,
-                                lookup.lookup_ids,
-                            );
-                        }
-                        if let Some(drain) = draining_demands.remove(&info_hash) {
-                            if let Some(active_runtime) = active_runtime.as_mut() {
-                                for lookup_id in drain.lookup_ids {
-                                    active_runtime.runtime.cancel_lookup(lookup_id);
-                                }
-                            }
-                        }
-                    }
                 }
-                if demand_log_enabled && removed > 0 {
-                    log_demand_state_event(
-                        "subscriber_prune",
-                        info_hash,
-                        None,
-                        None,
-                        demand_scheduler.entry_snapshot(info_hash),
-                        &demand_lookup_ids,
-                        &parked_crawls,
-                        Instant::now(),
-                    );
-                }
+                apply_demand_planner_effects(
+                    active_runtime.as_mut(),
+                    &mut demand_planner,
+                    &command_tx,
+                    &mut slice_metrics,
+                    cleanup_effects,
+                );
             }
             LoopEvent::Command(DhtCommand::DemandLookupFinished {
                 info_hash,
@@ -2264,58 +2153,26 @@ async fn run_service(
                 total_peers,
                 unique_peers,
             }) => {
-                let previous = if demand_log_enabled {
-                    demand_scheduler.entry_snapshot(info_hash)
-                } else {
-                    None
-                };
-                demand_lookup_ids.remove(&info_hash);
-                planner_state
-                    .entry(info_hash)
-                    .or_default()
-                    .note_finish(Instant::now(), unique_peers);
-                slice_metrics.record_stop(
+                let now = Instant::now();
+                let reduction = demand_planner.update(DemandPlannerAction::LookupFinished {
+                    info_hash,
                     slice_class,
-                    DemandSliceStopReason::NaturalFinish,
                     total_peers,
                     unique_peers,
+                    now,
+                });
+                apply_demand_planner_effects(
+                    active_runtime.as_mut(),
+                    &mut demand_planner,
+                    &command_tx,
+                    &mut slice_metrics,
+                    reduction.effects,
                 );
-                soak_metrics.record_natural_finish(total_peers, unique_peers);
-                let now = Instant::now();
-                demand_scheduler.finish(info_hash, now);
-                if demand_log_enabled {
-                    tracing::info!(
-                        target: "superseedr::dht_demand",
-                        info_hash = %short_info_hash_hex(info_hash),
-                        class = demand_slice_class_label(slice_class),
-                        stop_reason = demand_stop_reason_label(DemandSliceStopReason::NaturalFinish),
-                        total_peers,
-                        unique_peers,
-                        "dht demand lookup stopped"
-                    );
-                    log_demand_state_event(
-                        "finish",
-                        info_hash,
-                        None,
-                        previous,
-                        demand_scheduler.entry_snapshot(info_hash),
-                        &demand_lookup_ids,
-                        &parked_crawls,
-                        now,
-                    );
-                }
                 start_due_demands(
                     active_runtime.as_mut(),
                     &command_tx,
-                    &mut demand_scheduler,
-                    &mut demand_lookup_ids,
-                    &mut parked_crawls,
-                    &draining_demands,
-                    &mut planner_state,
-                    &mut planner_budget,
+                    &mut demand_planner,
                     &mut slice_metrics,
-                    &mut soak_metrics,
-                    demand_log_enabled,
                 )
                 .await;
             }
@@ -2326,7 +2183,7 @@ async fn run_service(
                 let result = start_get_peers_lookup(
                     active_runtime.as_mut(),
                     &command_tx,
-                    &mut parked_crawls,
+                    &mut demand_planner,
                     None,
                     info_hash,
                     DemandSliceClass::RoutineRefresh,
@@ -2347,7 +2204,7 @@ async fn run_service(
             }) => {
                 let _ = attach_lookup_family(
                     active_runtime.as_mut(),
-                    &mut parked_crawls,
+                    &mut demand_planner,
                     if record_metrics {
                         Some(&mut slice_metrics)
                     } else {
@@ -2378,189 +2235,65 @@ async fn run_service(
                 unique_peers,
                 lookup_ids,
             }) => {
-                let previous = if demand_log_enabled {
-                    demand_scheduler.entry_snapshot(info_hash)
-                } else {
-                    None
-                };
-                demand_lookup_ids.remove(&info_hash);
-                let initial_unique_peers = unique_peers.len();
-                let parked_outcome = drain_lookup_ids(
-                    active_runtime.as_mut(),
-                    &mut parked_crawls,
-                    &mut draining_demands,
-                    &command_tx,
-                    &mut soak_metrics,
+                let requested = demand_planner.update(DemandPlannerAction::LookupParkRequested {
                     info_hash,
                     slice_class,
                     stop_reason,
                     total_peers,
                     unique_peers,
                     lookup_ids,
-                );
-                let drain_admission = draining_demands.get(&info_hash).map(|drain| {
-                    (
-                        drain.initial_inflight_queries,
-                        drain.score,
-                        duration_ms(drain.deadline.saturating_duration_since(drain.started_at)),
-                    )
                 });
-                if parked_outcome.is_none() {
-                    planner_state
-                        .entry(info_hash)
-                        .or_default()
-                        .note_finish(Instant::now(), initial_unique_peers);
-                    slice_metrics.record_stop(
-                        slice_class,
-                        stop_reason,
-                        total_peers,
-                        initial_unique_peers,
-                    );
-                    demand_scheduler.finish(info_hash, Instant::now());
-                }
-                if parked_outcome.is_some() {
-                    soak_metrics.record_drain_start(
-                        total_peers,
-                        initial_unique_peers,
-                        parked_outcome,
-                    );
-                }
-                if demand_log_enabled {
-                    tracing::info!(
-                        target: "superseedr::dht_demand",
-                        info_hash = %short_info_hash_hex(info_hash),
-                        class = demand_slice_class_label(slice_class),
-                        stop_reason = demand_stop_reason_label(stop_reason),
-                        parked_outcome = parked_outcome
-                            .map(demand_parked_slice_outcome_label)
-                            .unwrap_or("none"),
-                        total_peers,
-                        unique_peers = initial_unique_peers,
-                        drain_admitted = drain_admission.is_some(),
-                        drain_initial_inflight = drain_admission
-                            .map(|(inflight, _, _)| inflight)
-                            .unwrap_or_default(),
-                        drain_score = drain_admission
-                            .map(|(_, score, _)| score)
-                            .unwrap_or_default(),
-                        drain_deadline_ms = drain_admission
-                            .map(|(_, _, deadline_ms)| deadline_ms)
-                            .unwrap_or_default(),
-                        "dht demand lookup draining"
-                    );
-                    log_demand_state_event(
-                        "park",
-                        info_hash,
-                        None,
-                        previous,
-                        demand_scheduler.entry_snapshot(info_hash),
-                        &demand_lookup_ids,
-                        &parked_crawls,
-                        Instant::now(),
-                    );
-                }
-                if draining_demands.contains_key(&info_hash)
-                    && demand_scheduler
-                        .demand_state(info_hash)
-                        .map(DemandSliceClass::from_demand)
-                        .is_some_and(|current_class| current_class != slice_class)
-                {
-                    finish_drained_demand_lookup(
-                        active_runtime.as_mut(),
-                        &mut parked_crawls,
-                        &mut draining_demands,
-                        &command_tx,
-                        &mut demand_scheduler,
-                        &demand_lookup_ids,
-                        &mut planner_state,
-                        &mut slice_metrics,
-                        &mut soak_metrics,
-                        info_hash,
-                        true,
-                        demand_log_enabled,
-                    );
-                }
+                apply_demand_planner_effects(
+                    active_runtime.as_mut(),
+                    &mut demand_planner,
+                    &command_tx,
+                    &mut slice_metrics,
+                    requested.effects,
+                );
                 start_due_demands(
                     active_runtime.as_mut(),
                     &command_tx,
-                    &mut demand_scheduler,
-                    &mut demand_lookup_ids,
-                    &mut parked_crawls,
-                    &draining_demands,
-                    &mut planner_state,
-                    &mut planner_budget,
+                    &mut demand_planner,
                     &mut slice_metrics,
-                    &mut soak_metrics,
-                    demand_log_enabled,
                 )
                 .await;
             }
             LoopEvent::Command(DhtCommand::FinalizeDrainedDemandLookups { info_hash }) => {
                 finish_drained_demand_lookup(
                     active_runtime.as_mut(),
-                    &mut parked_crawls,
-                    &mut draining_demands,
+                    &mut demand_planner,
                     &command_tx,
-                    &mut demand_scheduler,
-                    &demand_lookup_ids,
-                    &mut planner_state,
                     &mut slice_metrics,
-                    &mut soak_metrics,
                     info_hash,
                     false,
-                    demand_log_enabled,
                 );
                 start_due_demands(
                     active_runtime.as_mut(),
                     &command_tx,
-                    &mut demand_scheduler,
-                    &mut demand_lookup_ids,
-                    &mut parked_crawls,
-                    &draining_demands,
-                    &mut planner_state,
-                    &mut planner_budget,
+                    &mut demand_planner,
                     &mut slice_metrics,
-                    &mut soak_metrics,
-                    demand_log_enabled,
                 )
                 .await;
             }
             LoopEvent::DrainTick => {
-                let due_drains = due_drained_demand_lookups(
-                    active_runtime.as_ref(),
-                    &draining_demands,
-                    Instant::now(),
+                let runtime_ready = demand_planner.drain_runtime_readiness(active_runtime.as_ref());
+                let reduction = demand_planner.update(DemandPlannerAction::DrainTick {
+                    now: Instant::now(),
+                    runtime_ready,
+                });
+                let finalized_any = apply_demand_planner_effects(
+                    active_runtime.as_mut(),
+                    &mut demand_planner,
+                    &command_tx,
+                    &mut slice_metrics,
+                    reduction.effects,
                 );
-                let mut finalized_any = false;
-                for info_hash in due_drains {
-                    finalized_any |= finish_drained_demand_lookup(
-                        active_runtime.as_mut(),
-                        &mut parked_crawls,
-                        &mut draining_demands,
-                        &command_tx,
-                        &mut demand_scheduler,
-                        &demand_lookup_ids,
-                        &mut planner_state,
-                        &mut slice_metrics,
-                        &mut soak_metrics,
-                        info_hash,
-                        false,
-                        demand_log_enabled,
-                    );
-                }
                 if finalized_any {
                     start_due_demands(
                         active_runtime.as_mut(),
                         &command_tx,
-                        &mut demand_scheduler,
-                        &mut demand_lookup_ids,
-                        &mut parked_crawls,
-                        &draining_demands,
-                        &mut planner_state,
-                        &mut planner_budget,
+                        &mut demand_planner,
                         &mut slice_metrics,
-                        &mut soak_metrics,
-                        demand_log_enabled,
                     )
                     .await;
                 }
@@ -2577,15 +2310,8 @@ async fn run_service(
                 start_due_demands(
                     active_runtime.as_mut(),
                     &command_tx,
-                    &mut demand_scheduler,
-                    &mut demand_lookup_ids,
-                    &mut parked_crawls,
-                    &draining_demands,
-                    &mut planner_state,
-                    &mut planner_budget,
+                    &mut demand_planner,
                     &mut slice_metrics,
-                    &mut soak_metrics,
-                    demand_log_enabled,
                 )
                 .await;
             }
@@ -2606,32 +2332,27 @@ async fn run_service(
                 }
             }
             LoopEvent::HealthTick => {
-                publish_status(
-                    &status_tx,
+                let backend = active_runtime
+                    .as_ref()
+                    .map(|active| active.backend)
+                    .unwrap_or(DhtBackendKind::Disabled);
+                let bootstrap = active_runtime
+                    .as_ref()
+                    .map(|active| active.bootstrap)
+                    .unwrap_or_default();
+                let status = build_status(
                     active_runtime.as_ref(),
+                    backend,
+                    config.preferred_backend,
                     warning.clone(),
                     generation,
-                    config.preferred_backend,
+                    bootstrap,
                 );
+                let _ = status_tx.send(status.clone());
+                let _ = recent_unique_peers.unique_count(Instant::now());
+
                 if let Some(active) = active_runtime.as_ref() {
                     let _ = active.runtime.save_state().await;
-                }
-                if slice_metrics_log_enabled && slice_metrics.has_activity() {
-                    tracing::info!(
-                        target: "superseedr::dht_slice",
-                        summary = %slice_metrics.summary(),
-                        "DHT slice metrics"
-                    );
-                }
-                if demand_log_enabled {
-                    log_demand_scheduler_summary(
-                        &demand_scheduler,
-                        &demand_lookup_ids,
-                        &draining_demands,
-                        &parked_crawls,
-                        &mut planner_budget,
-                        Instant::now(),
-                    );
                 }
             }
             LoopEvent::RuntimeStep(Ok(_)) => {}
@@ -2657,8 +2378,8 @@ async fn run_service(
 
 async fn start_get_peers_lookup(
     active_runtime: Option<&mut ActiveRuntime>,
-    command_tx: &mpsc::UnboundedSender<DhtCommand>,
-    parked_crawls: &mut HashMap<InfoHash, DemandCrawlState>,
+    command_tx: &DhtCommandSender,
+    demand_planner: &mut DemandPlannerModel,
     slice_metrics: Option<&mut DemandSliceMetrics>,
     info_hash: InfoHash,
     slice_class: DemandSliceClass,
@@ -2690,7 +2411,7 @@ async fn start_get_peers_lookup(
         active_runtime.runtime.cancel_maintenance_lookups();
         attach_lookup_family(
             Some(active_runtime),
-            parked_crawls,
+            demand_planner,
             slice_metrics,
             info_hash,
             family,
@@ -2716,16 +2437,19 @@ async fn start_get_peers_lookup(
             if merged_tx.is_closed() || !accepting_families.load(Ordering::Acquire) {
                 return;
             }
-            let _ = command_tx.send(DhtCommand::StartGetPeersFamily {
-                info_hash,
-                family: AddressFamily::Ipv6,
-                slice_class,
-                record_metrics,
-                merged_tx,
-                lookup_ids,
-                first_batch_seen,
-                accepting_families,
-            });
+            let _ = send_dht_command(
+                &command_tx,
+                DhtCommand::StartGetPeersFamily {
+                    info_hash,
+                    family: AddressFamily::Ipv6,
+                    slice_class,
+                    record_metrics,
+                    merged_tx,
+                    lookup_ids,
+                    first_batch_seen,
+                    accepting_families,
+                },
+            );
         });
     }
 
@@ -2762,27 +2486,6 @@ fn take_parked_family_state(
     let mut remove_entry = false;
     let state = parked_crawls.get_mut(&info_hash).and_then(|crawl| {
         if let Some(reason) = crawl.reset_reason_for(slice_class, now) {
-            if demand_diagnostics_log_enabled() {
-                let quality = aggregate_parked_crawl_quality(crawl);
-                tracing::info!(
-                    target: "superseedr::dht_demand",
-                    info_hash = %short_info_hash_hex(info_hash),
-                    requested_class = demand_slice_class_label(slice_class),
-                    previous_class = demand_slice_class_label(crawl.class),
-                    reset_reason = demand_reset_reason_label(reason),
-                    requested_family = ?family,
-                    parked_age_ms = duration_ms(now.saturating_duration_since(crawl.updated_at)),
-                    low_yield_streak = crawl.consecutive_stalled_low_yield_slices,
-                    reset_count = crawl.reset_count,
-                    healthy_zero_yield_streak = crawl.consecutive_healthy_zero_yield_slices,
-                    frontier = quality.frontier_len,
-                    inflight = quality.inflight_len,
-                    visited = quality.visited_len,
-                    eligible_responders = quality.eligible_responder_count,
-                    received_peers = quality.received_peer_count,
-                    "dht demand parked crawl reset"
-                );
-            }
             if let Some(metrics) = slice_metrics.as_mut() {
                 metrics.record_reset(crawl.class, reason);
             }
@@ -2817,43 +2520,11 @@ fn store_parked_lookup_states(
     let quality = aggregate_lookup_quality(&states);
     let parked_outcome =
         parked_slice_outcome_for_quality(slice_class, stop_reason, unique_peers, quality);
-    let weak_parked_state = slice_class.parked_quality_is_weak(quality);
     let crawl = parked_crawls
         .entry(info_hash)
         .or_insert_with(|| DemandCrawlState::new(now, slice_class));
-    let previous_low_yield_streak = crawl.consecutive_stalled_low_yield_slices;
-    let previous_healthy_zero_yield_streak = crawl.consecutive_healthy_zero_yield_slices;
-    let previous_reset_count = crawl.reset_count;
     if let Some(outcome) = parked_outcome {
         crawl.observe_parked_slice(slice_class, outcome);
-    }
-    if demand_diagnostics_log_enabled() {
-        tracing::info!(
-            target: "superseedr::dht_demand",
-            info_hash = %short_info_hash_hex(info_hash),
-            class = demand_slice_class_label(slice_class),
-            stop_reason = stop_reason
-                .map(demand_stop_reason_label)
-                .unwrap_or("none"),
-            unique_peers,
-            parked_outcome = parked_outcome
-                .map(demand_parked_slice_outcome_label)
-                .unwrap_or("none"),
-            state_count = states.len(),
-            frontier = quality.frontier_len,
-            inflight = quality.inflight_len,
-            visited = quality.visited_len,
-            eligible_responders = quality.eligible_responder_count,
-            received_peers = quality.received_peer_count,
-            weak_parked_state,
-            previous_low_yield_streak,
-            current_low_yield_streak = crawl.consecutive_stalled_low_yield_slices,
-            previous_healthy_zero_yield_streak,
-            current_healthy_zero_yield_streak = crawl.consecutive_healthy_zero_yield_slices,
-            reset_count = crawl.reset_count,
-            reset_count_delta = crawl.reset_count.saturating_sub(previous_reset_count),
-            "dht demand parked crawl quality"
-        );
     }
     for state in states {
         crawl.store_family_state(slice_class, state);
@@ -2922,14 +2593,17 @@ fn park_lookup_ids(
 }
 
 fn schedule_drained_demand_finalize(
-    command_tx: &mpsc::UnboundedSender<DhtCommand>,
+    command_tx: &DhtCommandSender,
     info_hash: InfoHash,
     delay: Duration,
 ) {
     let command_tx = command_tx.clone();
     tokio::spawn(async move {
         tokio::time::sleep(delay).await;
-        let _ = command_tx.send(DhtCommand::FinalizeDrainedDemandLookups { info_hash });
+        let _ = send_dht_command(
+            &command_tx,
+            DhtCommand::FinalizeDrainedDemandLookups { info_hash },
+        );
     });
 }
 
@@ -3043,6 +2717,14 @@ fn draining_demand_inflight(
         .sum()
 }
 
+fn demand_drain_admission_snapshot(drain: &DrainingDemandLookup) -> DemandDrainAdmissionSnapshot {
+    DemandDrainAdmissionSnapshot {
+        initial_inflight_queries: drain.initial_inflight_queries,
+        score: drain.score,
+        deadline_ms: duration_ms(drain.deadline.saturating_duration_since(drain.started_at)),
+    }
+}
+
 fn cancel_lookup_ids_to_parked(
     active_runtime: &mut ActiveRuntime,
     parked_crawls: &mut HashMap<InfoHash, DemandCrawlState>,
@@ -3076,8 +2758,7 @@ fn drain_lookup_ids(
     active_runtime: Option<&mut ActiveRuntime>,
     parked_crawls: &mut HashMap<InfoHash, DemandCrawlState>,
     draining_demands: &mut HashMap<InfoHash, DrainingDemandLookup>,
-    command_tx: &mpsc::UnboundedSender<DhtCommand>,
-    soak_metrics: &mut DhtSoakMetrics,
+    command_tx: &DhtCommandSender,
     info_hash: InfoHash,
     slice_class: DemandSliceClass,
     stop_reason: DemandSliceStopReason,
@@ -3098,7 +2779,6 @@ fn drain_lookup_ids(
     };
 
     if let Some(previous) = draining_demands.remove(&info_hash) {
-        soak_metrics.record_drain_replaced();
         for lookup_id in previous.lookup_ids {
             active_runtime.runtime.cancel_lookup(lookup_id);
         }
@@ -3141,7 +2821,6 @@ fn drain_lookup_ids(
         || drain_score <= 0
         || over_inflight_cap
     {
-        soak_metrics.record_drain_rejected(quality.inflight_len);
         cancel_lookup_ids_to_parked(
             active_runtime,
             parked_crawls,
@@ -3199,6 +2878,132 @@ fn drained_demand_lookup_runtime_ready(
     active_runtime.is_none_or(|active| active.runtime.drained_lookups_ready(&drain.lookup_ids))
 }
 
+fn record_drain_peers_received(
+    draining_demands: &mut HashMap<InfoHash, DrainingDemandLookup>,
+    info_hash: InfoHash,
+    peers: &[SocketAddr],
+) -> DemandPlannerReduction {
+    let Some(drain) = draining_demands.get_mut(&info_hash) else {
+        return DemandPlannerReduction::default();
+    };
+    let unique_added = drain.record_peers(peers);
+    DemandPlannerReduction {
+        effects: vec![DemandPlannerEffect::DrainPeersRecorded(
+            DemandDrainPeersRecordedEffect {
+                info_hash,
+                peer_count: peers.len(),
+                unique_added,
+                initial_unique_peers: drain.initial_unique_peers,
+            },
+        )],
+        plan_stats: None,
+    }
+}
+
+impl DemandPlannerModel {
+    fn drain_runtime_readiness(
+        &self,
+        active_runtime: Option<&ActiveRuntime>,
+    ) -> HashMap<InfoHash, bool> {
+        self.draining_demands
+            .iter()
+            .map(|(&info_hash, drain)| {
+                (
+                    info_hash,
+                    drained_demand_lookup_runtime_ready(active_runtime, drain),
+                )
+            })
+            .collect()
+    }
+
+    fn take_parked_family_state(
+        &mut self,
+        slice_metrics: Option<&mut DemandSliceMetrics>,
+        info_hash: InfoHash,
+        family: AddressFamily,
+        slice_class: DemandSliceClass,
+    ) -> Option<LookupState> {
+        take_parked_family_state(
+            &mut self.parked_crawls,
+            slice_metrics,
+            info_hash,
+            family,
+            slice_class,
+        )
+    }
+
+    fn park_lookup_ids(
+        &mut self,
+        active_runtime: Option<&mut ActiveRuntime>,
+        info_hash: InfoHash,
+        slice_class: DemandSliceClass,
+        stop_reason: Option<DemandSliceStopReason>,
+        unique_peers: usize,
+        lookup_ids: Arc<StdMutex<Vec<LookupId>>>,
+    ) -> Option<DemandParkedSliceOutcome> {
+        park_lookup_ids(
+            active_runtime,
+            &mut self.parked_crawls,
+            info_hash,
+            slice_class,
+            stop_reason,
+            unique_peers,
+            lookup_ids,
+        )
+    }
+
+    fn drain_lookup_ids(
+        &mut self,
+        active_runtime: Option<&mut ActiveRuntime>,
+        command_tx: &DhtCommandSender,
+        info_hash: InfoHash,
+        slice_class: DemandSliceClass,
+        stop_reason: DemandSliceStopReason,
+        total_peers: usize,
+        unique_peers: HashSet<SocketAddr>,
+        lookup_ids: Arc<StdMutex<Vec<LookupId>>>,
+    ) -> Option<DemandParkedSliceOutcome> {
+        drain_lookup_ids(
+            active_runtime,
+            &mut self.parked_crawls,
+            &mut self.draining_demands,
+            command_tx,
+            info_hash,
+            slice_class,
+            stop_reason,
+            total_peers,
+            unique_peers,
+            lookup_ids,
+        )
+    }
+
+    fn drain_admission_snapshot(
+        &self,
+        info_hash: InfoHash,
+    ) -> Option<DemandDrainAdmissionSnapshot> {
+        self.draining_demands
+            .get(&info_hash)
+            .map(demand_drain_admission_snapshot)
+    }
+
+    fn finalize_drained_lookup(
+        &mut self,
+        active_runtime: Option<&mut ActiveRuntime>,
+        command_tx: &DhtCommandSender,
+        info_hash: InfoHash,
+        force: bool,
+    ) -> Option<DrainedDemandOutcome> {
+        finalize_drained_demand_lookup(
+            active_runtime,
+            &mut self.parked_crawls,
+            &mut self.draining_demands,
+            command_tx,
+            info_hash,
+            force,
+        )
+    }
+}
+
 fn drained_demand_lookup_ready_for_finalize(
     runtime_ready: bool,
     drain: &DrainingDemandLookup,
@@ -3211,27 +3016,11 @@ fn drained_demand_lookup_ready_for_finalize(
     (ready_to_finalize, early_no_yield)
 }
 
-fn due_drained_demand_lookups(
-    active_runtime: Option<&ActiveRuntime>,
-    draining_demands: &HashMap<InfoHash, DrainingDemandLookup>,
-    now: Instant,
-) -> Vec<InfoHash> {
-    draining_demands
-        .iter()
-        .filter_map(|(&info_hash, drain)| {
-            let runtime_ready = drained_demand_lookup_runtime_ready(active_runtime, drain);
-            let (ready_to_finalize, _) =
-                drained_demand_lookup_ready_for_finalize(runtime_ready, drain, now);
-            ready_to_finalize.then_some(info_hash)
-        })
-        .collect()
-}
-
 fn finalize_drained_demand_lookup(
     active_runtime: Option<&mut ActiveRuntime>,
     parked_crawls: &mut HashMap<InfoHash, DemandCrawlState>,
     draining_demands: &mut HashMap<InfoHash, DrainingDemandLookup>,
-    command_tx: &mpsc::UnboundedSender<DhtCommand>,
+    command_tx: &DhtCommandSender,
     info_hash: InfoHash,
     force: bool,
 ) -> Option<DrainedDemandOutcome> {
@@ -3282,93 +3071,145 @@ fn finalize_drained_demand_lookup(
     })
 }
 
+fn apply_demand_planner_effects(
+    mut active_runtime: Option<&mut ActiveRuntime>,
+    demand_planner: &mut DemandPlannerModel,
+    command_tx: &DhtCommandSender,
+    slice_metrics: &mut DemandSliceMetrics,
+    effects: Vec<DemandPlannerEffect>,
+) -> bool {
+    let mut finalized_any = false;
+    let mut pending_effects = VecDeque::from(effects);
+
+    while let Some(effect) = pending_effects.pop_front() {
+        match effect {
+            DemandPlannerEffect::LookupFinished(finished) => {
+                slice_metrics.record_stop(
+                    finished.slice_class,
+                    DemandSliceStopReason::NaturalFinish,
+                    finished.total_peers,
+                    finished.unique_peers,
+                );
+            }
+            DemandPlannerEffect::AdmitDrain(admit) => {
+                let initial_unique_peers = admit.unique_peers.len();
+                let parked_outcome = demand_planner.drain_lookup_ids(
+                    active_runtime.as_deref_mut(),
+                    command_tx,
+                    admit.info_hash,
+                    admit.slice_class,
+                    admit.stop_reason,
+                    admit.total_peers,
+                    admit.unique_peers,
+                    admit.lookup_ids,
+                );
+                let drain_admission = demand_planner.drain_admission_snapshot(admit.info_hash);
+                let resolved = demand_planner.update(DemandPlannerAction::LookupParkResolved {
+                    info_hash: admit.info_hash,
+                    slice_class: admit.slice_class,
+                    stop_reason: admit.stop_reason,
+                    total_peers: admit.total_peers,
+                    unique_peers: initial_unique_peers,
+                    parked_outcome,
+                    drain_admission,
+                    previous: admit.previous,
+                    now: Instant::now(),
+                });
+                pending_effects.extend(resolved.effects);
+            }
+            DemandPlannerEffect::LookupParked(parked) => {
+                if parked.drain_admission.is_none() {
+                    slice_metrics.record_stop(
+                        parked.slice_class,
+                        parked.stop_reason,
+                        parked.total_peers,
+                        parked.unique_peers,
+                    );
+                }
+            }
+            DemandPlannerEffect::DrainFinalized(finalized) => {
+                slice_metrics.record_stop(
+                    finalized.outcome.slice_class,
+                    finalized.outcome.stop_reason,
+                    finalized.outcome.total_peers,
+                    finalized.outcome.unique_peers,
+                );
+            }
+            DemandPlannerEffect::DrainPeersRecorded(recorded) => {
+                let _ = recorded.info_hash;
+                let _ = recorded.peer_count;
+                let _ = recorded.unique_added;
+                let _ = recorded.initial_unique_peers;
+            }
+            DemandPlannerEffect::FinalizeDrainingLookup(effect) => {
+                finalized_any |= finish_drained_demand_lookup(
+                    active_runtime.as_deref_mut(),
+                    demand_planner,
+                    command_tx,
+                    slice_metrics,
+                    effect.info_hash,
+                    effect.force,
+                );
+            }
+            DemandPlannerEffect::StartLookup(_) => {
+                debug_assert!(
+                    false,
+                    "start lookup effects must be handled by start_due_demands"
+                );
+            }
+            DemandPlannerEffect::ParkActiveLookup(effect) => {
+                demand_planner.park_lookup_ids(
+                    active_runtime.as_deref_mut(),
+                    effect.info_hash,
+                    effect.slice_class,
+                    None,
+                    0,
+                    effect.lookup_ids,
+                );
+            }
+            DemandPlannerEffect::CancelDrainingLookup(effect) => {
+                let _ = effect.info_hash;
+                if let Some(active_runtime) = active_runtime.as_deref_mut() {
+                    for lookup_id in effect.lookup_ids {
+                        active_runtime.runtime.cancel_lookup(lookup_id);
+                    }
+                }
+            }
+        }
+    }
+
+    finalized_any
+}
+
 fn finish_drained_demand_lookup(
     active_runtime: Option<&mut ActiveRuntime>,
-    parked_crawls: &mut HashMap<InfoHash, DemandCrawlState>,
-    draining_demands: &mut HashMap<InfoHash, DrainingDemandLookup>,
-    command_tx: &mpsc::UnboundedSender<DhtCommand>,
-    demand_scheduler: &mut DemandScheduler,
-    demand_lookup_ids: &HashMap<InfoHash, ActiveDemandLookup>,
-    planner_state: &mut HashMap<InfoHash, DemandPlannerState>,
+    demand_planner: &mut DemandPlannerModel,
+    command_tx: &DhtCommandSender,
     slice_metrics: &mut DemandSliceMetrics,
-    soak_metrics: &mut DhtSoakMetrics,
     info_hash: InfoHash,
     force: bool,
-    demand_log_enabled: bool,
 ) -> bool {
-    let previous = if demand_log_enabled {
-        demand_scheduler.entry_snapshot(info_hash)
-    } else {
-        None
-    };
-    let Some(outcome) = finalize_drained_demand_lookup(
-        active_runtime,
-        parked_crawls,
-        draining_demands,
-        command_tx,
-        info_hash,
-        force,
-    ) else {
+    let previous = demand_planner.entry_snapshot(info_hash);
+    let Some(outcome) =
+        demand_planner.finalize_drained_lookup(active_runtime, command_tx, info_hash, force)
+    else {
         return false;
     };
 
     let now = Instant::now();
-    planner_state
-        .entry(info_hash)
-        .or_default()
-        .note_finish(now, outcome.unique_peers);
-    slice_metrics.record_stop(
-        outcome.slice_class,
-        outcome.stop_reason,
-        outcome.total_peers,
-        outcome.unique_peers,
-    );
-    soak_metrics.record_drain_finalize(
+    let reduction = demand_planner.update(DemandPlannerAction::DrainedLookupFinalized {
+        info_hash,
         outcome,
-        outcome.drain_duration_ms,
-        outcome.finalized_after_deadline,
+        previous,
+        now,
+    });
+    apply_demand_planner_effects(
+        None,
+        demand_planner,
+        command_tx,
+        slice_metrics,
+        reduction.effects,
     );
-    let finish_mode = if outcome.slice_class == DemandSliceClass::NoConnectedPeers
-        && outcome.parked_outcome == Some(DemandParkedSliceOutcome::HealthyZeroYield)
-    {
-        DemandFinishMode::AcceleratedNoConnectedPeersBackoff
-    } else {
-        DemandFinishMode::Standard
-    };
-    demand_scheduler.finish_with_mode(info_hash, now, finish_mode);
-    if demand_log_enabled {
-        tracing::info!(
-            target: "superseedr::dht_demand",
-            info_hash = %short_info_hash_hex(info_hash),
-            class = demand_slice_class_label(outcome.slice_class),
-            stop_reason = demand_stop_reason_label(outcome.stop_reason),
-            parked_outcome = outcome
-                .parked_outcome
-                .map(demand_parked_slice_outcome_label)
-                .unwrap_or("none"),
-            accelerated_no_peers_backoff = matches!(
-                finish_mode,
-                DemandFinishMode::AcceleratedNoConnectedPeersBackoff
-            ),
-            total_peers = outcome.total_peers,
-            unique_peers = outcome.unique_peers,
-            drain_duration_ms = outcome.drain_duration_ms,
-            finalized_after_deadline = outcome.finalized_after_deadline,
-            finalized_early_no_yield = outcome.finalized_early_no_yield,
-            parked = parked_crawls.contains_key(&info_hash),
-            "dht demand drain finalized"
-        );
-        log_demand_state_event(
-            "drain_finish",
-            info_hash,
-            None,
-            previous,
-            demand_scheduler.entry_snapshot(info_hash),
-            demand_lookup_ids,
-            parked_crawls,
-            now,
-        );
-    }
 
     true
 }
@@ -3715,163 +3556,411 @@ fn select_due_demand_launches_with_stats(
     }
 }
 
-async fn start_due_demands(
-    active_runtime: Option<&mut ActiveRuntime>,
-    command_tx: &mpsc::UnboundedSender<DhtCommand>,
-    demand_scheduler: &mut DemandScheduler,
-    demand_lookup_ids: &mut HashMap<InfoHash, ActiveDemandLookup>,
-    parked_crawls: &mut HashMap<InfoHash, DemandCrawlState>,
-    draining_demands: &HashMap<InfoHash, DrainingDemandLookup>,
-    planner_state: &mut HashMap<InfoHash, DemandPlannerState>,
-    planner_budget: &mut DemandPlannerBudget,
-    slice_metrics: &mut DemandSliceMetrics,
-    soak_metrics: &mut DhtSoakMetrics,
-    demand_log_enabled: bool,
-) {
-    let Some(active_runtime) = active_runtime else {
-        return;
-    };
+impl DemandPlannerModel {
+    fn update(&mut self, action: DemandPlannerAction<'_>) -> DemandPlannerReduction {
+        let demand_scheduler = &mut self.scheduler;
+        let demand_lookup_ids = &mut self.active;
+        let parked_crawls = &mut self.parked_crawls;
+        let draining_demands = &mut self.draining_demands;
+        let planner_state = &mut self.state;
+        let planner_budget = &mut self.budget;
 
-    evict_stale_parked_crawls(parked_crawls, Instant::now());
-    let drain_virtual_slots = drain_virtual_slot_count(draining_demands.len());
-    let launch_budget = demand_lookup_launch_budget(demand_lookup_ids, draining_demands.len());
-    if launch_budget == 0 {
-        return;
-    }
-    let now = Instant::now();
-    planner_budget.refill(now);
-    let active_counts = active_demand_lookup_slot_counts(demand_lookup_ids);
-    let due_candidates = demand_scheduler
-        .due_candidates(now)
-        .into_iter()
-        .filter(|candidate| !draining_demands.contains_key(&candidate.info_hash))
-        .collect::<Vec<_>>();
-    let demand_snapshots = demand_scheduler
-        .entry_snapshots()
-        .into_iter()
-        .filter(|snapshot| !draining_demands.contains_key(&snapshot.info_hash))
-        .collect::<Vec<_>>();
-    let due_selection = select_due_demand_launches_with_stats(
-        &due_candidates,
-        active_counts,
-        parked_crawls,
-        planner_state,
-        planner_budget,
-        now,
-        launch_budget,
-    );
-    let planner_selection_stats = due_selection.stats;
-    let mut planned_launches = due_selection
-        .launches
-        .into_iter()
-        .map(|candidate| {
-            (
-                candidate,
-                candidate_selection_reason(candidate, parked_crawls, planner_state, now),
-            )
-        })
-        .collect::<Vec<_>>();
-
-    if planned_launches.is_empty() {
-        planned_launches = select_spare_research_launches(
-            &demand_snapshots,
-            active_counts,
-            parked_crawls,
-            planner_state,
-            planner_budget,
-            now,
-            launch_budget,
-        )
-        .into_iter()
-        .map(|candidate| (candidate, DemandSelectionReason::SpareCapacity))
-        .collect();
-    }
-
-    let spare_selected = planned_launches
-        .iter()
-        .filter(|(_, reason)| *reason == DemandSelectionReason::SpareCapacity)
-        .count();
-    if !planned_launches.is_empty() {
-        soak_metrics.record_launch_batch(planned_launches.len(), spare_selected);
-    }
-
-    if demand_log_enabled
-        && (!planned_launches.is_empty() || planner_selection_stats.throttled.total() > 0)
-    {
-        tracing::info!(
-            target: "superseedr::dht_demand",
-            launch_budget,
-            due_total = due_candidates.len(),
-            selected = planned_launches.len(),
-            offered_awaiting = planner_selection_stats.offered.awaiting_metadata,
-            offered_no_peers = planner_selection_stats.offered.no_connected_peers,
-            offered_routine = planner_selection_stats.offered.routine_refresh,
-            launched_awaiting = planner_selection_stats.launched.awaiting_metadata,
-            launched_no_peers = planner_selection_stats.launched.no_connected_peers,
-            launched_routine = planner_selection_stats.launched.routine_refresh,
-            throttled_total = planner_selection_stats.throttled.total(),
-            throttled_awaiting = planner_selection_stats.throttled.awaiting_metadata,
-            throttled_no_peers = planner_selection_stats.throttled.no_connected_peers,
-            throttled_routine = planner_selection_stats.throttled.routine_refresh,
-            oldest_throttled_awaiting_ms =
-                planner_selection_stats.oldest_throttled_awaiting_ms,
-            oldest_throttled_no_peers_ms =
-                planner_selection_stats.oldest_throttled_no_peers_ms,
-            oldest_throttled_routine_ms = planner_selection_stats.oldest_throttled_routine_ms,
-            spare_selected,
-            active_total = active_counts.total(),
-            active_awaiting = active_counts.awaiting_metadata,
-            active_no_peers = active_counts.no_connected_peers,
-            active_routine = active_counts.routine_refresh,
-            parked = parked_crawls.len(),
-            draining = draining_demands.len(),
-            drain_virtual_slots,
-            budget_awaiting = planner_budget.available(DemandSliceClass::AwaitingMetadata, now),
-            budget_no_peers = planner_budget.available(DemandSliceClass::NoConnectedPeers, now),
-            budget_routine = planner_budget.available(DemandSliceClass::RoutineRefresh, now),
-            "dht demand launch batch"
-        );
-    }
-    for (candidate, selection_reason) in planned_launches {
-        let info_hash = candidate.info_hash;
-        if !demand_scheduler.mark_in_progress(info_hash) {
-            planner_budget.refund(DemandSliceClass::from_demand(candidate.demand));
-            if demand_log_enabled {
-                tracing::info!(
-                    target: "superseedr::dht_demand",
-                    info_hash = %short_info_hash_hex(info_hash),
-                    demand = ?candidate.demand,
-                    "dht demand launch skipped after planner selection"
-                );
+        match action {
+            DemandPlannerAction::RuntimeReset { now } => {
+                demand_scheduler.reset_active(now);
+                demand_lookup_ids.clear();
+                parked_crawls.clear();
+                draining_demands.clear();
+                planner_state.clear();
+                *planner_budget = DemandPlannerBudget::new(now);
+                DemandPlannerReduction::default()
             }
+            DemandPlannerAction::DemandRegistered {
+                info_hash,
+                demand,
+                now,
+            } => {
+                demand_scheduler.register(info_hash, demand, now);
+                DemandPlannerReduction::default()
+            }
+            DemandPlannerAction::DemandUpdated {
+                info_hash,
+                demand,
+                now,
+            } => {
+                demand_scheduler.update(info_hash, demand, now);
+                let effects = if draining_demands
+                    .get(&info_hash)
+                    .is_some_and(|drain| drain.slice_class != DemandSliceClass::from_demand(demand))
+                {
+                    vec![DemandPlannerEffect::FinalizeDrainingLookup(
+                        DemandFinalizeDrainingLookupEffect {
+                            info_hash,
+                            force: true,
+                        },
+                    )]
+                } else {
+                    Vec::new()
+                };
+                DemandPlannerReduction {
+                    effects,
+                    plan_stats: None,
+                }
+            }
+            DemandPlannerAction::DemandSubscriberRemoved { info_hash } => {
+                let slice_class = demand_scheduler
+                    .demand_state(info_hash)
+                    .map(DemandSliceClass::from_demand)
+                    .unwrap_or(DemandSliceClass::RoutineRefresh);
+                let mut effects = Vec::new();
+                if demand_scheduler.unregister(info_hash) {
+                    if let Some(lookup) = demand_lookup_ids.remove(&info_hash) {
+                        effects.push(DemandPlannerEffect::ParkActiveLookup(
+                            DemandParkActiveLookupEffect {
+                                info_hash,
+                                slice_class,
+                                lookup_ids: lookup.lookup_ids,
+                            },
+                        ));
+                    }
+                    if let Some(drain) = draining_demands.remove(&info_hash) {
+                        effects.push(DemandPlannerEffect::CancelDrainingLookup(
+                            DemandCancelDrainingLookupEffect {
+                                info_hash,
+                                lookup_ids: drain.lookup_ids,
+                            },
+                        ));
+                    }
+                }
+                DemandPlannerReduction {
+                    effects,
+                    plan_stats: None,
+                }
+            }
+            DemandPlannerAction::PeersReceived { info_hash, peers } => {
+                record_drain_peers_received(draining_demands, info_hash, peers)
+            }
+            DemandPlannerAction::DrainTick { now, runtime_ready } => {
+                let effects = draining_demands
+                    .iter()
+                    .filter_map(|(&info_hash, drain)| {
+                        let ready = runtime_ready.get(&info_hash).copied().unwrap_or(false);
+                        let (ready_to_finalize, _) =
+                            drained_demand_lookup_ready_for_finalize(ready, drain, now);
+                        ready_to_finalize.then_some(DemandPlannerEffect::FinalizeDrainingLookup(
+                            DemandFinalizeDrainingLookupEffect {
+                                info_hash,
+                                force: false,
+                            },
+                        ))
+                    })
+                    .collect();
+                DemandPlannerReduction {
+                    effects,
+                    plan_stats: None,
+                }
+            }
+            DemandPlannerAction::PlanDue {
+                now,
+                runtime_available,
+            } => {
+                if !runtime_available {
+                    return DemandPlannerReduction::default();
+                }
+
+                evict_stale_parked_crawls(parked_crawls, now);
+                let drain_virtual_slots = drain_virtual_slot_count(draining_demands.len());
+                let launch_budget =
+                    demand_lookup_launch_budget(demand_lookup_ids, draining_demands.len());
+                if launch_budget == 0 {
+                    return DemandPlannerReduction::default();
+                }
+
+                planner_budget.refill(now);
+                let active_counts = active_demand_lookup_slot_counts(demand_lookup_ids);
+                let due_candidates = demand_scheduler
+                    .due_candidates(now)
+                    .into_iter()
+                    .filter(|candidate| !draining_demands.contains_key(&candidate.info_hash))
+                    .collect::<Vec<_>>();
+                let demand_snapshots = demand_scheduler
+                    .entry_snapshots()
+                    .into_iter()
+                    .filter(|snapshot| !draining_demands.contains_key(&snapshot.info_hash))
+                    .collect::<Vec<_>>();
+                let due_selection = select_due_demand_launches_with_stats(
+                    &due_candidates,
+                    active_counts,
+                    parked_crawls,
+                    planner_state,
+                    planner_budget,
+                    now,
+                    launch_budget,
+                );
+                let selection_stats = due_selection.stats;
+                let mut planned_launches = due_selection
+                    .launches
+                    .into_iter()
+                    .map(|candidate| {
+                        (
+                            candidate,
+                            candidate_selection_reason(
+                                candidate,
+                                parked_crawls,
+                                planner_state,
+                                now,
+                            ),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+
+                if planned_launches.is_empty() {
+                    planned_launches = select_spare_research_launches(
+                        &demand_snapshots,
+                        active_counts,
+                        parked_crawls,
+                        planner_state,
+                        planner_budget,
+                        now,
+                        launch_budget,
+                    )
+                    .into_iter()
+                    .map(|candidate| (candidate, DemandSelectionReason::SpareCapacity))
+                    .collect();
+                }
+
+                let spare_selected = planned_launches
+                    .iter()
+                    .filter(|(_, reason)| *reason == DemandSelectionReason::SpareCapacity)
+                    .count();
+                let mut effects = Vec::new();
+                for (candidate, selection_reason) in planned_launches {
+                    let plan = DemandLookupPlan::for_demand(candidate.demand);
+                    if !demand_scheduler.mark_in_progress(candidate.info_hash) {
+                        planner_budget.refund(plan.class);
+                        continue;
+                    }
+                    planner_state
+                        .entry(candidate.info_hash)
+                        .or_default()
+                        .note_start(now);
+                    effects.push(DemandPlannerEffect::StartLookup(DemandStartLookupEffect {
+                        candidate,
+                        plan,
+                        selection_reason,
+                    }));
+                }
+
+                let budget_awaiting =
+                    planner_budget.available(DemandSliceClass::AwaitingMetadata, now);
+                let budget_no_peers =
+                    planner_budget.available(DemandSliceClass::NoConnectedPeers, now);
+                let budget_routine =
+                    planner_budget.available(DemandSliceClass::RoutineRefresh, now);
+
+                DemandPlannerReduction {
+                    effects,
+                    plan_stats: Some(DemandPlannerPlanStats {
+                        launch_budget,
+                        due_total: due_candidates.len(),
+                        selection_stats,
+                        spare_selected,
+                        active_counts,
+                        parked_count: parked_crawls.len(),
+                        draining_count: draining_demands.len(),
+                        drain_virtual_slots,
+                        budget_awaiting,
+                        budget_no_peers,
+                        budget_routine,
+                    }),
+                }
+            }
+            DemandPlannerAction::LookupStarted {
+                info_hash,
+                slice_class,
+                lookup_ids,
+            } => {
+                demand_lookup_ids.insert(
+                    info_hash,
+                    ActiveDemandLookup {
+                        lookup_ids,
+                        slice_class,
+                    },
+                );
+                DemandPlannerReduction::default()
+            }
+            DemandPlannerAction::LookupStartFailed {
+                info_hash,
+                slice_class,
+                now,
+            } => {
+                planner_budget.refund(slice_class);
+                demand_scheduler.finish(info_hash, now);
+                DemandPlannerReduction::default()
+            }
+            DemandPlannerAction::LookupFinished {
+                info_hash,
+                slice_class,
+                total_peers,
+                unique_peers,
+                now,
+            } => {
+                let previous = demand_scheduler.entry_snapshot(info_hash);
+                demand_lookup_ids.remove(&info_hash);
+                planner_state
+                    .entry(info_hash)
+                    .or_default()
+                    .note_finish(now, unique_peers);
+                demand_scheduler.finish(info_hash, now);
+                DemandPlannerReduction {
+                    effects: vec![DemandPlannerEffect::LookupFinished(
+                        DemandLookupFinishedEffect {
+                            info_hash,
+                            slice_class,
+                            total_peers,
+                            unique_peers,
+                            previous,
+                            current: demand_scheduler.entry_snapshot(info_hash),
+                            finished_at: now,
+                        },
+                    )],
+                    plan_stats: None,
+                }
+            }
+            DemandPlannerAction::LookupParkRequested {
+                info_hash,
+                slice_class,
+                stop_reason,
+                total_peers,
+                unique_peers,
+                lookup_ids,
+            } => {
+                let previous = demand_scheduler.entry_snapshot(info_hash);
+                demand_lookup_ids.remove(&info_hash);
+                DemandPlannerReduction {
+                    effects: vec![DemandPlannerEffect::AdmitDrain(DemandAdmitDrainEffect {
+                        info_hash,
+                        slice_class,
+                        stop_reason,
+                        total_peers,
+                        unique_peers,
+                        lookup_ids,
+                        previous,
+                    })],
+                    plan_stats: None,
+                }
+            }
+            DemandPlannerAction::LookupParkResolved {
+                info_hash,
+                slice_class,
+                stop_reason,
+                total_peers,
+                unique_peers,
+                parked_outcome,
+                drain_admission,
+                previous,
+                now,
+            } => {
+                if drain_admission.is_none() {
+                    planner_state
+                        .entry(info_hash)
+                        .or_default()
+                        .note_finish(now, unique_peers);
+                    demand_scheduler.finish(info_hash, now);
+                }
+                let should_finalize_drain = drain_admission.is_some()
+                    && demand_scheduler
+                        .demand_state(info_hash)
+                        .map(DemandSliceClass::from_demand)
+                        .is_some_and(|current_class| current_class != slice_class);
+                let mut effects = vec![DemandPlannerEffect::LookupParked(
+                    DemandLookupParkedEffect {
+                        info_hash,
+                        slice_class,
+                        stop_reason,
+                        total_peers,
+                        unique_peers,
+                        parked_outcome,
+                        drain_admission,
+                        previous,
+                        current: demand_scheduler.entry_snapshot(info_hash),
+                        parked_at: now,
+                    },
+                )];
+                if should_finalize_drain {
+                    effects.push(DemandPlannerEffect::FinalizeDrainingLookup(
+                        DemandFinalizeDrainingLookupEffect {
+                            info_hash,
+                            force: true,
+                        },
+                    ));
+                }
+                DemandPlannerReduction {
+                    effects,
+                    plan_stats: None,
+                }
+            }
+            DemandPlannerAction::DrainedLookupFinalized {
+                info_hash,
+                outcome,
+                previous,
+                now,
+            } => {
+                planner_state
+                    .entry(info_hash)
+                    .or_default()
+                    .note_finish(now, outcome.unique_peers);
+                let finish_mode = if outcome.slice_class == DemandSliceClass::NoConnectedPeers
+                    && outcome.parked_outcome == Some(DemandParkedSliceOutcome::HealthyZeroYield)
+                {
+                    DemandFinishMode::AcceleratedNoConnectedPeersBackoff
+                } else {
+                    DemandFinishMode::Standard
+                };
+                demand_scheduler.finish_with_mode(info_hash, now, finish_mode);
+                DemandPlannerReduction {
+                    effects: vec![DemandPlannerEffect::DrainFinalized(
+                        DemandDrainFinalizedEffect {
+                            info_hash,
+                            outcome,
+                            finish_mode,
+                            previous,
+                            current: demand_scheduler.entry_snapshot(info_hash),
+                            finalized_at: now,
+                            parked: parked_crawls.contains_key(&info_hash),
+                        },
+                    )],
+                    plan_stats: None,
+                }
+            }
+        }
+    }
+}
+
+async fn start_due_demands(
+    mut active_runtime: Option<&mut ActiveRuntime>,
+    command_tx: &DhtCommandSender,
+    demand_planner: &mut DemandPlannerModel,
+    slice_metrics: &mut DemandSliceMetrics,
+) {
+    let now = Instant::now();
+    let runtime_available = active_runtime.is_some();
+    let reduction = demand_planner.update(DemandPlannerAction::PlanDue {
+        now,
+        runtime_available,
+    });
+    for effect in reduction.effects {
+        let DemandPlannerEffect::StartLookup(start) = effect else {
             continue;
-        }
-        let plan = DemandLookupPlan::for_demand(candidate.demand);
-        slice_metrics.record_selection(plan.class, selection_reason);
-        planner_state.entry(info_hash).or_default().note_start(now);
-        if demand_log_enabled {
-            tracing::info!(
-                target: "superseedr::dht_demand",
-                info_hash = %short_info_hash_hex(info_hash),
-                class = demand_slice_class_label(plan.class),
-                selection_reason = demand_selection_reason_label(selection_reason),
-                awaiting_metadata = candidate.demand.awaiting_metadata,
-                connected_peers = candidate.demand.connected_peers,
-                subscribers = candidate.subscriber_count,
-                overdue_ms = duration_ms(now.saturating_duration_since(candidate.next_eligible_at)),
-                early_ms = duration_ms(candidate.next_eligible_at.saturating_duration_since(now)),
-                parked = parked_crawls.contains_key(&info_hash),
-                idle_timeout_ms = duration_ms(plan.idle_timeout),
-                max_wall_time_ms = duration_ms(plan.max_wall_time),
-                unique_peer_cap = plan.unique_peer_cap,
-                stop_after_first_batch = plan.stop_after_first_batch,
-                "dht demand launch"
-            );
-        }
+        };
+        let candidate = start.candidate;
+        let info_hash = candidate.info_hash;
+        let plan = start.plan;
+        slice_metrics.record_selection(plan.class, start.selection_reason);
         match start_get_peers_lookup(
-            Some(active_runtime),
+            active_runtime.as_mut().map(|active| &mut **active),
             command_tx,
-            parked_crawls,
+            demand_planner,
             Some(slice_metrics),
             info_hash,
             plan.class,
@@ -3880,27 +3969,11 @@ async fn start_due_demands(
         .await
         {
             Ok(started) => {
-                if demand_log_enabled {
-                    let lookup_count = started
-                        .lookup_ids
-                        .lock()
-                        .expect("managed dht lookup ids lock")
-                        .len();
-                    tracing::info!(
-                        target: "superseedr::dht_demand",
-                        info_hash = %short_info_hash_hex(info_hash),
-                        class = demand_slice_class_label(plan.class),
-                        lookup_count,
-                        "dht demand launch started"
-                    );
-                }
-                demand_lookup_ids.insert(
+                demand_planner.update(DemandPlannerAction::LookupStarted {
                     info_hash,
-                    ActiveDemandLookup {
-                        lookup_ids: started.lookup_ids.clone(),
-                        slice_class: plan.class,
-                    },
-                );
+                    slice_class: plan.class,
+                    lookup_ids: started.lookup_ids.clone(),
+                });
                 let mut receiver = started.receiver;
                 let command_tx = command_tx.clone();
                 let lookup_ids = started.lookup_ids.clone();
@@ -3928,13 +4001,13 @@ async fn start_due_demands(
                                     break;
                                 };
                                 total_peers = total_peers.saturating_add(peers.len());
-                                let _ = command_tx.send(DhtCommand::DemandPeers {
-                                    info_hash,
-                                    peers: peers.clone(),
-                                });
-                                for peer in peers {
-                                    unique_peers.insert(peer);
+                                for peer in &peers {
+                                    unique_peers.insert(*peer);
                                 }
+                                let _ = send_dht_command(
+                                    &command_tx,
+                                    DhtCommand::DemandPeers { info_hash, peers },
+                                );
                                 if plan.stop_after_first_batch {
                                     stop_reason = Some(DemandSliceStopReason::FirstBatch);
                                     break;
@@ -3952,14 +4025,17 @@ async fn start_due_demands(
 
                     if let Some(reason) = stop_reason {
                         accepting_families.store(false, Ordering::Release);
-                        let _ = command_tx.send(DhtCommand::ParkDemandLookups {
-                            info_hash,
-                            slice_class: plan.class,
-                            stop_reason: reason,
-                            total_peers,
-                            unique_peers,
-                            lookup_ids,
-                        });
+                        let _ = send_dht_command(
+                            &command_tx,
+                            DhtCommand::ParkDemandLookups {
+                                info_hash,
+                                slice_class: plan.class,
+                                stop_reason: reason,
+                                total_peers,
+                                unique_peers,
+                                lookup_ids,
+                            },
+                        );
                         let drain_sleep = tokio::time::sleep(
                             DHT_DEMAND_DRAIN_MAX_AGE + DHT_DEMAND_DRAIN_POLL_INTERVAL,
                         );
@@ -3971,7 +4047,7 @@ async fn start_due_demands(
                                     let Some(peers) = maybe_peers else {
                                         break;
                                     };
-                                    let _ = command_tx.send(DhtCommand::DemandPeers {
+                                    let _ = send_dht_command(&command_tx, DhtCommand::DemandPeers {
                                         info_hash,
                                         peers,
                                     });
@@ -3980,28 +4056,24 @@ async fn start_due_demands(
                         }
                     } else {
                         let unique_peer_count = unique_peers.len();
-                        let _ = command_tx.send(DhtCommand::DemandLookupFinished {
-                            info_hash,
-                            slice_class: plan.class,
-                            total_peers,
-                            unique_peers: unique_peer_count,
-                        });
+                        let _ = send_dht_command(
+                            &command_tx,
+                            DhtCommand::DemandLookupFinished {
+                                info_hash,
+                                slice_class: plan.class,
+                                total_peers,
+                                unique_peers: unique_peer_count,
+                            },
+                        );
                     }
                 });
             }
-            Err(error) => {
-                planner_budget.refund(plan.class);
-                soak_metrics.record_launch_failure();
-                if demand_log_enabled {
-                    tracing::info!(
-                        target: "superseedr::dht_demand",
-                        info_hash = %short_info_hash_hex(info_hash),
-                        class = demand_slice_class_label(plan.class),
-                        error = %error,
-                        "dht demand launch failed"
-                    );
-                }
-                demand_scheduler.finish(info_hash, Instant::now());
+            Err(_) => {
+                demand_planner.update(DemandPlannerAction::LookupStartFailed {
+                    info_hash,
+                    slice_class: plan.class,
+                    now: Instant::now(),
+                });
             }
         }
     }
@@ -4038,7 +4110,7 @@ async fn ensure_lookup_routes(
 
 async fn attach_lookup_family(
     active_runtime: Option<&mut ActiveRuntime>,
-    parked_crawls: &mut HashMap<InfoHash, DemandCrawlState>,
+    demand_planner: &mut DemandPlannerModel,
     slice_metrics: Option<&mut DemandSliceMetrics>,
     info_hash: InfoHash,
     family: AddressFamily,
@@ -4059,8 +4131,7 @@ async fn attach_lookup_family(
     }
 
     let mut slice_metrics = slice_metrics;
-    let resumed_state = take_parked_family_state(
-        parked_crawls,
+    let resumed_state = demand_planner.take_parked_family_state(
         slice_metrics.as_mut().map(|metrics| &mut **metrics),
         info_hash,
         family,
@@ -4493,9 +4564,636 @@ fn forced_internal_backend_error(config: &DhtServiceConfig) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn peer(addr: &str) -> SocketAddr {
         addr.parse().expect("valid socket address")
+    }
+
+    fn hash_index(index: u32) -> InfoHash {
+        let mut bytes = [0u8; InfoHash::LEN];
+        bytes[..4].copy_from_slice(&index.to_be_bytes());
+        InfoHash::from(bytes)
+    }
+
+    fn demand_for_fuzz_class(class: u8, connected_peers: u8) -> DhtDemandState {
+        match class % 3 {
+            0 => DhtDemandState {
+                awaiting_metadata: true,
+                connected_peers: usize::from(connected_peers),
+            },
+            1 => DhtDemandState {
+                awaiting_metadata: false,
+                connected_peers: 0,
+            },
+            _ => DhtDemandState {
+                awaiting_metadata: false,
+                connected_peers: usize::from(connected_peers.max(1)),
+            },
+        }
+    }
+
+    fn count_candidate_classes(candidates: &[DueDemandCandidate]) -> DemandSlotCounts {
+        let mut counts = DemandSlotCounts::default();
+        for candidate in candidates {
+            counts.record(DemandSliceClass::from_demand(candidate.demand));
+        }
+        counts
+    }
+
+    fn test_instant_saturating_sub(now: Instant, duration: Duration) -> Instant {
+        now.checked_sub(duration).unwrap_or(now)
+    }
+
+    #[derive(Debug, Clone)]
+    struct PlannerCandidateSpec {
+        index: u16,
+        demand_class: u8,
+        connected_peers: u8,
+        overdue_ms: u32,
+        subscribers: u8,
+        useful_yield_age_ms: Option<u32>,
+        last_unique_peers: u8,
+    }
+
+    fn planner_candidate_strategy() -> impl Strategy<Value = PlannerCandidateSpec> {
+        (
+            0u16..512,
+            0u8..3,
+            0u8..32,
+            0u32..=1_200_000,
+            1u8..=8,
+            prop::option::of(0u32..=1_200_000),
+            0u8..=96,
+        )
+            .prop_map(
+                |(
+                    index,
+                    demand_class,
+                    connected_peers,
+                    overdue_ms,
+                    subscribers,
+                    useful_yield_age_ms,
+                    last_unique_peers,
+                )| PlannerCandidateSpec {
+                    index,
+                    demand_class,
+                    connected_peers,
+                    overdue_ms,
+                    subscribers,
+                    useful_yield_age_ms,
+                    last_unique_peers,
+                },
+            )
+    }
+
+    #[derive(Debug, Clone)]
+    enum PlannerMachineOp {
+        Register {
+            key: u8,
+            demand: DhtDemandState,
+            advance_ms: u16,
+        },
+        Update {
+            key: u8,
+            demand: DhtDemandState,
+            advance_ms: u16,
+        },
+        Unregister {
+            key: u8,
+            advance_ms: u16,
+        },
+        PlanTick {
+            advance_ms: u16,
+        },
+        FinishActive {
+            key: u8,
+            unique_peers: u8,
+            advance_ms: u16,
+        },
+        ParkActive {
+            key: u8,
+            unique_peers: u8,
+            advance_ms: u16,
+        },
+        AddDrainPeers {
+            key: u8,
+            peer_count: u8,
+            advance_ms: u16,
+        },
+        FinalizeDrain {
+            key: u8,
+            advance_ms: u16,
+        },
+        DrainTick {
+            runtime_ready: bool,
+            advance_ms: u16,
+        },
+        ResetActive {
+            advance_ms: u16,
+        },
+    }
+
+    fn planner_machine_op_strategy() -> impl Strategy<Value = PlannerMachineOp> {
+        let key = 0u8..64;
+        let advance_ms = 0u16..=5_000;
+
+        prop_oneof![
+            (key.clone(), demand_strategy(), advance_ms.clone()).prop_map(
+                |(key, demand, advance_ms)| PlannerMachineOp::Register {
+                    key,
+                    demand,
+                    advance_ms,
+                }
+            ),
+            (key.clone(), demand_strategy(), advance_ms.clone()).prop_map(
+                |(key, demand, advance_ms)| PlannerMachineOp::Update {
+                    key,
+                    demand,
+                    advance_ms,
+                }
+            ),
+            (key.clone(), advance_ms.clone())
+                .prop_map(|(key, advance_ms)| { PlannerMachineOp::Unregister { key, advance_ms } }),
+            advance_ms
+                .clone()
+                .prop_map(|advance_ms| PlannerMachineOp::PlanTick { advance_ms }),
+            (key.clone(), 0u8..=96, advance_ms.clone()).prop_map(
+                |(key, unique_peers, advance_ms)| PlannerMachineOp::FinishActive {
+                    key,
+                    unique_peers,
+                    advance_ms,
+                }
+            ),
+            (key.clone(), 0u8..=96, advance_ms.clone()).prop_map(
+                |(key, unique_peers, advance_ms)| PlannerMachineOp::ParkActive {
+                    key,
+                    unique_peers,
+                    advance_ms,
+                }
+            ),
+            (key.clone(), 0u8..=32, advance_ms.clone()).prop_map(
+                |(key, peer_count, advance_ms)| PlannerMachineOp::AddDrainPeers {
+                    key,
+                    peer_count,
+                    advance_ms,
+                }
+            ),
+            (key, advance_ms.clone()).prop_map(|(key, advance_ms)| {
+                PlannerMachineOp::FinalizeDrain { key, advance_ms }
+            }),
+            (any::<bool>(), advance_ms.clone()).prop_map(|(runtime_ready, advance_ms)| {
+                PlannerMachineOp::DrainTick {
+                    runtime_ready,
+                    advance_ms,
+                }
+            }),
+            advance_ms.prop_map(|advance_ms| PlannerMachineOp::ResetActive { advance_ms }),
+        ]
+    }
+
+    fn demand_strategy() -> impl Strategy<Value = DhtDemandState> {
+        (any::<bool>(), 0usize..=32).prop_map(|(awaiting_metadata, connected_peers)| {
+            DhtDemandState {
+                awaiting_metadata,
+                connected_peers,
+            }
+        })
+    }
+
+    fn active_lookup(lookup_id: LookupId, class: DemandSliceClass) -> ActiveDemandLookup {
+        ActiveDemandLookup {
+            lookup_ids: Arc::new(StdMutex::new(vec![lookup_id])),
+            slice_class: class,
+        }
+    }
+
+    fn synthetic_peers(key: u8, count: u8) -> HashSet<SocketAddr> {
+        (0..count)
+            .map(|index| {
+                SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(127, key, index, key.wrapping_add(index))),
+                    40_000 + u16::from(index),
+                )
+            })
+            .collect()
+    }
+
+    fn lookup_state_for_family(
+        lookup_id: LookupId,
+        family: AddressFamily,
+        target_index: u32,
+        now: Instant,
+    ) -> LookupState {
+        let bootstrap = match family {
+            AddressFamily::Ipv4 => vec![peer("127.0.0.10:6881")],
+            AddressFamily::Ipv6 => vec![peer("[::1]:6881")],
+        };
+        let routing = crate::dht::routing::RoutingSnapshot {
+            family,
+            buckets: Vec::new(),
+            nodes: Vec::new(),
+            replacement_count: 0,
+            refresh_due_count: 0,
+        };
+        crate::dht::lookup::LookupManager::new(crate::dht::lookup::LookupConfig::default()).start(
+            crate::dht::lookup::LookupRequest {
+                lookup_id,
+                kind: crate::dht::lookup::LookupKind::GetPeers,
+                target: crate::dht::lookup::LookupTarget::InfoHash(hash_index(target_index)),
+            },
+            family,
+            &routing,
+            &bootstrap,
+            &[],
+            now,
+        )
+    }
+
+    fn disabled_service_config() -> DhtServiceConfig {
+        DhtServiceConfig {
+            port: 0,
+            bootstrap_nodes: Vec::new(),
+            preferred_backend: DhtBackendKind::Disabled,
+            force_internal_failure: false,
+        }
+    }
+
+    fn initial_disabled_status(config: &DhtServiceConfig) -> DhtStatus {
+        build_status(
+            None,
+            DhtBackendKind::Disabled,
+            config.preferred_backend,
+            None,
+            0,
+            literal_bootstrap_summary(&config.bootstrap_nodes),
+        )
+    }
+
+    async fn local_ipv4_active_runtime() -> ActiveRuntime {
+        let bootstrap_addr = peer("127.0.0.1:9");
+        local_ipv4_active_runtime_with_bootstrap(vec![bootstrap_addr]).await
+    }
+
+    async fn local_ipv4_active_runtime_without_bootstrap() -> ActiveRuntime {
+        local_ipv4_active_runtime_with_bootstrap(Vec::new()).await
+    }
+
+    async fn local_ipv4_active_runtime_with_bootstrap(
+        bootstrap_nodes: Vec<SocketAddr>,
+    ) -> ActiveRuntime {
+        let runtime = Runtime::bind(RuntimeConfig {
+            local_node_id: NodeId::from([9u8; NodeId::LEN]),
+            bootstrap_nodes: bootstrap_nodes.clone(),
+            ipv4_bind_addr: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
+            ipv6_bind_addr: None,
+            persistence: None,
+        })
+        .await
+        .expect("bind local ipv4 runtime");
+
+        ActiveRuntime {
+            runtime,
+            backend: DhtBackendKind::InternalPrototype,
+            bootstrap: BootstrapSummary {
+                total: bootstrap_nodes.len(),
+                ipv4: bootstrap_nodes.iter().filter(|addr| addr.is_ipv4()).count(),
+                ipv6: 0,
+            },
+            startup_bootstrap_due: None,
+        }
+    }
+
+    fn insert_synthetic_drain(
+        draining_demands: &mut HashMap<InfoHash, DrainingDemandLookup>,
+        info_hash: InfoHash,
+        key: u8,
+        lookup_id: LookupId,
+        slice_class: DemandSliceClass,
+        unique_peers: u8,
+        now: Instant,
+    ) {
+        let unique_peers = synthetic_peers(key, unique_peers);
+        let unique_peer_count = unique_peers.len();
+        let stop_reason = DemandSliceStopReason::WallTime;
+        let parked_outcome =
+            slice_class.parked_slice_outcome(stop_reason, unique_peer_count, false);
+        let duration = demand_drain_duration(
+            slice_class,
+            stop_reason,
+            Some(parked_outcome),
+            unique_peer_count,
+        )
+        .unwrap_or(Duration::from_secs(1));
+        draining_demands.insert(
+            info_hash,
+            DrainingDemandLookup {
+                lookup_ids: vec![lookup_id],
+                slice_class,
+                stop_reason,
+                started_at: now,
+                total_peers: unique_peer_count,
+                initial_unique_peers: unique_peer_count,
+                unique_peers,
+                deadline: now + duration,
+                no_late_yield_deadline: now
+                    + demand_drain_no_late_yield_grace(slice_class).min(duration),
+                initial_inflight_queries: 1,
+                score: 1,
+            },
+        );
+    }
+
+    struct PlannerMachine {
+        now: Instant,
+        planner: DemandPlannerModel,
+        next_lookup_id: u64,
+    }
+
+    impl PlannerMachine {
+        fn new() -> Self {
+            let now = Instant::now();
+            Self {
+                now,
+                planner: DemandPlannerModel::new(now),
+                next_lookup_id: 1,
+            }
+        }
+
+        fn advance(&mut self, advance_ms: u16) {
+            self.now += Duration::from_millis(u64::from(advance_ms));
+        }
+
+        fn plan_tick(&mut self) {
+            let reduction = self.planner.update(DemandPlannerAction::PlanDue {
+                now: self.now,
+                runtime_available: true,
+            });
+
+            for effect in reduction.effects {
+                let DemandPlannerEffect::StartLookup(start) = effect else {
+                    continue;
+                };
+                let lookup_id = LookupId(self.next_lookup_id);
+                self.next_lookup_id = self.next_lookup_id.saturating_add(1);
+                self.planner.update(DemandPlannerAction::LookupStarted {
+                    info_hash: start.candidate.info_hash,
+                    slice_class: start.plan.class,
+                    lookup_ids: active_lookup(lookup_id, start.plan.class).lookup_ids,
+                });
+            }
+        }
+
+        fn finish_active(&mut self, key: u8, unique_peers: u8) {
+            let info_hash = hash_index(u32::from(key));
+            let Some(active) = self.planner.active.get(&info_hash) else {
+                return;
+            };
+            let slice_class = active.slice_class;
+            self.planner.update(DemandPlannerAction::LookupFinished {
+                info_hash,
+                slice_class,
+                total_peers: usize::from(unique_peers),
+                unique_peers: usize::from(unique_peers),
+                now: self.now,
+            });
+        }
+
+        fn park_active(&mut self, key: u8, unique_peers: u8) {
+            let info_hash = hash_index(u32::from(key));
+            let Some(active) = self.planner.active.get(&info_hash).cloned() else {
+                return;
+            };
+            let requested = self
+                .planner
+                .update(DemandPlannerAction::LookupParkRequested {
+                    info_hash,
+                    slice_class: active.slice_class,
+                    stop_reason: DemandSliceStopReason::WallTime,
+                    total_peers: usize::from(unique_peers),
+                    unique_peers: synthetic_peers(key, unique_peers),
+                    lookup_ids: active.lookup_ids,
+                });
+            for effect in requested.effects {
+                let DemandPlannerEffect::AdmitDrain(admit) = effect else {
+                    continue;
+                };
+                let unique_peer_count = admit.unique_peers.len();
+                let admit_drain =
+                    unique_peer_count > 0 || admit.slice_class != DemandSliceClass::RoutineRefresh;
+                let parked_outcome = if admit_drain {
+                    let lookup_id = admit
+                        .lookup_ids
+                        .lock()
+                        .expect("test lookup id lock")
+                        .first()
+                        .copied()
+                        .unwrap_or(LookupId(0));
+                    insert_synthetic_drain(
+                        &mut self.planner.draining_demands,
+                        admit.info_hash,
+                        key,
+                        lookup_id,
+                        admit.slice_class,
+                        unique_peers,
+                        self.now,
+                    );
+                    Some(admit.slice_class.parked_slice_outcome(
+                        admit.stop_reason,
+                        unique_peer_count,
+                        false,
+                    ))
+                } else {
+                    None
+                };
+                let drain_admission = self
+                    .planner
+                    .draining_demands
+                    .get(&admit.info_hash)
+                    .map(demand_drain_admission_snapshot);
+                self.planner
+                    .update(DemandPlannerAction::LookupParkResolved {
+                        info_hash: admit.info_hash,
+                        slice_class: admit.slice_class,
+                        stop_reason: admit.stop_reason,
+                        total_peers: admit.total_peers,
+                        unique_peers: unique_peer_count,
+                        parked_outcome,
+                        drain_admission,
+                        previous: admit.previous,
+                        now: self.now,
+                    });
+            }
+        }
+
+        fn finalize_drain(&mut self, key: u8) {
+            self.finalize_drain_hash(hash_index(u32::from(key)));
+        }
+
+        fn finalize_drain_hash(&mut self, info_hash: InfoHash) {
+            let Some(drain) = self.planner.draining_demands.remove(&info_hash) else {
+                return;
+            };
+            let unique_peers = drain.unique_peer_count();
+            let previous = self.planner.scheduler.entry_snapshot(info_hash);
+            let parked_outcome =
+                drain
+                    .slice_class
+                    .parked_slice_outcome(drain.stop_reason, unique_peers, false);
+            self.planner
+                .update(DemandPlannerAction::DrainedLookupFinalized {
+                    info_hash,
+                    outcome: DrainedDemandOutcome {
+                        slice_class: drain.slice_class,
+                        stop_reason: drain.stop_reason,
+                        total_peers: drain.total_peers,
+                        unique_peers,
+                        parked_outcome: Some(parked_outcome),
+                        drain_duration_ms: drain.duration_ms(self.now),
+                        finalized_after_deadline: self.now >= drain.deadline,
+                        finalized_early_no_yield: false,
+                    },
+                    previous,
+                    now: self.now,
+                });
+        }
+
+        fn apply(&mut self, op: PlannerMachineOp) {
+            let advance_ms = match &op {
+                PlannerMachineOp::Register { advance_ms, .. }
+                | PlannerMachineOp::Update { advance_ms, .. }
+                | PlannerMachineOp::Unregister { advance_ms, .. }
+                | PlannerMachineOp::PlanTick { advance_ms }
+                | PlannerMachineOp::FinishActive { advance_ms, .. }
+                | PlannerMachineOp::ParkActive { advance_ms, .. }
+                | PlannerMachineOp::AddDrainPeers { advance_ms, .. }
+                | PlannerMachineOp::FinalizeDrain { advance_ms, .. }
+                | PlannerMachineOp::DrainTick { advance_ms, .. }
+                | PlannerMachineOp::ResetActive { advance_ms } => *advance_ms,
+            };
+            self.advance(advance_ms);
+
+            match op {
+                PlannerMachineOp::Register { key, demand, .. } => {
+                    self.planner.update(DemandPlannerAction::DemandRegistered {
+                        info_hash: hash_index(u32::from(key)),
+                        demand,
+                        now: self.now,
+                    });
+                }
+                PlannerMachineOp::Update { key, demand, .. } => {
+                    let info_hash = hash_index(u32::from(key));
+                    let reduction = self.planner.update(DemandPlannerAction::DemandUpdated {
+                        info_hash,
+                        demand,
+                        now: self.now,
+                    });
+                    for effect in reduction.effects {
+                        if let DemandPlannerEffect::FinalizeDrainingLookup(_) = effect {
+                            self.finalize_drain(key);
+                        }
+                    }
+                }
+                PlannerMachineOp::Unregister { key, .. } => {
+                    let info_hash = hash_index(u32::from(key));
+                    self.planner
+                        .update(DemandPlannerAction::DemandSubscriberRemoved { info_hash });
+                }
+                PlannerMachineOp::PlanTick { .. } => self.plan_tick(),
+                PlannerMachineOp::FinishActive {
+                    key, unique_peers, ..
+                } => self.finish_active(key, unique_peers),
+                PlannerMachineOp::ParkActive {
+                    key, unique_peers, ..
+                } => self.park_active(key, unique_peers),
+                PlannerMachineOp::AddDrainPeers {
+                    key, peer_count, ..
+                } => {
+                    let peers = synthetic_peers(key.wrapping_add(1), peer_count)
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    self.planner.update(DemandPlannerAction::PeersReceived {
+                        info_hash: hash_index(u32::from(key)),
+                        peers: &peers,
+                    });
+                }
+                PlannerMachineOp::FinalizeDrain { key, .. } => self.finalize_drain(key),
+                PlannerMachineOp::DrainTick { runtime_ready, .. } => {
+                    let runtime_ready = self
+                        .planner
+                        .draining_demands
+                        .keys()
+                        .copied()
+                        .map(|info_hash| (info_hash, runtime_ready))
+                        .collect();
+                    let reduction = self.planner.update(DemandPlannerAction::DrainTick {
+                        now: self.now,
+                        runtime_ready,
+                    });
+                    for effect in reduction.effects {
+                        if let DemandPlannerEffect::FinalizeDrainingLookup(finalize) = effect {
+                            self.finalize_drain_hash(finalize.info_hash);
+                        }
+                    }
+                }
+                PlannerMachineOp::ResetActive { .. } => {
+                    self.planner.active.clear();
+                    self.planner.draining_demands.clear();
+                    self.planner.scheduler.reset_active(self.now);
+                }
+            }
+        }
+
+        fn assert_invariants(&self) -> Result<(), TestCaseError> {
+            let mut occupied = HashSet::new();
+            for (&info_hash, active) in &self.planner.active {
+                prop_assert!(occupied.insert(info_hash));
+                let snapshot = self
+                    .planner
+                    .scheduler
+                    .entry_snapshot(info_hash)
+                    .expect("active demand must have scheduler entry");
+                prop_assert!(snapshot.in_progress);
+                prop_assert!(active.lookup_ids.lock().expect("test lookup id lock").len() == 1);
+            }
+
+            for (&info_hash, drain) in &self.planner.draining_demands {
+                prop_assert!(occupied.insert(info_hash));
+                let snapshot = self
+                    .planner
+                    .scheduler
+                    .entry_snapshot(info_hash)
+                    .expect("draining demand must have scheduler entry");
+                prop_assert!(snapshot.in_progress);
+                prop_assert!(drain.deadline >= drain.started_at);
+                prop_assert!(drain.no_late_yield_deadline <= drain.deadline);
+                prop_assert!(drain.unique_peer_count() >= drain.initial_unique_peers);
+            }
+
+            let active_counts = active_demand_lookup_slot_counts(&self.planner.active);
+            prop_assert!(active_counts.awaiting_metadata <= DHT_AWAITING_METADATA_SLOT_CAP);
+            prop_assert!(active_counts.no_connected_peers <= DHT_NO_CONNECTED_PEERS_SLOT_CAP);
+            prop_assert!(active_counts.routine_refresh <= DHT_ROUTINE_LOOKUP_SLOT_CAP);
+            prop_assert!(
+                self.planner
+                    .active
+                    .len()
+                    .saturating_add(drain_virtual_slot_count(
+                        self.planner.draining_demands.len()
+                    ))
+                    <= DHT_DEMAND_LOOKUP_SLOT_COUNT
+            );
+
+            for candidate in self.planner.scheduler.due_candidates(self.now) {
+                prop_assert!(!self.planner.active.contains_key(&candidate.info_hash));
+                prop_assert!(!self
+                    .planner
+                    .draining_demands
+                    .contains_key(&candidate.info_hash));
+            }
+
+            Ok(())
+        }
     }
 
     #[test]
@@ -4967,6 +5665,1402 @@ mod tests {
         assert!(metrics.summary().contains("sel_due=1"));
         assert!(metrics.summary().contains("sel_spare=1"));
         assert!(metrics.summary().contains("reset_quality=1"));
+    }
+
+    #[test]
+    fn demand_planner_plan_due_starts_due_demands_by_class_and_marks_state() {
+        let now = Instant::now();
+        let metadata_hash = hash_index(60);
+        let no_peer_hash = hash_index(61);
+        let routine_hash = hash_index(62);
+        let mut planner = DemandPlannerModel::new(now);
+
+        for (info_hash, demand) in [
+            (
+                metadata_hash,
+                DhtDemandState {
+                    awaiting_metadata: true,
+                    connected_peers: 0,
+                },
+            ),
+            (
+                no_peer_hash,
+                DhtDemandState {
+                    awaiting_metadata: false,
+                    connected_peers: 0,
+                },
+            ),
+            (
+                routine_hash,
+                DhtDemandState {
+                    awaiting_metadata: false,
+                    connected_peers: 2,
+                },
+            ),
+        ] {
+            planner.update(DemandPlannerAction::DemandRegistered {
+                info_hash,
+                demand,
+                now,
+            });
+        }
+
+        let reduction = planner.update(DemandPlannerAction::PlanDue {
+            now,
+            runtime_available: true,
+        });
+        let starts = reduction
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                DemandPlannerEffect::StartLookup(start) => Some(*start),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(starts.len(), 3);
+        assert!(starts.iter().any(|start| {
+            start.candidate.info_hash == metadata_hash
+                && start.plan.class == DemandSliceClass::AwaitingMetadata
+        }));
+        assert!(starts.iter().any(|start| {
+            start.candidate.info_hash == no_peer_hash
+                && start.plan.class == DemandSliceClass::NoConnectedPeers
+        }));
+        assert!(starts.iter().any(|start| {
+            start.candidate.info_hash == routine_hash
+                && start.plan.class == DemandSliceClass::RoutineRefresh
+        }));
+
+        for start in starts {
+            assert_eq!(start.selection_reason, DemandSelectionReason::OverdueScarce);
+            assert!(
+                planner
+                    .scheduler
+                    .entry_snapshot(start.candidate.info_hash)
+                    .expect("demand entry")
+                    .in_progress
+            );
+            assert_eq!(
+                planner
+                    .state
+                    .get(&start.candidate.info_hash)
+                    .expect("planner state")
+                    .last_started_at,
+                Some(now)
+            );
+        }
+    }
+
+    #[test]
+    fn demand_planner_plan_due_skips_draining_demands_but_launches_independent_work() {
+        let now = Instant::now();
+        let draining_hash = hash_index(63);
+        let metadata_hash = hash_index(64);
+        let mut planner = DemandPlannerModel::new(now);
+
+        planner.update(DemandPlannerAction::DemandRegistered {
+            info_hash: draining_hash,
+            demand: DhtDemandState {
+                awaiting_metadata: false,
+                connected_peers: 0,
+            },
+            now,
+        });
+        planner.update(DemandPlannerAction::DemandRegistered {
+            info_hash: metadata_hash,
+            demand: DhtDemandState {
+                awaiting_metadata: true,
+                connected_peers: 0,
+            },
+            now,
+        });
+        assert!(planner.scheduler.mark_in_progress(draining_hash));
+        insert_synthetic_drain(
+            &mut planner.draining_demands,
+            draining_hash,
+            63,
+            LookupId(63),
+            DemandSliceClass::NoConnectedPeers,
+            1,
+            now,
+        );
+
+        let reduction = planner.update(DemandPlannerAction::PlanDue {
+            now,
+            runtime_available: true,
+        });
+        let starts = reduction
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                DemandPlannerEffect::StartLookup(start) => Some(*start),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].candidate.info_hash, metadata_hash);
+        assert_eq!(starts[0].plan.class, DemandSliceClass::AwaitingMetadata);
+        assert!(planner.draining_demands.contains_key(&draining_hash));
+        assert!(
+            planner
+                .scheduler
+                .entry_snapshot(draining_hash)
+                .expect("draining demand entry")
+                .in_progress
+        );
+    }
+
+    #[test]
+    fn demand_planner_drained_lookup_lifecycle_keeps_late_peer_yield_in_state() {
+        let now = Instant::now();
+        let info_hash = hash_index(65);
+        let mut planner = DemandPlannerModel::new(now);
+        planner.update(DemandPlannerAction::DemandRegistered {
+            info_hash,
+            demand: DhtDemandState {
+                awaiting_metadata: false,
+                connected_peers: 0,
+            },
+            now,
+        });
+        assert!(planner.scheduler.mark_in_progress(info_hash));
+        let active = active_lookup(LookupId(65), DemandSliceClass::NoConnectedPeers);
+        planner.active.insert(info_hash, active.clone());
+
+        let requested = planner.update(DemandPlannerAction::LookupParkRequested {
+            info_hash,
+            slice_class: DemandSliceClass::NoConnectedPeers,
+            stop_reason: DemandSliceStopReason::WallTime,
+            total_peers: 1,
+            unique_peers: synthetic_peers(65, 1),
+            lookup_ids: active.lookup_ids,
+        });
+        assert!(planner.active.is_empty());
+        let DemandPlannerEffect::AdmitDrain(admit) =
+            requested.effects.into_iter().next().expect("admit effect")
+        else {
+            panic!("expected admit drain effect");
+        };
+
+        insert_synthetic_drain(
+            &mut planner.draining_demands,
+            info_hash,
+            65,
+            LookupId(65),
+            DemandSliceClass::NoConnectedPeers,
+            1,
+            now,
+        );
+        let drain_admission = planner
+            .draining_demands
+            .get(&info_hash)
+            .map(demand_drain_admission_snapshot);
+        planner.update(DemandPlannerAction::LookupParkResolved {
+            info_hash,
+            slice_class: DemandSliceClass::NoConnectedPeers,
+            stop_reason: DemandSliceStopReason::WallTime,
+            total_peers: 1,
+            unique_peers: 1,
+            parked_outcome: Some(DemandParkedSliceOutcome::HealthyLowYield),
+            drain_admission,
+            previous: admit.previous,
+            now,
+        });
+        assert!(
+            planner
+                .scheduler
+                .entry_snapshot(info_hash)
+                .expect("demand entry")
+                .in_progress
+        );
+
+        let late_peers = synthetic_peers(66, 3).into_iter().collect::<Vec<_>>();
+        let recorded = planner.update(DemandPlannerAction::PeersReceived {
+            info_hash,
+            peers: &late_peers,
+        });
+        let DemandPlannerEffect::DrainPeersRecorded(recorded) = recorded
+            .effects
+            .into_iter()
+            .next()
+            .expect("recorded effect")
+        else {
+            panic!("expected drain peers recorded effect");
+        };
+        assert_eq!(recorded.peer_count, 3);
+        assert_eq!(recorded.unique_added, 3);
+        assert_eq!(
+            planner
+                .draining_demands
+                .get(&info_hash)
+                .expect("draining demand")
+                .unique_peer_count(),
+            4
+        );
+
+        let finalized_at = now + Duration::from_secs(2);
+        let drain = planner
+            .draining_demands
+            .remove(&info_hash)
+            .expect("draining demand");
+        let previous = planner.scheduler.entry_snapshot(info_hash);
+        let finalized = planner.update(DemandPlannerAction::DrainedLookupFinalized {
+            info_hash,
+            outcome: DrainedDemandOutcome {
+                slice_class: drain.slice_class,
+                stop_reason: drain.stop_reason,
+                total_peers: drain.total_peers,
+                unique_peers: drain.unique_peer_count(),
+                parked_outcome: Some(DemandParkedSliceOutcome::UsefulYield),
+                drain_duration_ms: drain.duration_ms(finalized_at),
+                finalized_after_deadline: finalized_at >= drain.deadline,
+                finalized_early_no_yield: false,
+            },
+            previous,
+            now: finalized_at,
+        });
+
+        let state = planner.state.get(&info_hash).expect("planner state");
+        assert_eq!(state.last_finished_at, Some(finalized_at));
+        assert_eq!(state.last_useful_yield_at, Some(finalized_at));
+        assert_eq!(state.last_unique_peers, 4);
+        assert!(
+            !planner
+                .scheduler
+                .entry_snapshot(info_hash)
+                .expect("demand entry")
+                .in_progress
+        );
+        let DemandPlannerEffect::DrainFinalized(finalized) = finalized
+            .effects
+            .into_iter()
+            .next()
+            .expect("finalized effect")
+        else {
+            panic!("expected drain finalized effect");
+        };
+        assert_eq!(finalized.finish_mode, DemandFinishMode::Standard);
+        assert_eq!(finalized.outcome.unique_peers, 4);
+    }
+
+    #[test]
+    fn demand_planner_uses_spare_capacity_for_backed_off_no_peer_state() {
+        let now = Instant::now();
+        let info_hash = hash_index(67);
+        let mut planner = DemandPlannerModel::new(now);
+        planner.update(DemandPlannerAction::DemandRegistered {
+            info_hash,
+            demand: DhtDemandState {
+                awaiting_metadata: false,
+                connected_peers: 0,
+            },
+            now,
+        });
+        assert!(planner.scheduler.mark_in_progress(info_hash));
+        let previous = planner.scheduler.entry_snapshot(info_hash);
+
+        planner.update(DemandPlannerAction::DrainedLookupFinalized {
+            info_hash,
+            outcome: DrainedDemandOutcome {
+                slice_class: DemandSliceClass::NoConnectedPeers,
+                stop_reason: DemandSliceStopReason::IdleTimeout,
+                total_peers: 0,
+                unique_peers: 0,
+                parked_outcome: Some(DemandParkedSliceOutcome::HealthyZeroYield),
+                drain_duration_ms: 1_000,
+                finalized_after_deadline: false,
+                finalized_early_no_yield: true,
+            },
+            previous,
+            now,
+        });
+        let backed_off = planner
+            .scheduler
+            .entry_snapshot(info_hash)
+            .expect("demand entry");
+        assert!(backed_off.no_connected_peers_backoff_step > 0);
+
+        let spare_at = now + DHT_DEMAND_SPARE_RESEARCH_MIN_INTERVAL;
+        assert!(backed_off.next_eligible_at > spare_at);
+        let reduction = planner.update(DemandPlannerAction::PlanDue {
+            now: spare_at,
+            runtime_available: true,
+        });
+        let starts = reduction
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                DemandPlannerEffect::StartLookup(start) => Some(*start),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].candidate.info_hash, info_hash);
+        assert_eq!(starts[0].plan.class, DemandSliceClass::NoConnectedPeers);
+        assert_eq!(
+            starts[0].selection_reason,
+            DemandSelectionReason::SpareCapacity
+        );
+        assert!(
+            planner
+                .scheduler
+                .entry_snapshot(info_hash)
+                .expect("demand entry")
+                .in_progress
+        );
+    }
+
+    #[test]
+    fn parked_family_state_round_trips_each_family_and_clears_entry() {
+        let now = Instant::now();
+        let info_hash = hash_index(68);
+        let mut parked_crawls = HashMap::new();
+
+        let outcome = store_parked_lookup_states(
+            &mut parked_crawls,
+            info_hash,
+            DemandSliceClass::NoConnectedPeers,
+            Some(DemandSliceStopReason::WallTime),
+            2,
+            vec![
+                lookup_state_for_family(LookupId(68), AddressFamily::Ipv4, 68, now),
+                lookup_state_for_family(LookupId(69), AddressFamily::Ipv6, 68, now),
+            ],
+        );
+
+        assert_eq!(outcome, Some(DemandParkedSliceOutcome::HealthyLowYield));
+        assert!(parked_crawls.contains_key(&info_hash));
+
+        let ipv4 = take_parked_family_state(
+            &mut parked_crawls,
+            None,
+            info_hash,
+            AddressFamily::Ipv4,
+            DemandSliceClass::NoConnectedPeers,
+        )
+        .expect("parked ipv4 state");
+        assert_eq!(ipv4.family(), AddressFamily::Ipv4);
+        assert!(parked_crawls.contains_key(&info_hash));
+
+        let ipv6 = take_parked_family_state(
+            &mut parked_crawls,
+            None,
+            info_hash,
+            AddressFamily::Ipv6,
+            DemandSliceClass::NoConnectedPeers,
+        )
+        .expect("parked ipv6 state");
+        assert_eq!(ipv6.family(), AddressFamily::Ipv6);
+        assert!(!parked_crawls.contains_key(&info_hash));
+    }
+
+    #[test]
+    fn parked_family_state_reset_drops_low_quality_crawl_and_records_reason() {
+        let now = Instant::now();
+        let info_hash = hash_index(69);
+        let mut parked_crawls = HashMap::new();
+        let mut metrics = DemandSliceMetrics::default();
+
+        let mut crawl = DemandCrawlState::new(now, DemandSliceClass::RoutineRefresh);
+        crawl.ipv4 = Some(lookup_state_for_family(
+            LookupId(70),
+            AddressFamily::Ipv4,
+            69,
+            now,
+        ));
+        crawl.consecutive_stalled_low_yield_slices =
+            DHT_ROUTINE_STALLED_EMPTY_SLICE_RESET_THRESHOLD;
+        parked_crawls.insert(info_hash, crawl);
+
+        let reset = take_parked_family_state(
+            &mut parked_crawls,
+            Some(&mut metrics),
+            info_hash,
+            AddressFamily::Ipv4,
+            DemandSliceClass::RoutineRefresh,
+        );
+
+        assert!(reset.is_none());
+        assert!(!parked_crawls.contains_key(&info_hash));
+        assert_eq!(metrics.routine_refresh.low_quality_resets, 1);
+    }
+
+    #[test]
+    fn demand_planner_lookup_start_failed_releases_scheduler_entry_and_refunds_slot() {
+        let now = Instant::now();
+        let info_hash = hash_index(70);
+        let mut planner = DemandPlannerModel::new(now);
+        planner.update(DemandPlannerAction::DemandRegistered {
+            info_hash,
+            demand: DhtDemandState {
+                awaiting_metadata: false,
+                connected_peers: 0,
+            },
+            now,
+        });
+
+        let planned = planner.update(DemandPlannerAction::PlanDue {
+            now,
+            runtime_available: true,
+        });
+        assert!(planned.effects.iter().any(|effect| matches!(
+            effect,
+            DemandPlannerEffect::StartLookup(start)
+                if start.candidate.info_hash == info_hash
+        )));
+        assert!(
+            planner
+                .scheduler
+                .entry_snapshot(info_hash)
+                .expect("demand entry")
+                .in_progress
+        );
+
+        planner.update(DemandPlannerAction::LookupStartFailed {
+            info_hash,
+            slice_class: DemandSliceClass::NoConnectedPeers,
+            now,
+        });
+        let snapshot = planner
+            .scheduler
+            .entry_snapshot(info_hash)
+            .expect("demand entry");
+        assert!(!snapshot.in_progress);
+        assert!(snapshot.next_eligible_at > now);
+
+        let later = now + DHT_NO_CONNECTED_PEERS_BASE_INTERVAL;
+        let retry = planner.update(DemandPlannerAction::PlanDue {
+            now: later,
+            runtime_available: true,
+        });
+        assert!(retry.effects.iter().any(|effect| matches!(
+            effect,
+            DemandPlannerEffect::StartLookup(start)
+                if start.candidate.info_hash == info_hash
+        )));
+    }
+
+    #[test]
+    fn demand_planner_duplicate_subscribers_keep_lookup_until_final_unsubscribe() {
+        let now = Instant::now();
+        let info_hash = hash_index(71);
+        let mut planner = DemandPlannerModel::new(now);
+        let demand = DhtDemandState {
+            awaiting_metadata: false,
+            connected_peers: 0,
+        };
+        planner.update(DemandPlannerAction::DemandRegistered {
+            info_hash,
+            demand,
+            now,
+        });
+        planner.update(DemandPlannerAction::DemandRegistered {
+            info_hash,
+            demand,
+            now,
+        });
+        assert_eq!(
+            planner
+                .scheduler
+                .entry_snapshot(info_hash)
+                .expect("demand entry")
+                .subscriber_count,
+            2
+        );
+        assert!(planner.scheduler.mark_in_progress(info_hash));
+        planner.active.insert(
+            info_hash,
+            active_lookup(LookupId(71), DemandSliceClass::NoConnectedPeers),
+        );
+
+        let first = planner.update(DemandPlannerAction::DemandSubscriberRemoved { info_hash });
+        assert!(first.effects.is_empty());
+        assert!(planner.active.contains_key(&info_hash));
+        assert_eq!(
+            planner
+                .scheduler
+                .entry_snapshot(info_hash)
+                .expect("demand entry")
+                .subscriber_count,
+            1
+        );
+
+        let final_removal =
+            planner.update(DemandPlannerAction::DemandSubscriberRemoved { info_hash });
+        assert!(planner.scheduler.entry_snapshot(info_hash).is_none());
+        assert!(!planner.active.contains_key(&info_hash));
+        assert!(final_removal.effects.iter().any(|effect| matches!(
+            effect,
+            DemandPlannerEffect::ParkActiveLookup(park)
+                if park.info_hash == info_hash
+                    && park.slice_class == DemandSliceClass::NoConnectedPeers
+        )));
+    }
+
+    #[test]
+    fn demand_planner_drain_runtime_readiness_defaults_ready_without_runtime() {
+        let now = Instant::now();
+        let info_hash = hash_index(72);
+        let mut planner = DemandPlannerModel::new(now);
+        insert_synthetic_drain(
+            &mut planner.draining_demands,
+            info_hash,
+            72,
+            LookupId(72),
+            DemandSliceClass::NoConnectedPeers,
+            2,
+            now,
+        );
+
+        assert_eq!(
+            planner.drain_runtime_readiness(None),
+            HashMap::from([(info_hash, true)])
+        );
+    }
+
+    #[test]
+    fn literal_bootstrap_summary_counts_literal_socket_addresses() {
+        let summary = literal_bootstrap_summary(&[
+            "127.0.0.1:6881".to_string(),
+            "[::1]:6881".to_string(),
+            "node.example.invalid:6881".to_string(),
+        ]);
+
+        assert_eq!(summary.total, 3);
+        assert_eq!(summary.ipv4, 1);
+        assert_eq!(summary.ipv6, 1);
+    }
+
+    #[test]
+    fn build_status_without_runtime_reports_disabled_state_and_bootstrap() {
+        let bootstrap = BootstrapSummary {
+            total: 3,
+            ipv4: 2,
+            ipv6: 1,
+        };
+        let status = build_status(
+            None,
+            DhtBackendKind::Disabled,
+            DhtBackendKind::InternalPrototype,
+            Some("test warning".to_string()),
+            7,
+            bootstrap,
+        );
+
+        assert_eq!(status.generation, 7);
+        assert_eq!(status.warning.as_deref(), Some("test warning"));
+        assert_eq!(status.health.backend, DhtBackendKind::Disabled);
+        assert_eq!(
+            status.health.preferred_backend,
+            Some(DhtBackendKind::InternalPrototype)
+        );
+        assert!(!status.health.enabled);
+        assert_eq!(status.health.exported_bootstrap_nodes, 3);
+        assert_eq!(status.health.ipv4_bootstrap_nodes, 2);
+        assert_eq!(status.health.ipv6_bootstrap_nodes, 1);
+        assert_eq!(status.health.bound_family_count, 0);
+        assert_eq!(status.health.inflight_lookups, 0);
+    }
+
+    #[test]
+    fn build_wave_telemetry_without_runtime_preserves_recent_unique_count() {
+        let telemetry = build_wave_telemetry(None, 12);
+
+        assert_eq!(telemetry.unique_peers_found_last_10s, 12);
+        assert_eq!(telemetry.active_lookups, 0);
+        assert_eq!(telemetry.active_user_lookups, 0);
+        assert_eq!(telemetry.inflight_ipv4_queries, 0);
+        assert_eq!(telemetry.inflight_ipv6_queries, 0);
+    }
+
+    #[tokio::test]
+    async fn start_get_peers_lookup_without_runtime_returns_empty_lookup() {
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        let mut planner = DemandPlannerModel::new(Instant::now());
+
+        let started = start_get_peers_lookup(
+            None,
+            &command_tx,
+            &mut planner,
+            None,
+            hash_index(73),
+            DemandSliceClass::RoutineRefresh,
+            false,
+        )
+        .await
+        .expect("empty lookup should succeed");
+
+        assert!(started
+            .lookup_ids
+            .lock()
+            .expect("test lookup ids")
+            .is_empty());
+        assert!(!started.accepting_families.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn disabled_service_command_loop_delivers_peers_and_honors_unregister() {
+        let config = disabled_service_config();
+        let (status_tx, _status_rx) = watch::channel(initial_disabled_status(&config));
+        let (wave_tx, _wave_rx) = watch::channel(DhtWaveTelemetry::default());
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let task = tokio::spawn(run_service(
+            config,
+            NodeId::from([1u8; NodeId::LEN]),
+            None,
+            None,
+            status_tx,
+            wave_tx,
+            command_tx.clone(),
+            command_rx,
+            shutdown_rx,
+        ));
+
+        let info_hash = hash_index(74);
+        let (subscriber_one_tx, mut subscriber_one_rx) = mpsc::unbounded_channel();
+        let (subscriber_two_tx, mut subscriber_two_rx) = mpsc::unbounded_channel();
+        let (response_one_tx, response_one_rx) = oneshot::channel();
+        let (response_two_tx, response_two_rx) = oneshot::channel();
+
+        send_dht_command(
+            &command_tx,
+            DhtCommand::RegisterDemand {
+                info_hash,
+                demand: DhtDemandState {
+                    awaiting_metadata: false,
+                    connected_peers: 0,
+                },
+                subscriber_tx: subscriber_one_tx,
+                response_tx: response_one_tx,
+            },
+        )
+        .expect("register subscriber one");
+        send_dht_command(
+            &command_tx,
+            DhtCommand::RegisterDemand {
+                info_hash,
+                demand: DhtDemandState {
+                    awaiting_metadata: false,
+                    connected_peers: 0,
+                },
+                subscriber_tx: subscriber_two_tx,
+                response_tx: response_two_tx,
+            },
+        )
+        .expect("register subscriber two");
+        let subscriber_one_id = response_one_rx
+            .await
+            .expect("subscriber one response")
+            .unwrap();
+        let subscriber_two_id = response_two_rx
+            .await
+            .expect("subscriber two response")
+            .unwrap();
+        assert_ne!(subscriber_one_id, subscriber_two_id);
+
+        let first_batch = vec![peer("127.0.0.21:6881"), peer("127.0.0.22:6881")];
+        send_dht_command(
+            &command_tx,
+            DhtCommand::DemandPeers {
+                info_hash,
+                peers: first_batch.clone(),
+            },
+        )
+        .expect("send peers");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), subscriber_one_rx.recv())
+                .await
+                .expect("subscriber one peers"),
+            Some(first_batch.clone())
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), subscriber_two_rx.recv())
+                .await
+                .expect("subscriber two peers"),
+            Some(first_batch)
+        );
+
+        send_dht_command(
+            &command_tx,
+            DhtCommand::UnregisterDemand {
+                info_hash,
+                subscriber_id: subscriber_one_id,
+            },
+        )
+        .expect("unregister subscriber one");
+        let second_batch = vec![peer("127.0.0.23:6881")];
+        send_dht_command(
+            &command_tx,
+            DhtCommand::DemandPeers {
+                info_hash,
+                peers: second_batch.clone(),
+            },
+        )
+        .expect("send peers after unregister");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), subscriber_two_rx.recv())
+                .await
+                .expect("subscriber two second peers"),
+            Some(second_batch)
+        );
+        let stale_subscriber_result =
+            tokio::time::timeout(Duration::from_millis(50), subscriber_one_rx.recv()).await;
+        assert_ne!(
+            stale_subscriber_result.ok().flatten(),
+            Some(vec![peer("127.0.0.23:6881")])
+        );
+
+        let _ = shutdown_tx.send(());
+        task.await.expect("service task join");
+    }
+
+    #[tokio::test]
+    async fn disabled_service_command_loop_returns_empty_lookup_and_failed_announce() {
+        let config = disabled_service_config();
+        let (status_tx, _status_rx) = watch::channel(initial_disabled_status(&config));
+        let (wave_tx, _wave_rx) = watch::channel(DhtWaveTelemetry::default());
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let task = tokio::spawn(run_service(
+            config,
+            NodeId::from([2u8; NodeId::LEN]),
+            None,
+            None,
+            status_tx,
+            wave_tx,
+            command_tx.clone(),
+            command_rx,
+            shutdown_rx,
+        ));
+
+        let (lookup_response_tx, lookup_response_rx) = oneshot::channel();
+        send_dht_command(
+            &command_tx,
+            DhtCommand::StartGetPeers {
+                info_hash: hash_index(75),
+                response_tx: lookup_response_tx,
+            },
+        )
+        .expect("start get peers");
+        let started = lookup_response_rx
+            .await
+            .expect("lookup response")
+            .expect("empty lookup result");
+        assert!(started
+            .lookup_ids
+            .lock()
+            .expect("test lookup ids")
+            .is_empty());
+        assert!(!started.accepting_families.load(Ordering::Acquire));
+
+        let (announce_response_tx, announce_response_rx) = oneshot::channel();
+        send_dht_command(
+            &command_tx,
+            DhtCommand::AnnouncePeer {
+                info_hash: hash_index(75),
+                port: Some(6881),
+                response_tx: announce_response_tx,
+            },
+        )
+        .expect("announce peer");
+        assert!(!announce_response_rx.await.expect("announce response"));
+
+        let _ = shutdown_tx.send(());
+        task.await.expect("service task join");
+    }
+
+    #[tokio::test]
+    async fn disabled_service_reconfigure_failure_publishes_warning_without_generation_bump() {
+        let config = disabled_service_config();
+        let (status_tx, mut status_rx) = watch::channel(initial_disabled_status(&config));
+        let (wave_tx, _wave_rx) = watch::channel(DhtWaveTelemetry::default());
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let task = tokio::spawn(run_service(
+            config,
+            NodeId::from([3u8; NodeId::LEN]),
+            None,
+            None,
+            status_tx,
+            wave_tx,
+            command_tx.clone(),
+            command_rx,
+            shutdown_rx,
+        ));
+
+        send_dht_command(
+            &command_tx,
+            DhtCommand::Reconfigure(DhtServiceConfig {
+                port: 0,
+                bootstrap_nodes: Vec::new(),
+                preferred_backend: DhtBackendKind::InternalPrototype,
+                force_internal_failure: true,
+            }),
+        )
+        .expect("send reconfigure");
+
+        tokio::time::timeout(Duration::from_secs(1), status_rx.changed())
+            .await
+            .expect("status update")
+            .expect("status channel open");
+        let status = status_rx.borrow().clone();
+        assert_eq!(status.generation, 0);
+        assert_eq!(status.health.backend, DhtBackendKind::Disabled);
+        assert_eq!(
+            status.health.preferred_backend,
+            Some(DhtBackendKind::Disabled)
+        );
+        assert_eq!(
+            status.warning.as_deref(),
+            Some("forced internal backend failure")
+        );
+
+        let _ = shutdown_tx.send(());
+        task.await.expect("service task join");
+    }
+
+    #[tokio::test]
+    async fn runtime_backed_park_lookup_moves_active_state_to_parked_crawl() {
+        let mut active_runtime = local_ipv4_active_runtime().await;
+        let info_hash = hash_index(76);
+        let (lookup_id, peer_rx) = active_runtime
+            .runtime
+            .start_get_peers(AddressFamily::Ipv4, info_hash)
+            .await
+            .expect("start runtime lookup");
+        let _keep_receiver_open = peer_rx;
+        assert_eq!(active_runtime.runtime.active_user_lookup_count(), 1);
+
+        let lookup_ids = Arc::new(StdMutex::new(vec![lookup_id]));
+        let mut parked_crawls = HashMap::new();
+        let parked_outcome = park_lookup_ids(
+            Some(&mut active_runtime),
+            &mut parked_crawls,
+            info_hash,
+            DemandSliceClass::NoConnectedPeers,
+            Some(DemandSliceStopReason::WallTime),
+            1,
+            lookup_ids.clone(),
+        );
+
+        assert_eq!(
+            parked_outcome,
+            Some(DemandParkedSliceOutcome::HealthyLowYield)
+        );
+        assert!(lookup_ids.lock().expect("test lookup ids").is_empty());
+        assert_eq!(active_runtime.runtime.active_lookup_count(), 0);
+        let parked = take_parked_family_state(
+            &mut parked_crawls,
+            None,
+            info_hash,
+            AddressFamily::Ipv4,
+            DemandSliceClass::NoConnectedPeers,
+        )
+        .expect("parked runtime state");
+        assert_eq!(parked.family(), AddressFamily::Ipv4);
+        assert!(!parked_crawls.contains_key(&info_hash));
+    }
+
+    #[tokio::test]
+    async fn runtime_backed_drain_lookup_pauses_and_force_finalize_finishes_state() {
+        let mut active_runtime = local_ipv4_active_runtime().await;
+        let info_hash = hash_index(77);
+        let (lookup_id, peer_rx) = active_runtime
+            .runtime
+            .start_get_peers(AddressFamily::Ipv4, info_hash)
+            .await
+            .expect("start runtime lookup");
+        let _keep_receiver_open = peer_rx;
+
+        let mut planner = DemandPlannerModel::new(Instant::now());
+        planner.update(DemandPlannerAction::DemandRegistered {
+            info_hash,
+            demand: DhtDemandState {
+                awaiting_metadata: false,
+                connected_peers: 0,
+            },
+            now: Instant::now(),
+        });
+        assert!(planner.scheduler.mark_in_progress(info_hash));
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        let lookup_ids = Arc::new(StdMutex::new(vec![lookup_id]));
+        let parked_outcome = planner.drain_lookup_ids(
+            Some(&mut active_runtime),
+            &command_tx,
+            info_hash,
+            DemandSliceClass::NoConnectedPeers,
+            DemandSliceStopReason::WallTime,
+            3,
+            synthetic_peers(77, 3),
+            lookup_ids,
+        );
+
+        assert_eq!(parked_outcome, Some(DemandParkedSliceOutcome::UsefulYield));
+        assert_eq!(active_runtime.runtime.active_lookup_count(), 0);
+        assert_eq!(active_runtime.runtime.draining_lookup_count(), 1);
+        assert!(planner.draining_demands.contains_key(&info_hash));
+
+        let mut slice_metrics = DemandSliceMetrics::default();
+        let finalized = finish_drained_demand_lookup(
+            Some(&mut active_runtime),
+            &mut planner,
+            &command_tx,
+            &mut slice_metrics,
+            info_hash,
+            true,
+        );
+
+        assert!(finalized);
+        assert_eq!(active_runtime.runtime.draining_lookup_count(), 0);
+        assert!(!planner.draining_demands.contains_key(&info_hash));
+        assert!(
+            !planner
+                .scheduler
+                .entry_snapshot(info_hash)
+                .expect("demand entry")
+                .in_progress
+        );
+        assert!(planner.parked_crawls.contains_key(&info_hash));
+        assert_eq!(slice_metrics.no_connected_peers.wall_time_stops, 1);
+        assert_eq!(slice_metrics.no_connected_peers.unique_peers_yielded, 3);
+    }
+
+    #[tokio::test]
+    async fn runtime_backed_cancel_draining_effect_removes_runtime_lookup() {
+        let mut active_runtime = local_ipv4_active_runtime().await;
+        let info_hash = hash_index(78);
+        let (lookup_id, peer_rx) = active_runtime
+            .runtime
+            .start_get_peers(AddressFamily::Ipv4, info_hash)
+            .await
+            .expect("start runtime lookup");
+        let _keep_receiver_open = peer_rx;
+
+        let mut planner = DemandPlannerModel::new(Instant::now());
+        planner.update(DemandPlannerAction::DemandRegistered {
+            info_hash,
+            demand: DhtDemandState {
+                awaiting_metadata: false,
+                connected_peers: 0,
+            },
+            now: Instant::now(),
+        });
+        assert!(planner.scheduler.mark_in_progress(info_hash));
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        let parked_outcome = planner.drain_lookup_ids(
+            Some(&mut active_runtime),
+            &command_tx,
+            info_hash,
+            DemandSliceClass::NoConnectedPeers,
+            DemandSliceStopReason::WallTime,
+            3,
+            synthetic_peers(78, 3),
+            Arc::new(StdMutex::new(vec![lookup_id])),
+        );
+        assert_eq!(parked_outcome, Some(DemandParkedSliceOutcome::UsefulYield));
+        assert_eq!(active_runtime.runtime.draining_lookup_count(), 1);
+
+        let removal = planner.update(DemandPlannerAction::DemandSubscriberRemoved { info_hash });
+        let mut slice_metrics = DemandSliceMetrics::default();
+        apply_demand_planner_effects(
+            Some(&mut active_runtime),
+            &mut planner,
+            &command_tx,
+            &mut slice_metrics,
+            removal.effects,
+        );
+
+        assert_eq!(active_runtime.runtime.draining_lookup_count(), 0);
+        assert_eq!(active_runtime.runtime.active_lookup_count(), 0);
+        assert!(planner.scheduler.entry_snapshot(info_hash).is_none());
+        assert!(!planner.draining_demands.contains_key(&info_hash));
+    }
+
+    #[tokio::test]
+    async fn attach_lookup_family_ignores_closed_acceptance_and_unbound_family() {
+        let mut active_runtime = local_ipv4_active_runtime().await;
+        let mut planner = DemandPlannerModel::new(Instant::now());
+        let mut metrics = DemandSliceMetrics::default();
+        let (merged_tx, _merged_rx) = mpsc::unbounded_channel();
+        let lookup_ids = Arc::new(StdMutex::new(Vec::new()));
+        let first_batch_seen = Arc::new(AtomicBool::new(false));
+
+        attach_lookup_family(
+            Some(&mut active_runtime),
+            &mut planner,
+            Some(&mut metrics),
+            hash_index(79),
+            AddressFamily::Ipv4,
+            DemandSliceClass::NoConnectedPeers,
+            merged_tx.clone(),
+            lookup_ids.clone(),
+            first_batch_seen.clone(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("closed accepting flag is not an error");
+        assert!(lookup_ids.lock().expect("test lookup ids").is_empty());
+        assert_eq!(active_runtime.runtime.active_lookup_count(), 0);
+
+        attach_lookup_family(
+            Some(&mut active_runtime),
+            &mut planner,
+            Some(&mut metrics),
+            hash_index(79),
+            AddressFamily::Ipv6,
+            DemandSliceClass::NoConnectedPeers,
+            merged_tx,
+            lookup_ids.clone(),
+            first_batch_seen,
+            Arc::new(AtomicBool::new(true)),
+        )
+        .await
+        .expect("unbound family is not an error");
+        assert!(lookup_ids.lock().expect("test lookup ids").is_empty());
+        assert_eq!(active_runtime.runtime.active_lookup_count(), 0);
+        assert_eq!(metrics.no_connected_peers.fresh_starts, 0);
+        assert_eq!(metrics.no_connected_peers.resumed_starts, 0);
+    }
+
+    #[tokio::test]
+    async fn attach_lookup_family_records_fresh_and_resumed_state() {
+        let mut active_runtime = local_ipv4_active_runtime().await;
+        let mut planner = DemandPlannerModel::new(Instant::now());
+        let mut metrics = DemandSliceMetrics::default();
+        let (merged_tx, _merged_rx) = mpsc::unbounded_channel();
+        let lookup_ids = Arc::new(StdMutex::new(Vec::new()));
+        let first_batch_seen = Arc::new(AtomicBool::new(false));
+
+        attach_lookup_family(
+            Some(&mut active_runtime),
+            &mut planner,
+            Some(&mut metrics),
+            hash_index(80),
+            AddressFamily::Ipv4,
+            DemandSliceClass::NoConnectedPeers,
+            merged_tx.clone(),
+            lookup_ids.clone(),
+            first_batch_seen.clone(),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .await
+        .expect("fresh attach");
+        assert_eq!(lookup_ids.lock().expect("test lookup ids").len(), 1);
+        assert_eq!(metrics.no_connected_peers.fresh_starts, 1);
+        assert_eq!(metrics.no_connected_peers.resumed_starts, 0);
+
+        let parked_hash = hash_index(81);
+        store_parked_lookup_states(
+            &mut planner.parked_crawls,
+            parked_hash,
+            DemandSliceClass::NoConnectedPeers,
+            Some(DemandSliceStopReason::WallTime),
+            1,
+            vec![lookup_state_for_family(
+                LookupId(81),
+                AddressFamily::Ipv4,
+                81,
+                Instant::now(),
+            )],
+        );
+        let resumed_lookup_ids = Arc::new(StdMutex::new(Vec::new()));
+        attach_lookup_family(
+            Some(&mut active_runtime),
+            &mut planner,
+            Some(&mut metrics),
+            parked_hash,
+            AddressFamily::Ipv4,
+            DemandSliceClass::NoConnectedPeers,
+            merged_tx,
+            resumed_lookup_ids.clone(),
+            first_batch_seen,
+            Arc::new(AtomicBool::new(true)),
+        )
+        .await
+        .expect("resumed attach");
+
+        assert_eq!(resumed_lookup_ids.lock().expect("test lookup ids").len(), 1);
+        assert_eq!(metrics.no_connected_peers.fresh_starts, 1);
+        assert_eq!(metrics.no_connected_peers.resumed_starts, 1);
+        assert!(!planner.parked_crawls.contains_key(&parked_hash));
+    }
+
+    #[tokio::test]
+    async fn runtime_backed_drain_rejection_parks_lookup_when_no_queries_are_inflight() {
+        let mut active_runtime = local_ipv4_active_runtime_without_bootstrap().await;
+        let info_hash = hash_index(82);
+        let (lookup_id, peer_rx) = active_runtime
+            .runtime
+            .start_get_peers(AddressFamily::Ipv4, info_hash)
+            .await
+            .expect("start runtime lookup");
+        let _keep_receiver_open = peer_rx;
+        assert_eq!(
+            active_runtime
+                .runtime
+                .lookup_quality_snapshot(lookup_id)
+                .expect("lookup quality")
+                .inflight_len,
+            0
+        );
+
+        let mut planner = DemandPlannerModel::new(Instant::now());
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        let parked_outcome = planner.drain_lookup_ids(
+            Some(&mut active_runtime),
+            &command_tx,
+            info_hash,
+            DemandSliceClass::NoConnectedPeers,
+            DemandSliceStopReason::WallTime,
+            1,
+            synthetic_peers(82, 1),
+            Arc::new(StdMutex::new(vec![lookup_id])),
+        );
+
+        assert!(parked_outcome.is_none());
+        assert!(planner.draining_demands.is_empty());
+        assert_eq!(active_runtime.runtime.active_lookup_count(), 0);
+        assert!(planner.parked_crawls.contains_key(&info_hash));
+    }
+
+    #[tokio::test]
+    async fn runtime_backed_drain_rejection_parks_lookup_when_score_is_not_productive() {
+        let mut active_runtime = local_ipv4_active_runtime().await;
+        let info_hash = hash_index(83);
+        let (lookup_id, peer_rx) = active_runtime
+            .runtime
+            .start_get_peers(AddressFamily::Ipv4, info_hash)
+            .await
+            .expect("start runtime lookup");
+        let _keep_receiver_open = peer_rx;
+
+        let mut planner = DemandPlannerModel::new(Instant::now());
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        let parked_outcome = planner.drain_lookup_ids(
+            Some(&mut active_runtime),
+            &command_tx,
+            info_hash,
+            DemandSliceClass::NoConnectedPeers,
+            DemandSliceStopReason::IdleTimeout,
+            0,
+            HashSet::new(),
+            Arc::new(StdMutex::new(vec![lookup_id])),
+        );
+
+        assert!(parked_outcome.is_none());
+        assert!(planner.draining_demands.is_empty());
+        assert_eq!(active_runtime.runtime.active_lookup_count(), 0);
+        assert!(planner.parked_crawls.contains_key(&info_hash));
+    }
+
+    #[tokio::test]
+    async fn runtime_backed_drain_replaces_previous_drain_for_same_demand() {
+        let mut active_runtime = local_ipv4_active_runtime().await;
+        let info_hash = hash_index(84);
+        let (first_lookup_id, first_rx) = active_runtime
+            .runtime
+            .start_get_peers(AddressFamily::Ipv4, info_hash)
+            .await
+            .expect("start first runtime lookup");
+        let _keep_first_receiver_open = first_rx;
+
+        let mut planner = DemandPlannerModel::new(Instant::now());
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        assert_eq!(
+            planner.drain_lookup_ids(
+                Some(&mut active_runtime),
+                &command_tx,
+                info_hash,
+                DemandSliceClass::NoConnectedPeers,
+                DemandSliceStopReason::WallTime,
+                3,
+                synthetic_peers(84, 3),
+                Arc::new(StdMutex::new(vec![first_lookup_id])),
+            ),
+            Some(DemandParkedSliceOutcome::UsefulYield)
+        );
+        assert_eq!(active_runtime.runtime.draining_lookup_count(), 1);
+
+        let (second_lookup_id, second_rx) = active_runtime
+            .runtime
+            .start_get_peers(AddressFamily::Ipv4, info_hash)
+            .await
+            .expect("start second runtime lookup");
+        let _keep_second_receiver_open = second_rx;
+        assert_eq!(
+            planner.drain_lookup_ids(
+                Some(&mut active_runtime),
+                &command_tx,
+                info_hash,
+                DemandSliceClass::NoConnectedPeers,
+                DemandSliceStopReason::WallTime,
+                3,
+                synthetic_peers(85, 3),
+                Arc::new(StdMutex::new(vec![second_lookup_id])),
+            ),
+            Some(DemandParkedSliceOutcome::UsefulYield)
+        );
+
+        assert_eq!(active_runtime.runtime.draining_lookup_count(), 1);
+        assert!(active_runtime
+            .runtime
+            .lookup_quality_snapshot(first_lookup_id)
+            .is_none());
+        assert!(planner
+            .draining_demands
+            .get(&info_hash)
+            .expect("replacement drain")
+            .lookup_ids
+            .contains(&second_lookup_id));
+    }
+
+    #[tokio::test]
+    async fn finalize_drained_lookup_not_ready_keeps_drain_when_not_forced() {
+        let mut active_runtime = local_ipv4_active_runtime().await;
+        let info_hash = hash_index(86);
+        let (lookup_id, peer_rx) = active_runtime
+            .runtime
+            .start_get_peers(AddressFamily::Ipv4, info_hash)
+            .await
+            .expect("start runtime lookup");
+        let _keep_receiver_open = peer_rx;
+
+        let mut planner = DemandPlannerModel::new(Instant::now());
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        assert_eq!(
+            planner.drain_lookup_ids(
+                Some(&mut active_runtime),
+                &command_tx,
+                info_hash,
+                DemandSliceClass::NoConnectedPeers,
+                DemandSliceStopReason::WallTime,
+                3,
+                synthetic_peers(86, 3),
+                Arc::new(StdMutex::new(vec![lookup_id])),
+            ),
+            Some(DemandParkedSliceOutcome::UsefulYield)
+        );
+
+        let outcome = planner.finalize_drained_lookup(
+            Some(&mut active_runtime),
+            &command_tx,
+            info_hash,
+            false,
+        );
+
+        assert!(outcome.is_none());
+        assert!(planner.draining_demands.contains_key(&info_hash));
+        assert_eq!(active_runtime.runtime.draining_lookup_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn managed_lookup_receiver_drop_sends_cancel_for_non_empty_lookup_ids() {
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let (_peer_tx, peer_rx) = mpsc::unbounded_channel();
+        let lookup_ids_arc = Arc::new(StdMutex::new(vec![LookupId(90), LookupId(91)]));
+
+        drop(ManagedLookupReceiver::new(
+            peer_rx,
+            command_tx,
+            lookup_ids_arc.clone(),
+        ));
+
+        let command = tokio::time::timeout(Duration::from_secs(1), command_rx.recv())
+            .await
+            .expect("cancel command")
+            .expect("command channel open");
+        let LoopEvent::Command(DhtCommand::CancelLookups { lookup_ids }) =
+            command_event(Some(command))
+        else {
+            panic!("expected cancel command");
+        };
+        assert_eq!(lookup_ids, vec![LookupId(90), LookupId(91)]);
+        assert!(lookup_ids_arc.lock().expect("test lookup ids").is_empty());
+    }
+
+    #[tokio::test]
+    async fn managed_lookup_receiver_drop_ignores_empty_lookup_ids() {
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let (_peer_tx, peer_rx) = mpsc::unbounded_channel();
+
+        drop(ManagedLookupReceiver::new(
+            peer_rx,
+            command_tx,
+            Arc::new(StdMutex::new(Vec::new())),
+        ));
+
+        let maybe_command = tokio::time::timeout(Duration::from_millis(50), command_rx.recv())
+            .await
+            .ok()
+            .flatten();
+        assert!(maybe_command.is_none());
+    }
+
+    #[tokio::test]
+    async fn dht_demand_subscription_drop_sends_unregister_for_service_subscription() {
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let (_subscriber_tx, receiver) = mpsc::unbounded_channel();
+        let info_hash = hash_index(87);
+
+        drop(DhtDemandSubscription {
+            receiver,
+            inner: DhtDemandSubscriptionInner::Service {
+                command_tx,
+                info_hash,
+                subscriber_id: 42,
+            },
+        });
+
+        let command = tokio::time::timeout(Duration::from_secs(1), command_rx.recv())
+            .await
+            .expect("unregister command")
+            .expect("command channel open");
+        let LoopEvent::Command(DhtCommand::UnregisterDemand {
+            info_hash: command_hash,
+            subscriber_id,
+        }) = command_event(Some(command))
+        else {
+            panic!("expected unregister command");
+        };
+        assert_eq!(command_hash, info_hash);
+        assert_eq!(subscriber_id, 42);
+    }
+
+    #[tokio::test]
+    async fn summarize_lookup_receiver_counts_unique_peer_families() {
+        let (peer_tx, peer_rx) = mpsc::unbounded_channel();
+        peer_tx
+            .send(vec![peer("127.0.0.30:6881"), peer("[::1]:6881")])
+            .expect("first batch");
+        peer_tx
+            .send(vec![peer("127.0.0.30:6881"), peer("127.0.0.31:6881")])
+            .expect("second batch");
+        drop(peer_tx);
+
+        let mut receiver = ManagedLookupReceiver {
+            receiver: peer_rx,
+            cancel_guard: None,
+        };
+        let summary = summarize_lookup_receiver(
+            &mut receiver,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("lookup summary");
+
+        assert_eq!(summary.batch_count, 2);
+        assert_eq!(summary.total_peers, 4);
+        assert_eq!(summary.unique_peers, 3);
+        assert_eq!(summary.unique_ipv4_peers, 2);
+        assert_eq!(summary.unique_ipv6_peers, 1);
+        assert!(summary.first_batch_ms.is_some());
+        assert!(summary.first_ipv4_batch_ms.is_some());
+        assert!(summary.first_ipv6_batch_ms.is_some());
     }
 
     #[test]
@@ -5740,5 +7834,668 @@ mod tests {
             candidate_selection_reason(candidate, &parked_crawls, &planner_state, now),
             DemandSelectionReason::OverdueScarce
         );
+    }
+
+    #[test]
+    fn demand_planner_runtime_reset_action_clears_runtime_state_and_preserves_demands() {
+        let now = Instant::now();
+        let info_hash = hash_index(41);
+        let mut planner = DemandPlannerModel::new(now);
+        planner.scheduler.register(
+            info_hash,
+            DhtDemandState {
+                awaiting_metadata: false,
+                connected_peers: 0,
+            },
+            now,
+        );
+        assert!(planner.scheduler.mark_in_progress(info_hash));
+        planner.active.insert(
+            info_hash,
+            active_lookup(LookupId(6), DemandSliceClass::NoConnectedPeers),
+        );
+        insert_synthetic_drain(
+            &mut planner.draining_demands,
+            info_hash,
+            41,
+            LookupId(6),
+            DemandSliceClass::NoConnectedPeers,
+            1,
+            now,
+        );
+        planner.state.entry(info_hash).or_default().note_start(now);
+        planner.parked_crawls.insert(
+            info_hash,
+            DemandCrawlState::new(now, DemandSliceClass::NoConnectedPeers),
+        );
+
+        let reset_at = now + Duration::from_secs(1);
+        let reduction = planner.update(DemandPlannerAction::RuntimeReset { now: reset_at });
+
+        assert!(reduction.effects.is_empty());
+        assert!(planner.active.is_empty());
+        assert!(planner.draining_demands.is_empty());
+        assert!(planner.parked_crawls.is_empty());
+        assert!(planner.state.is_empty());
+        let snapshot = planner
+            .scheduler
+            .entry_snapshot(info_hash)
+            .expect("demand entry");
+        assert!(!snapshot.in_progress);
+        assert_eq!(snapshot.next_eligible_at, now);
+    }
+
+    #[test]
+    fn demand_planner_lookup_finished_action_updates_state_and_emits_metrics_effect() {
+        let now = Instant::now();
+        let info_hash = hash_index(42);
+        let mut planner = DemandPlannerModel::new(now);
+        planner.scheduler.register(
+            info_hash,
+            DhtDemandState {
+                awaiting_metadata: false,
+                connected_peers: 0,
+            },
+            now,
+        );
+        assert!(planner.scheduler.mark_in_progress(info_hash));
+
+        planner.active = HashMap::from([(
+            info_hash,
+            active_lookup(LookupId(7), DemandSliceClass::NoConnectedPeers),
+        )]);
+
+        let reduction = planner.update(DemandPlannerAction::LookupFinished {
+            info_hash,
+            slice_class: DemandSliceClass::NoConnectedPeers,
+            total_peers: 11,
+            unique_peers: 5,
+            now,
+        });
+
+        assert!(planner.active.is_empty());
+        let snapshot = planner
+            .scheduler
+            .entry_snapshot(info_hash)
+            .expect("demand entry");
+        assert!(!snapshot.in_progress);
+        assert!(snapshot.next_eligible_at > now);
+        let state = planner.state.get(&info_hash).expect("planner state");
+        assert_eq!(state.last_finished_at, Some(now));
+        assert_eq!(state.last_useful_yield_at, Some(now));
+        assert_eq!(state.last_unique_peers, 5);
+        assert_eq!(reduction.effects.len(), 1);
+        let DemandPlannerEffect::LookupFinished(effect) = &reduction.effects[0] else {
+            panic!("expected lookup finished effect");
+        };
+        assert_eq!(effect.info_hash, info_hash);
+        assert_eq!(effect.slice_class, DemandSliceClass::NoConnectedPeers);
+        assert_eq!(effect.total_peers, 11);
+        assert_eq!(effect.unique_peers, 5);
+        assert!(effect.previous.expect("previous snapshot").in_progress);
+        assert!(!effect.current.expect("current snapshot").in_progress);
+    }
+
+    #[test]
+    fn demand_planner_update_action_requests_drain_finalize_on_class_mismatch() {
+        let now = Instant::now();
+        let info_hash = hash_index(46);
+        let mut planner = DemandPlannerModel::new(now);
+        planner.scheduler.register(
+            info_hash,
+            DhtDemandState {
+                awaiting_metadata: false,
+                connected_peers: 0,
+            },
+            now,
+        );
+        assert!(planner.scheduler.mark_in_progress(info_hash));
+        insert_synthetic_drain(
+            &mut planner.draining_demands,
+            info_hash,
+            46,
+            LookupId(10),
+            DemandSliceClass::NoConnectedPeers,
+            1,
+            now,
+        );
+
+        let reduction = planner.update(DemandPlannerAction::DemandUpdated {
+            info_hash,
+            demand: DhtDemandState {
+                awaiting_metadata: false,
+                connected_peers: 4,
+            },
+            now,
+        });
+
+        assert_eq!(
+            planner.scheduler.demand_state(info_hash),
+            Some(DhtDemandState {
+                awaiting_metadata: false,
+                connected_peers: 4,
+            })
+        );
+        assert!(planner.draining_demands.contains_key(&info_hash));
+        assert!(reduction.effects.iter().any(|effect| matches!(
+            effect,
+            DemandPlannerEffect::FinalizeDrainingLookup(finalize)
+                if finalize.info_hash == info_hash && finalize.force
+        )));
+    }
+
+    #[test]
+    fn demand_planner_subscriber_removed_action_detaches_lookup_work_on_final_subscriber() {
+        let now = Instant::now();
+        let info_hash = hash_index(47);
+        let mut planner = DemandPlannerModel::new(now);
+        planner.scheduler.register(
+            info_hash,
+            DhtDemandState {
+                awaiting_metadata: false,
+                connected_peers: 0,
+            },
+            now,
+        );
+        assert!(planner.scheduler.mark_in_progress(info_hash));
+        planner.active.insert(
+            info_hash,
+            active_lookup(LookupId(11), DemandSliceClass::NoConnectedPeers),
+        );
+
+        let reduction = planner.update(DemandPlannerAction::DemandSubscriberRemoved { info_hash });
+
+        assert!(planner.scheduler.entry_snapshot(info_hash).is_none());
+        assert!(!planner.active.contains_key(&info_hash));
+        let DemandPlannerEffect::ParkActiveLookup(effect) = reduction
+            .effects
+            .into_iter()
+            .find(|effect| matches!(effect, DemandPlannerEffect::ParkActiveLookup(_)))
+            .expect("park active lookup effect")
+        else {
+            panic!("expected park active lookup effect");
+        };
+        assert_eq!(effect.info_hash, info_hash);
+        assert_eq!(effect.slice_class, DemandSliceClass::NoConnectedPeers);
+        assert_eq!(
+            effect
+                .lookup_ids
+                .lock()
+                .expect("test lookup id lock")
+                .as_slice(),
+            &[LookupId(11)]
+        );
+    }
+
+    #[test]
+    fn demand_planner_peers_received_action_records_drain_unique_peers() {
+        let now = Instant::now();
+        let info_hash = hash_index(48);
+        let mut planner = DemandPlannerModel::new(now);
+        insert_synthetic_drain(
+            &mut planner.draining_demands,
+            info_hash,
+            48,
+            LookupId(12),
+            DemandSliceClass::NoConnectedPeers,
+            1,
+            now,
+        );
+        let peers = synthetic_peers(49, 3).into_iter().collect::<Vec<_>>();
+
+        let reduction = planner.update(DemandPlannerAction::PeersReceived {
+            info_hash,
+            peers: &peers,
+        });
+
+        let DemandPlannerEffect::DrainPeersRecorded(recorded) = reduction
+            .effects
+            .into_iter()
+            .next()
+            .expect("drain peers recorded effect")
+        else {
+            panic!("expected drain peers recorded effect");
+        };
+        assert_eq!(recorded.info_hash, info_hash);
+        assert_eq!(recorded.peer_count, 3);
+        assert_eq!(recorded.unique_added, 3);
+        assert_eq!(recorded.initial_unique_peers, 1);
+        assert_eq!(
+            planner
+                .draining_demands
+                .get(&info_hash)
+                .expect("draining demand")
+                .unique_peer_count(),
+            4
+        );
+    }
+
+    #[test]
+    fn demand_planner_drain_tick_action_requests_finalize_for_ready_drains() {
+        let now = Instant::now();
+        let info_hash = hash_index(50);
+        let mut planner = DemandPlannerModel::new(now);
+        insert_synthetic_drain(
+            &mut planner.draining_demands,
+            info_hash,
+            50,
+            LookupId(14),
+            DemandSliceClass::NoConnectedPeers,
+            1,
+            now,
+        );
+
+        let waiting = planner.update(DemandPlannerAction::DrainTick {
+            now,
+            runtime_ready: HashMap::from([(info_hash, false)]),
+        });
+        assert!(waiting.effects.is_empty());
+
+        let ready = planner.update(DemandPlannerAction::DrainTick {
+            now: now + DHT_DEMAND_DRAIN_NO_LATE_YIELD_GRACE,
+            runtime_ready: HashMap::from([(info_hash, false)]),
+        });
+
+        assert!(ready.effects.iter().any(|effect| matches!(
+            effect,
+            DemandPlannerEffect::FinalizeDrainingLookup(finalize)
+                if finalize.info_hash == info_hash && !finalize.force
+        )));
+    }
+
+    #[test]
+    fn demand_planner_lookup_park_rejection_finishes_scheduler_entry() {
+        let now = Instant::now();
+        let info_hash = hash_index(43);
+        let mut planner = DemandPlannerModel::new(now);
+        planner.scheduler.register(
+            info_hash,
+            DhtDemandState {
+                awaiting_metadata: false,
+                connected_peers: 4,
+            },
+            now,
+        );
+        assert!(planner.scheduler.mark_in_progress(info_hash));
+
+        planner.active = HashMap::from([(
+            info_hash,
+            active_lookup(LookupId(8), DemandSliceClass::RoutineRefresh),
+        )]);
+
+        let requested = planner.update(DemandPlannerAction::LookupParkRequested {
+            info_hash,
+            slice_class: DemandSliceClass::RoutineRefresh,
+            stop_reason: DemandSliceStopReason::WallTime,
+            total_peers: 0,
+            unique_peers: HashSet::new(),
+            lookup_ids: active_lookup(LookupId(8), DemandSliceClass::RoutineRefresh).lookup_ids,
+        });
+        assert!(planner.active.is_empty());
+        let DemandPlannerEffect::AdmitDrain(admit) =
+            requested.effects.into_iter().next().expect("admit effect")
+        else {
+            panic!("expected admit drain effect");
+        };
+        assert!(admit.previous.expect("previous snapshot").in_progress);
+
+        let resolved = planner.update(DemandPlannerAction::LookupParkResolved {
+            info_hash,
+            slice_class: DemandSliceClass::RoutineRefresh,
+            stop_reason: DemandSliceStopReason::WallTime,
+            total_peers: 0,
+            unique_peers: 0,
+            parked_outcome: None,
+            drain_admission: None,
+            previous: admit.previous,
+            now,
+        });
+
+        assert!(
+            !planner
+                .scheduler
+                .entry_snapshot(info_hash)
+                .expect("demand entry")
+                .in_progress
+        );
+        assert_eq!(
+            planner
+                .state
+                .get(&info_hash)
+                .expect("planner state")
+                .last_finished_at,
+            Some(now)
+        );
+        let DemandPlannerEffect::LookupParked(parked) =
+            resolved.effects.into_iter().next().expect("parked effect")
+        else {
+            panic!("expected parked effect");
+        };
+        assert!(parked.drain_admission.is_none());
+        assert!(parked.current.expect("current snapshot").in_progress == false);
+    }
+
+    #[test]
+    fn demand_planner_lookup_park_admission_keeps_scheduler_entry_in_progress() {
+        let now = Instant::now();
+        let info_hash = hash_index(44);
+        let mut planner = DemandPlannerModel::new(now);
+        planner.scheduler.register(
+            info_hash,
+            DhtDemandState {
+                awaiting_metadata: false,
+                connected_peers: 0,
+            },
+            now,
+        );
+        assert!(planner.scheduler.mark_in_progress(info_hash));
+
+        planner.active = HashMap::from([(
+            info_hash,
+            active_lookup(LookupId(9), DemandSliceClass::NoConnectedPeers),
+        )]);
+
+        let requested = planner.update(DemandPlannerAction::LookupParkRequested {
+            info_hash,
+            slice_class: DemandSliceClass::NoConnectedPeers,
+            stop_reason: DemandSliceStopReason::WallTime,
+            total_peers: 3,
+            unique_peers: synthetic_peers(44, 3),
+            lookup_ids: active_lookup(LookupId(9), DemandSliceClass::NoConnectedPeers).lookup_ids,
+        });
+        assert!(planner.active.is_empty());
+        let DemandPlannerEffect::AdmitDrain(admit) =
+            requested.effects.into_iter().next().expect("admit effect")
+        else {
+            panic!("expected admit drain effect");
+        };
+
+        let resolved = planner.update(DemandPlannerAction::LookupParkResolved {
+            info_hash,
+            slice_class: DemandSliceClass::NoConnectedPeers,
+            stop_reason: DemandSliceStopReason::WallTime,
+            total_peers: 3,
+            unique_peers: 3,
+            parked_outcome: Some(DemandParkedSliceOutcome::UsefulYield),
+            drain_admission: Some(DemandDrainAdmissionSnapshot {
+                initial_inflight_queries: 3,
+                score: 42,
+                deadline_ms: 5_000,
+            }),
+            previous: admit.previous,
+            now,
+        });
+
+        assert!(
+            planner
+                .scheduler
+                .entry_snapshot(info_hash)
+                .expect("demand entry")
+                .in_progress
+        );
+        assert!(planner.state.get(&info_hash).is_none());
+        let DemandPlannerEffect::LookupParked(parked) =
+            resolved.effects.into_iter().next().expect("parked effect")
+        else {
+            panic!("expected parked effect");
+        };
+        assert_eq!(parked.drain_admission.expect("drain admission").score, 42);
+        assert!(parked.current.expect("current snapshot").in_progress);
+    }
+
+    #[test]
+    fn demand_planner_lookup_park_admission_requests_finalize_after_class_change() {
+        let now = Instant::now();
+        let info_hash = hash_index(49);
+        let mut planner = DemandPlannerModel::new(now);
+        planner.scheduler.register(
+            info_hash,
+            DhtDemandState {
+                awaiting_metadata: false,
+                connected_peers: 0,
+            },
+            now,
+        );
+        assert!(planner.scheduler.mark_in_progress(info_hash));
+        let previous = planner.scheduler.entry_snapshot(info_hash);
+        let _ = planner.update(DemandPlannerAction::DemandUpdated {
+            info_hash,
+            demand: DhtDemandState {
+                awaiting_metadata: false,
+                connected_peers: 4,
+            },
+            now,
+        });
+        insert_synthetic_drain(
+            &mut planner.draining_demands,
+            info_hash,
+            49,
+            LookupId(13),
+            DemandSliceClass::NoConnectedPeers,
+            2,
+            now,
+        );
+
+        let resolved = planner.update(DemandPlannerAction::LookupParkResolved {
+            info_hash,
+            slice_class: DemandSliceClass::NoConnectedPeers,
+            stop_reason: DemandSliceStopReason::WallTime,
+            total_peers: 2,
+            unique_peers: 2,
+            parked_outcome: Some(DemandParkedSliceOutcome::UsefulYield),
+            drain_admission: Some(DemandDrainAdmissionSnapshot {
+                initial_inflight_queries: 2,
+                score: 7,
+                deadline_ms: 5_000,
+            }),
+            previous,
+            now,
+        });
+
+        assert!(resolved
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, DemandPlannerEffect::LookupParked(_))));
+        assert!(resolved.effects.iter().any(|effect| matches!(
+            effect,
+            DemandPlannerEffect::FinalizeDrainingLookup(finalize)
+                if finalize.info_hash == info_hash && finalize.force
+        )));
+    }
+
+    #[test]
+    fn demand_planner_drain_finalized_action_finishes_and_applies_backoff_mode() {
+        let now = Instant::now();
+        let info_hash = hash_index(45);
+        let mut planner = DemandPlannerModel::new(now);
+        planner.scheduler.register(
+            info_hash,
+            DhtDemandState {
+                awaiting_metadata: false,
+                connected_peers: 0,
+            },
+            now,
+        );
+        assert!(planner.scheduler.mark_in_progress(info_hash));
+
+        let previous = planner.scheduler.entry_snapshot(info_hash);
+
+        let reduction = planner.update(DemandPlannerAction::DrainedLookupFinalized {
+            info_hash,
+            outcome: DrainedDemandOutcome {
+                slice_class: DemandSliceClass::NoConnectedPeers,
+                stop_reason: DemandSliceStopReason::IdleTimeout,
+                total_peers: 0,
+                unique_peers: 0,
+                parked_outcome: Some(DemandParkedSliceOutcome::HealthyZeroYield),
+                drain_duration_ms: 1_000,
+                finalized_after_deadline: false,
+                finalized_early_no_yield: true,
+            },
+            previous,
+            now,
+        });
+
+        let snapshot = planner
+            .scheduler
+            .entry_snapshot(info_hash)
+            .expect("demand entry");
+        assert!(!snapshot.in_progress);
+        assert!(snapshot.next_eligible_at > now);
+        assert!(snapshot.no_connected_peers_backoff_step > 0);
+        let state = planner.state.get(&info_hash).expect("planner state");
+        assert_eq!(state.last_finished_at, Some(now));
+        assert_eq!(state.last_useful_yield_at, None);
+        assert_eq!(state.last_unique_peers, 0);
+
+        let DemandPlannerEffect::DrainFinalized(finalized) = reduction
+            .effects
+            .into_iter()
+            .next()
+            .expect("finalized effect")
+        else {
+            panic!("expected drain finalized effect");
+        };
+        assert_eq!(
+            finalized.finish_mode,
+            DemandFinishMode::AcceleratedNoConnectedPeersBackoff
+        );
+        assert_eq!(finalized.outcome.unique_peers, 0);
+        assert!(finalized.previous.expect("previous snapshot").in_progress);
+        assert!(!finalized.current.expect("current snapshot").in_progress);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 128,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn demand_planner_selection_fuzz_respects_caps_budget_and_stats(
+            specs in prop::collection::vec(planner_candidate_strategy(), 0..96),
+            active_awaiting in 0usize..=12,
+            active_no_peers in 0usize..=12,
+            active_routine in 0usize..=12,
+            total_budget in 0usize..=12,
+        ) {
+            let now = Instant::now();
+            let mut seen = HashSet::new();
+            let mut due_candidates = Vec::new();
+            let mut planner_state = HashMap::new();
+
+            for spec in specs {
+                if !seen.insert(spec.index) {
+                    continue;
+                }
+
+                let info_hash = hash_index(u32::from(spec.index));
+                due_candidates.push(DueDemandCandidate {
+                    info_hash,
+                    demand: demand_for_fuzz_class(spec.demand_class, spec.connected_peers),
+                    next_eligible_at: test_instant_saturating_sub(
+                        now,
+                        Duration::from_millis(u64::from(spec.overdue_ms)),
+                    ),
+                    subscriber_count: usize::from(spec.subscribers),
+                });
+
+                if let Some(useful_yield_age_ms) = spec.useful_yield_age_ms {
+                    let useful_yield_at = test_instant_saturating_sub(
+                        now,
+                        Duration::from_millis(u64::from(useful_yield_age_ms)),
+                    );
+                    planner_state.insert(
+                        info_hash,
+                        DemandPlannerState {
+                            last_started_at: Some(test_instant_saturating_sub(
+                                useful_yield_at,
+                                Duration::from_millis(250),
+                            )),
+                            last_finished_at: Some(useful_yield_at),
+                            last_useful_yield_at: Some(useful_yield_at),
+                            last_unique_peers: usize::from(spec.last_unique_peers),
+                        },
+                    );
+                }
+            }
+
+            let active_counts = DemandSlotCounts {
+                awaiting_metadata: active_awaiting,
+                no_connected_peers: active_no_peers,
+                routine_refresh: active_routine,
+            };
+            let mut planner_budget = DemandPlannerBudget::new(now);
+            let selection = select_due_demand_launches_with_stats(
+                &due_candidates,
+                active_counts,
+                &HashMap::new(),
+                &planner_state,
+                &mut planner_budget,
+                now,
+                total_budget,
+            );
+
+            prop_assert!(selection.launches.len() <= total_budget);
+
+            let input_hashes = due_candidates
+                .iter()
+                .map(|candidate| candidate.info_hash)
+                .collect::<HashSet<_>>();
+            let mut launched_hashes = HashSet::new();
+            let mut launched_counts = DemandSlotCounts::default();
+            for launched in &selection.launches {
+                prop_assert!(input_hashes.contains(&launched.info_hash));
+                prop_assert!(launched_hashes.insert(launched.info_hash));
+                launched_counts.record(DemandSliceClass::from_demand(launched.demand));
+            }
+
+            prop_assert!(
+                launched_counts.awaiting_metadata
+                    <= DHT_AWAITING_METADATA_SLOT_CAP.saturating_sub(active_awaiting)
+            );
+            prop_assert!(
+                launched_counts.no_connected_peers
+                    <= DHT_NO_CONNECTED_PEERS_SLOT_CAP.saturating_sub(active_no_peers)
+            );
+            prop_assert!(
+                launched_counts.routine_refresh
+                    <= DHT_ROUTINE_LOOKUP_SLOT_CAP.saturating_sub(active_routine)
+            );
+
+            let offered_counts = count_candidate_classes(&due_candidates);
+            prop_assert_eq!(selection.stats.offered, offered_counts);
+            prop_assert_eq!(selection.stats.launched, launched_counts);
+            prop_assert_eq!(
+                selection.stats.throttled.awaiting_metadata,
+                offered_counts
+                    .awaiting_metadata
+                    .saturating_sub(launched_counts.awaiting_metadata)
+            );
+            prop_assert_eq!(
+                selection.stats.throttled.no_connected_peers,
+                offered_counts
+                    .no_connected_peers
+                    .saturating_sub(launched_counts.no_connected_peers)
+            );
+            prop_assert_eq!(
+                selection.stats.throttled.routine_refresh,
+                offered_counts
+                    .routine_refresh
+                    .saturating_sub(launched_counts.routine_refresh)
+            );
+        }
+
+        #[test]
+        fn demand_planner_state_machine_fuzz_preserves_capacity_and_entry_invariants(
+            ops in prop::collection::vec(planner_machine_op_strategy(), 1..260)
+        ) {
+            let mut machine = PlannerMachine::new();
+
+            for op in ops {
+                machine.apply(op);
+                machine.assert_invariants()?;
+            }
+        }
     }
 }

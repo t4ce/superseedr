@@ -836,7 +836,8 @@ mod tests {
     use super::*;
     use crate::dht::routing::RoutingSnapshot;
     use crate::dht::test_support::{seeded_info_hash, seeded_node_id};
-    use std::collections::HashMap;
+    use proptest::prelude::*;
+    use std::collections::{HashMap, HashSet};
     use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
 
@@ -851,6 +852,76 @@ mod tests {
             responder_id: NodeId,
             peers: Vec<CompactPeer>,
         },
+    }
+
+    #[derive(Clone, Debug)]
+    enum LookupReplySpec {
+        Timeout,
+        Error,
+        SoftTimeoutThenTimeout,
+        Nodes {
+            responder_seed: u8,
+            node_seeds: Vec<u8>,
+        },
+        Peers {
+            responder_seed: u8,
+            peer_seeds: Vec<u8>,
+        },
+    }
+
+    fn lookup_reply_strategy() -> impl Strategy<Value = LookupReplySpec> {
+        prop_oneof![
+            Just(LookupReplySpec::Timeout),
+            Just(LookupReplySpec::Error),
+            Just(LookupReplySpec::SoftTimeoutThenTimeout),
+            (any::<u8>(), prop::collection::vec(any::<u8>(), 0..12)).prop_map(
+                |(responder_seed, node_seeds)| LookupReplySpec::Nodes {
+                    responder_seed,
+                    node_seeds,
+                }
+            ),
+            (any::<u8>(), prop::collection::vec(any::<u8>(), 0..8)).prop_map(
+                |(responder_seed, peer_seeds)| LookupReplySpec::Peers {
+                    responder_seed,
+                    peer_seeds,
+                }
+            ),
+        ]
+    }
+
+    fn assert_lookup_state_invariants(state: &LookupState) -> Result<(), TestCaseError> {
+        let snapshot = state.quality_snapshot();
+        prop_assert_eq!(snapshot.frontier_len, state.frontier.len());
+        prop_assert_eq!(snapshot.inflight_len, state.inflight.len());
+        prop_assert_eq!(snapshot.visited_len, state.visited.len());
+        prop_assert_eq!(snapshot.received_peer_count, state.received_peers.len());
+        prop_assert!(state.closest_valid_responders.len() <= state.config.max_visits.min(64));
+
+        let mut frontier_addrs = HashSet::new();
+        for candidate in &state.frontier {
+            prop_assert!(frontier_addrs.insert(candidate.addr));
+            prop_assert!(!state.visited.contains(&candidate.addr));
+            prop_assert!(!state
+                .inflight
+                .values()
+                .any(|query| query.candidate.addr == candidate.addr));
+        }
+
+        let mut inflight_addrs = HashSet::new();
+        for query in state.inflight.values() {
+            prop_assert!(inflight_addrs.insert(query.candidate.addr));
+            prop_assert!(state.visited.contains(&query.candidate.addr));
+        }
+
+        for candidate in state.next_candidates() {
+            prop_assert!(!state.visited.contains(&candidate.addr));
+            prop_assert!(!state
+                .inflight
+                .values()
+                .any(|query| query.candidate.addr == candidate.addr));
+        }
+
+        Ok(())
     }
 
     #[test]
@@ -1082,6 +1153,146 @@ mod tests {
             .any(|entry| entry.addr == candidate.addr));
     }
 
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 96,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn lookup_state_random_walk_fuzz_preserves_core_invariants(
+            seed in any::<u8>(),
+            bootstrap_count in 1usize..=8,
+            replies in prop::collection::vec(lookup_reply_strategy(), 1..96),
+        ) {
+            let info_hash = seeded_info_hash(seed);
+            let manager = LookupManager::new(LookupConfig {
+                initial_concurrency: 4,
+                concurrency: 4,
+                max_visits: 64,
+                max_referrals_per_response: 12,
+                per_prefix_limit: 2,
+                termination_k: 8,
+            });
+            let mut now = Instant::now();
+            let bootstrap_nodes = (0..bootstrap_count)
+                .map(|index| {
+                    socket(
+                        127,
+                        0,
+                        10,
+                        seed.wrapping_add(index as u8),
+                        30_000 + index as u16,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut state = manager.start(
+                LookupRequest {
+                    lookup_id: LookupId(1),
+                    kind: LookupKind::GetPeers,
+                    target: LookupTarget::InfoHash(info_hash),
+                },
+                AddressFamily::Ipv4,
+                &empty_routing_snapshot(AddressFamily::Ipv4),
+                &bootstrap_nodes,
+                &[],
+                now,
+            );
+            let mut replies = replies.into_iter();
+            let mut next_tid = 1u32;
+            let mut emitted_peers = HashSet::new();
+
+            for _ in 0..96 {
+                assert_lookup_state_invariants(&state)?;
+                if state.is_finished() {
+                    break;
+                }
+
+                let candidates = state.next_candidates();
+                if candidates.is_empty() {
+                    break;
+                }
+                prop_assert!(candidates.len() <= 16);
+
+                for candidate in candidates {
+                    let transaction_id = TransactionId::from(next_tid.to_be_bytes());
+                    next_tid = next_tid.saturating_add(1);
+
+                    if state.mark_inflight(transaction_id, candidate.addr, now).is_none() {
+                        state.discard_candidate(candidate.addr);
+                        continue;
+                    }
+
+                    let reply = replies.next().unwrap_or(LookupReplySpec::Timeout);
+                    let update = match reply {
+                        LookupReplySpec::Timeout => state.handle_timeout(transaction_id),
+                        LookupReplySpec::Error => state.handle_error(transaction_id),
+                        LookupReplySpec::SoftTimeoutThenTimeout => {
+                            let _ = state.mark_soft_timeout(transaction_id);
+                            state.handle_timeout(transaction_id)
+                        }
+                        LookupReplySpec::Nodes {
+                            responder_seed,
+                            node_seeds,
+                        } => {
+                            let nodes = node_seeds
+                                .into_iter()
+                                .enumerate()
+                                .map(|(index, node_seed)| {
+                                    public_compact_node(node_seed, index as u8)
+                                })
+                                .collect::<Vec<_>>();
+                            state.handle_response(
+                                transaction_id,
+                                &KrpcResponseBody::with_closest_nodes(
+                                    seeded_node_id(responder_seed),
+                                    &nodes,
+                                    AddressFamily::Ipv4,
+                                    b"tk",
+                                ),
+                                now,
+                            )
+                        }
+                        LookupReplySpec::Peers {
+                            responder_seed,
+                            peer_seeds,
+                        } => {
+                            let peers = peer_seeds
+                                .into_iter()
+                                .enumerate()
+                                .map(|(index, peer_seed)| {
+                                    public_compact_peer(peer_seed, index as u8)
+                                })
+                                .collect::<Vec<_>>();
+                            state.handle_response(
+                                transaction_id,
+                                &KrpcResponseBody::with_peers(
+                                    seeded_node_id(responder_seed),
+                                    &peers,
+                                    b"tk",
+                                ),
+                                now,
+                            )
+                        }
+                    };
+
+                    for peer in update.emitted_peers {
+                        prop_assert!(emitted_peers.insert(peer.addr));
+                    }
+
+                    assert_lookup_state_invariants(&state)?;
+                    if update.finished {
+                        break;
+                    }
+                }
+
+                now += Duration::from_millis(10);
+            }
+
+            assert_lookup_state_invariants(&state)?;
+        }
+    }
+
     fn empty_routing_snapshot(family: AddressFamily) -> RoutingSnapshot {
         RoutingSnapshot {
             family,
@@ -1090,6 +1301,27 @@ mod tests {
             replacement_count: 0,
             refresh_due_count: 0,
         }
+    }
+
+    fn public_compact_node(seed: u8, salt: u8) -> CompactNode {
+        compact_node(
+            seed,
+            45,
+            seed,
+            salt,
+            seed.wrapping_add(salt),
+            30_000 + u16::from(seed).saturating_mul(8) + u16::from(salt),
+        )
+    }
+
+    fn public_compact_peer(seed: u8, salt: u8) -> CompactPeer {
+        compact_peer(
+            46,
+            seed,
+            salt,
+            seed.wrapping_add(salt),
+            40_000 + u16::from(seed).saturating_mul(8) + u16::from(salt),
+        )
     }
 
     fn compact_node(seed: u8, a: u8, b: u8, c: u8, d: u8, port: u16) -> CompactNode {
