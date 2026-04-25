@@ -18,7 +18,7 @@ use crate::app::{
     TorrentDisplayState,
 };
 use crate::config::{PeerSortColumn, Settings, SortDirection, TorrentSortColumn};
-use crate::dht_service::{DhtBackendKind, DhtStatus, DhtWaveTelemetry};
+use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
 use crate::integrations::control::ControlRequest;
 use crate::persistence::activity_history::{ActivityHistoryPoint, ActivityHistorySeries};
 use crate::persistence::network_history::NetworkHistoryPoint;
@@ -782,7 +782,10 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>, plan: &LayoutPlan) {
         draw_network_chart(f, app_state, r, ctx);
     }
     if let Some(r) = plan.peer_stream {
-        draw_dht_wave_panel(
+        draw_peer_stream(f, app_state, r, ctx);
+    }
+    if let Some(r) = plan.block_stream {
+        draw_block_stream_and_disk_orb(
             f,
             app_state,
             screen.dht_status,
@@ -790,9 +793,6 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>, plan: &LayoutPlan) {
             r,
             ctx,
         );
-    }
-    if let Some(r) = plan.block_stream {
-        draw_block_stream_and_disk_orb(f, app_state, r, ctx);
     }
     if let Some(r) = plan.stats {
         draw_stats_panel(f, app_state, settings, r, ctx);
@@ -806,100 +806,30 @@ struct DhtWaveProfile {
     frequency: f64,
     phase_speed: f64,
     crest_bias: f64,
-    bootstrap_ratio: f64,
 }
 
 impl DhtWaveProfile {
-    fn from_inputs(status: &DhtStatus, telemetry: &DhtWaveTelemetry) -> Self {
-        let health = &status.health;
-        let routes = (health.cached_ipv4_routes + health.cached_ipv6_routes) as f64;
-        let bootstrap_total = (health.ipv4_bootstrap_nodes + health.ipv6_bootstrap_nodes) as f64;
-        let responsive_total = (health.responsive_ipv4_bootstrap_nodes
-            + health.responsive_ipv6_bootstrap_nodes) as f64;
-
-        let route_energy = (routes / 2_048.0).clamp(0.0, 1.0);
-        let ratio_signal = dht_wave_query_yield_signal(telemetry);
-        let bootstrap_ratio = if bootstrap_total > 0.0 {
-            (responsive_total / bootstrap_total).clamp(0.0, 1.0)
-        } else if health.enabled {
-            0.0
-        } else {
-            1.0
-        };
-        let enabled_factor = if health.enabled { 1.0 } else { 0.0 };
-        let firewalled_factor = match health.firewalled {
-            Some(true) => 0.72,
-            Some(false) => 1.0,
-            None => 0.88,
-        };
-        let warning_boost = f64::from(status.warning.is_some() || health.recovery_pending);
-        let activity_energy = ratio_signal.max((warning_boost * 0.55).clamp(0.0, 1.0));
-
-        let amplitude = ((0.01 + activity_energy * (0.16 + route_energy * 0.20))
-            * firewalled_factor
-            * enabled_factor)
-            .clamp(0.0, 0.52);
-        let harmonic_amplitude = ((0.004
-            + activity_energy
-                * (0.03
-                    + ratio_signal * 0.10
-                    + (1.0 - bootstrap_ratio) * 0.04
-                    + warning_boost * 0.04))
-            * enabled_factor)
-            .clamp(0.0, 0.20);
-        let frequency = (0.08
-            + activity_energy
-                * (0.08
-                    + ratio_signal * 0.12
-                    + (1.0 - bootstrap_ratio) * 0.04
-                    + warning_boost * 0.03))
-            .clamp(0.06, 0.38);
-        let phase_speed = ((0.03
-            + activity_energy * (0.45 + ratio_signal * 1.4 + warning_boost * 0.35))
-            * enabled_factor)
-            .clamp(0.0, 2.0);
-        let crest_bias = match health.firewalled {
-            Some(true) => -0.10,
-            Some(false) => 0.06,
-            None => 0.0,
-        } + ((route_energy - 0.5) * 0.12 * activity_energy);
+    fn from_inputs(_status: &DhtStatus, telemetry: &DhtWaveTelemetry) -> Self {
+        let query_signal = dht_wave_query_signal(telemetry);
+        let amplitude = (0.01 + query_signal * 0.38).clamp(0.0, 0.52);
+        let harmonic_amplitude = (0.004 + query_signal * 0.14).clamp(0.0, 0.20);
+        let frequency = (0.08 + query_signal * 0.22).clamp(0.06, 0.38);
+        let phase_speed = (0.03 + query_signal * 1.7).clamp(0.0, 2.0);
+        let crest_bias = ((query_signal - 0.5) * 0.08).clamp(-0.22, 0.22);
 
         Self {
             amplitude,
             harmonic_amplitude,
             frequency,
             phase_speed,
-            crest_bias: crest_bias.clamp(-0.22, 0.22),
-            bootstrap_ratio,
+            crest_bias,
         }
     }
 }
 
-fn dht_wave_query_yield_signal(telemetry: &DhtWaveTelemetry) -> f64 {
+fn dht_wave_query_signal(telemetry: &DhtWaveTelemetry) -> f64 {
     let total_queries = (telemetry.inflight_ipv4_queries + telemetry.inflight_ipv6_queries) as f64;
-    let unique_peers_found_last_10s = telemetry.unique_peers_found_last_10s as f64;
-
-    let ratio = if total_queries <= 0.0 {
-        0.0
-    } else if unique_peers_found_last_10s <= 0.0 {
-        (total_queries / 16.0).clamp(0.0, 1.0)
-    } else {
-        (total_queries / unique_peers_found_last_10s).clamp(0.0, 1.0)
-    };
-
-    (ratio / 0.02).clamp(0.0, 1.0)
-}
-
-fn dht_backend_label(backend: DhtBackendKind) -> &'static str {
-    match backend {
-        DhtBackendKind::Disabled => "off",
-        DhtBackendKind::Mainline => "compat",
-        DhtBackendKind::InternalPrototype => "int",
-    }
-}
-
-fn should_use_compact_dht_wave_legend(available_width: usize, total_routes: usize) -> bool {
-    total_routes >= 1_000 || available_width < 34
+    (total_queries / 64.0).clamp(0.0, 1.0)
 }
 
 fn draw_dht_wave_panel(
@@ -914,7 +844,6 @@ fn draw_dht_wave_panel(
         return;
     }
 
-    let health = &dht_status.health;
     let profile = if app_state.ui.dht_wave.initialized {
         DhtWaveProfile {
             amplitude: app_state.ui.dht_wave.amplitude,
@@ -922,23 +851,12 @@ fn draw_dht_wave_panel(
             frequency: app_state.ui.dht_wave.frequency,
             phase_speed: app_state.ui.dht_wave.phase_speed,
             crest_bias: app_state.ui.dht_wave.crest_bias,
-            bootstrap_ratio: app_state.ui.dht_wave.bootstrap_ratio,
         }
     } else {
         DhtWaveProfile::from_inputs(&dht_status, dht_wave_telemetry)
     };
-    let total_routes = health.cached_ipv4_routes + health.cached_ipv6_routes;
-    let total_bootstrap = health.ipv4_bootstrap_nodes + health.ipv6_bootstrap_nodes;
-    let responsive_bootstrap =
-        health.responsive_ipv4_bootstrap_nodes + health.responsive_ipv6_bootstrap_nodes;
     let total_queries =
         dht_wave_telemetry.inflight_ipv4_queries + dht_wave_telemetry.inflight_ipv6_queries;
-    let unique_peers_found_last_10s = dht_wave_telemetry.unique_peers_found_last_10s;
-    let ratio = if total_queries == 0 {
-        0.0
-    } else {
-        total_queries as f64 / unique_peers_found_last_10s.max(1) as f64
-    };
     let x_bound = area.width.saturating_sub(3).max(1) as usize;
     let phase = if app_state.ui.dht_wave.initialized {
         app_state.ui.dht_wave.phase
@@ -946,13 +864,6 @@ fn draw_dht_wave_panel(
         app_state.ui.effects_phase_time * profile.phase_speed
     };
 
-    let selected_torrent = app_state
-        .torrent_list_order
-        .get(app_state.ui.selected_torrent_index)
-        .and_then(|info_hash| app_state.torrents.get(info_hash));
-    let discovered_count = selected_torrent
-        .map(|torrent| torrent.peer_discovery_history.iter().sum::<u64>())
-        .unwrap_or_default();
     let sample_count = (x_bound.max(1) * 3).max(16);
     let x_step = x_bound as f64 / sample_count as f64;
     let mut dht_points = Vec::with_capacity(sample_count + 1);
@@ -973,32 +884,6 @@ fn draw_dht_wave_panel(
         dht_points.push((x, carrier.clamp(-1.04, 1.04)));
     }
 
-    let compact_legend =
-        should_use_compact_dht_wave_legend(area.width.saturating_sub(2) as usize, total_routes);
-    let legend_text = if compact_legend {
-        format!(
-            "q:{} u10:{} r:{:.3}",
-            total_queries, unique_peers_found_last_10s, ratio
-        )
-    } else {
-        format!(
-            "{} routes:{} q:{} u10:{} r:{:.3} boot:{}/{} d:{}{}",
-            dht_backend_label(health.backend),
-            total_routes,
-            total_queries,
-            unique_peers_found_last_10s,
-            ratio,
-            responsive_bootstrap,
-            total_bootstrap,
-            discovered_count,
-            match health.firewalled {
-                Some(true) => " fw",
-                Some(false) => "",
-                None => " ?",
-            }
-        )
-    };
-
     let datasets = vec![ratatui::widgets::Dataset::default()
         .marker(ratatui::symbols::Marker::Braille)
         .graph_type(ratatui::widgets::GraphType::Line)
@@ -1011,29 +896,19 @@ fn draw_dht_wave_panel(
         )
         .data(&dht_points)];
 
-    let title = Line::from(vec![
-        Span::styled(
-            " ",
-            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
-        ),
-        Span::styled("DHT", ctx.apply(Style::default().fg(ctx.peer_discovered()))),
-        Span::styled(
-            format!(" wave {:.0}%", profile.bootstrap_ratio * 100.0),
-            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
-        ),
-        Span::styled(
-            " ",
-            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
-        ),
-    ]);
-
     let chart = ratatui::widgets::Chart::new(datasets)
         .block(
             Block::default()
-                .title_top(title.alignment(Alignment::Left))
                 .title_top(
                     Line::from(Span::styled(
-                        legend_text,
+                        "DHT",
+                        ctx.apply(Style::default().fg(ctx.peer_discovered())),
+                    ))
+                    .alignment(Alignment::Left),
+                )
+                .title_top(
+                    Line::from(Span::styled(
+                        format!("queries {}", total_queries),
                         ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
                     ))
                     .alignment(Alignment::Right),
@@ -3469,7 +3344,6 @@ fn rss_sync_countdown_label(next_sync_at: &str) -> Option<String> {
     Some(label)
 }
 
-#[allow(dead_code)]
 fn peer_stream_smoothed_activity(data_slice: &[u64], i: usize) -> f64 {
     let current = data_slice.get(i).copied().unwrap_or(0) as f64;
     let prev = if i > 0 {
@@ -3481,7 +3355,6 @@ fn peer_stream_smoothed_activity(data_slice: &[u64], i: usize) -> f64 {
     (prev * 0.25) + (current * 0.5) + (next * 0.25)
 }
 
-#[allow(dead_code)]
 fn peer_stream_wave_amplitude(smoothed_activity: f64) -> f64 {
     let min_amp = 0.10;
     let max_amp = 0.28;
@@ -3489,7 +3362,6 @@ fn peer_stream_wave_amplitude(smoothed_activity: f64) -> f64 {
     min_amp + (max_amp - min_amp) * normalized
 }
 
-#[allow(dead_code)]
 pub fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &ThemeContext) {
     if area.height < 3 || area.width < 10 {
         return;
@@ -3733,7 +3605,6 @@ pub fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &T
     f.render_widget(chart, area);
 }
 
-#[allow(dead_code)]
 fn should_use_compact_peer_stream_legend(
     available_width: usize,
     connected: u64,
@@ -3750,6 +3621,8 @@ fn should_use_compact_peer_stream_legend(
 pub fn draw_block_stream_and_disk_orb(
     f: &mut Frame,
     app_state: &AppState,
+    dht_status: &DhtStatus,
+    dht_wave_telemetry: &DhtWaveTelemetry,
     area: Rect,
     ctx: &ThemeContext,
 ) {
@@ -3766,15 +3639,34 @@ pub fn draw_block_stream_and_disk_orb(
             draw_disk_health_panel(f, app_state, split[1], ctx);
         }
         BlockStreamDiskLayoutMode::Stacked => {
-            let split = Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)])
+            if should_insert_dht_between_blocks_and_disk(app_state.screen_area, area) {
+                let split = Layout::vertical([
+                    Constraint::Min(4),
+                    Constraint::Length(6),
+                    Constraint::Length(7),
+                ])
                 .split(area);
-            draw_vertical_block_stream_panel(f, app_state, split[0], ctx);
-            draw_disk_health_panel(f, app_state, split[1], ctx);
+                draw_vertical_block_stream_panel(f, app_state, split[0], ctx);
+                draw_dht_wave_panel(f, app_state, dht_status, dht_wave_telemetry, split[1], ctx);
+                draw_disk_health_panel(f, app_state, split[2], ctx);
+            } else {
+                let split =
+                    Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)])
+                        .split(area);
+                draw_vertical_block_stream_panel(f, app_state, split[0], ctx);
+                draw_disk_health_panel(f, app_state, split[1], ctx);
+            }
         }
         BlockStreamDiskLayoutMode::DiskOnly => {
             draw_disk_health_panel(f, app_state, area, ctx);
         }
     }
+}
+
+fn should_insert_dht_between_blocks_and_disk(screen_area: Rect, area: Rect) -> bool {
+    let is_horizontal_mode =
+        screen_area.width >= 100 && (screen_area.height as f32 <= screen_area.width as f32 * 0.6);
+    is_horizontal_mode && area.height >= 14 && area.width >= 10
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7325,26 +7217,17 @@ mod tests {
     }
 
     #[test]
-    fn dht_wave_profile_responds_to_query_to_yield_ratio() {
-        let mut quiet = DhtStatus::default();
-        quiet.health.enabled = true;
-        quiet.health.backend = DhtBackendKind::InternalPrototype;
-        quiet.health.ipv4_bootstrap_nodes = 3;
-        quiet.health.responsive_ipv4_bootstrap_nodes = 1;
+    fn dht_wave_profile_responds_to_query_count() {
+        let quiet = DhtStatus::default();
         let quiet_telemetry = DhtWaveTelemetry {
             inflight_ipv4_queries: 4,
-            unique_peers_found_last_10s: 2_000,
             ..Default::default()
         };
 
-        let mut busy = quiet.clone();
-        busy.health.cached_ipv4_routes = 1_200;
-        busy.health.cached_ipv6_routes = 220;
-        busy.health.responsive_ipv4_bootstrap_nodes = 3;
+        let busy = quiet.clone();
         let busy_telemetry = DhtWaveTelemetry {
-            inflight_ipv4_queries: 14,
-            inflight_ipv6_queries: 6,
-            unique_peers_found_last_10s: 120,
+            inflight_ipv4_queries: 40,
+            inflight_ipv6_queries: 24,
             ..Default::default()
         };
 
@@ -7353,53 +7236,43 @@ mod tests {
 
         assert!(busy_profile.amplitude > quiet_profile.amplitude);
         assert!(busy_profile.phase_speed > quiet_profile.phase_speed);
-        assert!(busy_profile.bootstrap_ratio > quiet_profile.bootstrap_ratio);
+        assert!(busy_profile.frequency >= quiet_profile.frequency);
     }
 
     #[test]
-    fn dht_wave_profile_dampens_when_disabled_or_firewalled() {
+    fn dht_wave_profile_ignores_health_when_query_count_matches() {
         let mut healthy = DhtStatus::default();
         healthy.health.enabled = true;
-        healthy.health.backend = DhtBackendKind::InternalPrototype;
         healthy.health.cached_ipv4_routes = 900;
-        healthy.health.ipv4_bootstrap_nodes = 3;
-        healthy.health.responsive_ipv4_bootstrap_nodes = 3;
         healthy.health.firewalled = Some(false);
         let healthy_telemetry = DhtWaveTelemetry {
             inflight_ipv4_queries: 12,
-            unique_peers_found_last_10s: 180,
             ..Default::default()
         };
 
         let mut constrained = healthy.clone();
         constrained.health.enabled = false;
-        constrained.health.backend = DhtBackendKind::Disabled;
         constrained.health.firewalled = Some(true);
         let constrained_telemetry = healthy_telemetry.clone();
 
         let healthy_profile = DhtWaveProfile::from_inputs(&healthy, &healthy_telemetry);
         let constrained_profile = DhtWaveProfile::from_inputs(&constrained, &constrained_telemetry);
 
-        assert!(healthy_profile.amplitude > constrained_profile.amplitude);
-        assert!(healthy_profile.crest_bias > constrained_profile.crest_bias);
+        assert_eq!(healthy_profile.amplitude, constrained_profile.amplitude);
+        assert_eq!(healthy_profile.phase_speed, constrained_profile.phase_speed);
     }
 
     #[test]
     fn dht_wave_profile_stays_nearly_flat_when_only_routes_are_warm() {
         let mut route_warm = DhtStatus::default();
-        route_warm.health.enabled = true;
-        route_warm.health.backend = DhtBackendKind::InternalPrototype;
         route_warm.health.cached_ipv4_routes = 1_400;
         route_warm.health.cached_ipv6_routes = 260;
-        route_warm.health.ipv4_bootstrap_nodes = 3;
-        route_warm.health.responsive_ipv4_bootstrap_nodes = 3;
         let route_warm_telemetry = DhtWaveTelemetry::default();
 
         let active = route_warm.clone();
         let active_telemetry = DhtWaveTelemetry {
             inflight_ipv4_queries: 10,
             inflight_ipv6_queries: 4,
-            unique_peers_found_last_10s: 120,
             ..Default::default()
         };
 
@@ -7521,6 +7394,18 @@ mod tests {
         let mode =
             block_stream_and_disk_layout_mode(Rect::new(0, 0, 64, 90), Rect::new(0, 0, 33, 18));
         assert_eq!(mode, BlockStreamDiskLayoutMode::Stacked);
+    }
+
+    #[test]
+    fn dht_inserts_between_blocks_and_disk_only_in_horizontal_mode() {
+        assert!(should_insert_dht_between_blocks_and_disk(
+            Rect::new(0, 0, 150, 60),
+            Rect::new(0, 0, 17, 27)
+        ));
+        assert!(!should_insert_dht_between_blocks_and_disk(
+            Rect::new(0, 0, 90, 70),
+            Rect::new(0, 0, 40, 18)
+        ));
     }
 
     #[test]
