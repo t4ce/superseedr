@@ -90,6 +90,15 @@ pub mod service {
         pub health: DhtHealthSnapshot,
     }
 
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct DhtWaveTelemetry {
+        pub active_lookups: usize,
+        pub active_user_lookups: usize,
+        pub inflight_ipv4_queries: usize,
+        pub inflight_ipv6_queries: usize,
+        pub unique_peers_found_last_10s: usize,
+    }
+
     #[derive(Debug, Clone, Default)]
     pub struct DhtLookupRun {
         pub batch_count: usize,
@@ -147,6 +156,10 @@ pub mod service {
 
         pub fn current_status(&self) -> DhtStatus {
             self.status_rx.borrow().clone()
+        }
+
+        pub fn current_wave_telemetry(&self) -> DhtWaveTelemetry {
+            DhtWaveTelemetry::default()
         }
 
         pub fn current_warning(&self) -> Option<String> {

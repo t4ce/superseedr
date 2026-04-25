@@ -6551,7 +6551,7 @@ pub(crate) fn sort_and_filter_torrent_list_state(app_state: &mut AppState) {
 
                 let a_prog = calc_progress(a_torrent);
                 let b_prog = calc_progress(b_torrent);
-                b_prog.total_cmp(&a_prog)
+                a_prog.total_cmp(&b_prog)
             }
         };
 
@@ -7508,6 +7508,33 @@ mod tests {
         sort_and_filter_torrent_list_state(&mut app_state);
 
         assert_eq!(app_state.torrent_list_order, vec![higher_hash, lower_hash]);
+    }
+
+    #[test]
+    fn sort_and_filter_progress_ascending_puts_zero_progress_first() {
+        let mut app_state = AppState {
+            torrent_sort: (TorrentSortColumn::Progress, SortDirection::Ascending),
+            torrent_sort_pinned: true,
+            ..Default::default()
+        };
+
+        let zero_hash = b"zero_hash".to_vec();
+        let partial_hash = b"partial_hash".to_vec();
+
+        let mut zero = mock_display("sample-zero.iso", 0);
+        zero.latest_state.number_of_pieces_total = 10;
+        zero.latest_state.number_of_pieces_completed = 0;
+
+        let mut partial = mock_display("sample-partial.iso", 0);
+        partial.latest_state.number_of_pieces_total = 10;
+        partial.latest_state.number_of_pieces_completed = 5;
+
+        app_state.torrents.insert(zero_hash.clone(), zero);
+        app_state.torrents.insert(partial_hash.clone(), partial);
+
+        sort_and_filter_torrent_list_state(&mut app_state);
+
+        assert_eq!(app_state.torrent_list_order, vec![zero_hash, partial_hash]);
     }
 
     #[test]

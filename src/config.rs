@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use chrono::{DateTime, Local, TimeZone};
 use figment::providers::{Env, Serialized};
 use figment::Figment;
 use sha1::{Digest, Sha1};
@@ -40,7 +41,8 @@ impl TorrentSortColumn {
     pub fn default_direction(self) -> SortDirection {
         match self {
             Self::Name => SortDirection::Ascending,
-            Self::Up | Self::Down | Self::Progress => SortDirection::Descending,
+            Self::Up | Self::Down => SortDirection::Descending,
+            Self::Progress => SortDirection::Ascending,
         }
     }
 }
@@ -497,6 +499,12 @@ struct NormalConfigBackend {
 #[derive(Clone, Debug)]
 struct SharedConfigBackend {
     paths: SharedConfigPaths,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SharedCatalogBackupPolicy {
+    cadence_hours: i64,
+    retained_backups: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -1352,6 +1360,84 @@ fn write_toml_atomically_with_fingerprint<T: Serialize>(
     Ok(Some(hex::encode(Sha1::digest(content.as_bytes()))))
 }
 
+fn shared_catalog_backup_policy(torrent_count: usize) -> SharedCatalogBackupPolicy {
+    match torrent_count {
+        0..=999 => SharedCatalogBackupPolicy {
+            cadence_hours: 1,
+            retained_backups: 16_384,
+        },
+        1_000..=9_999 => SharedCatalogBackupPolicy {
+            cadence_hours: 3,
+            retained_backups: 4_096,
+        },
+        10_000..=99_999 => SharedCatalogBackupPolicy {
+            cadence_hours: 6,
+            retained_backups: 1_024,
+        },
+        100_000..=999_999 => SharedCatalogBackupPolicy {
+            cadence_hours: 12,
+            retained_backups: 256,
+        },
+        _ => SharedCatalogBackupPolicy {
+            cadence_hours: 24,
+            retained_backups: 64,
+        },
+    }
+}
+
+fn shared_catalog_backup_roll_start(
+    now: DateTime<Local>,
+    policy: SharedCatalogBackupPolicy,
+) -> DateTime<Local> {
+    let cadence_secs = policy.cadence_hours.saturating_mul(60 * 60).max(60 * 60);
+    let bucket_start = now.timestamp().div_euclid(cadence_secs) * cadence_secs;
+    Local.timestamp_opt(bucket_start, 0).single().unwrap_or(now)
+}
+
+fn cleanup_shared_catalog_backups(backup_dir: &Path, retained_backups: usize) -> io::Result<()> {
+    let mut entries: Vec<_> = fs::read_dir(backup_dir)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with("catalog_") && name.ends_with(".toml"))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    if entries.len() > retained_backups {
+        entries.sort();
+        for path in entries.iter().take(entries.len() - retained_backups) {
+            fs::remove_file(path)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn backup_shared_catalog_before_write(
+    paths: &SharedConfigPaths,
+    catalog: &CatalogConfig,
+) -> io::Result<()> {
+    if !paths.catalog_path.exists() {
+        return Ok(());
+    }
+
+    let policy = shared_catalog_backup_policy(catalog.torrents.len());
+    let backup_dir = paths.root_dir.join("backups").join("catalog");
+    fs::create_dir_all(&backup_dir)?;
+
+    let roll_start = shared_catalog_backup_roll_start(Local::now(), policy);
+    let backup_path = backup_dir.join(format!("catalog_{}.toml", roll_start.format("%Y%m%d_%H")));
+
+    if !backup_path.exists() {
+        fs::copy(&paths.catalog_path, &backup_path)?;
+    }
+
+    cleanup_shared_catalog_backups(&backup_dir, policy.retained_backups)
+}
+
 fn write_shared_cluster_revision_marker(root_dir: &Path) -> io::Result<()> {
     let revision_path = root_dir.join("cluster.revision");
     let revision = format!(
@@ -1665,6 +1751,18 @@ impl SharedConfigBackend {
 
         let shared_catalog_changed = next_layered.catalog != current_layered.catalog;
         if shared_catalog_changed {
+            backup_shared_catalog_before_write(&self.paths, &current_layered.catalog)?;
+            let current_count = current_layered.catalog.torrents.len();
+            let next_count = next_layered.catalog.torrents.len();
+            let large_drop = current_count.saturating_sub(next_count);
+            if large_drop > 10 || (current_count > 0 && next_count * 4 < current_count * 3) {
+                tracing_event!(
+                    Level::WARN,
+                    current_torrents = current_count,
+                    next_torrents = next_count,
+                    "Shared catalog save is reducing torrent count"
+                );
+            }
             let _ = write_toml_atomically_with_fingerprint(
                 &self.paths.catalog_path,
                 &next_layered.catalog,
@@ -3019,6 +3117,144 @@ mod tests {
             reloaded.default_download_folder,
             Some(dir.path().join("downloads"))
         );
+    }
+
+    #[test]
+    fn test_shared_catalog_backup_policy_scales_by_catalog_size() {
+        assert_eq!(
+            shared_catalog_backup_policy(999),
+            SharedCatalogBackupPolicy {
+                cadence_hours: 1,
+                retained_backups: 16_384
+            }
+        );
+        assert_eq!(
+            shared_catalog_backup_policy(1_000),
+            SharedCatalogBackupPolicy {
+                cadence_hours: 3,
+                retained_backups: 4_096
+            }
+        );
+        assert_eq!(
+            shared_catalog_backup_policy(10_000),
+            SharedCatalogBackupPolicy {
+                cadence_hours: 6,
+                retained_backups: 1_024
+            }
+        );
+        assert_eq!(
+            shared_catalog_backup_policy(100_000),
+            SharedCatalogBackupPolicy {
+                cadence_hours: 12,
+                retained_backups: 256
+            }
+        );
+        assert_eq!(
+            shared_catalog_backup_policy(1_000_000),
+            SharedCatalogBackupPolicy {
+                cadence_hours: 24,
+                retained_backups: 64
+            }
+        );
+    }
+
+    #[test]
+    fn test_shared_catalog_backup_deduplicates_current_roll_window() {
+        let dir = tempdir().expect("create tempdir");
+        let root_dir = dir.path().join("shared");
+        let host_dir = root_dir.join("hosts").join("node-a");
+        let paths = SharedConfigPaths {
+            mount_dir: dir.path().to_path_buf(),
+            root_dir: root_dir.clone(),
+            settings_path: root_dir.join("settings.toml"),
+            catalog_path: root_dir.join("catalog.toml"),
+            metadata_path: root_dir.join("torrent_metadata.toml"),
+            host_dir: host_dir.clone(),
+            host_path: host_dir.join("config.toml"),
+            host_id: "node-a".to_string(),
+        };
+        fs::create_dir_all(&paths.root_dir).expect("create shared root");
+        let catalog = CatalogConfig {
+            torrents: vec![CatalogTorrentSettings {
+                torrent_or_magnet: "magnet:?xt=urn:btih:1111111111111111111111111111111111111111"
+                    .to_string(),
+                name: "Sample Item".to_string(),
+                ..CatalogTorrentSettings::default()
+            }],
+        };
+        write_toml_atomically(&paths.catalog_path, &catalog).expect("seed catalog");
+
+        backup_shared_catalog_before_write(&paths, &catalog).expect("backup catalog");
+        backup_shared_catalog_before_write(&paths, &catalog).expect("backup catalog again");
+
+        let backup_dir = paths.root_dir.join("backups").join("catalog");
+        let backups: Vec<_> = fs::read_dir(backup_dir)
+            .expect("read backups")
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(backups.len(), 1);
+    }
+
+    #[test]
+    fn test_shared_backend_backs_up_catalog_before_overwrite() {
+        let _guard = shared_backend_guard().lock().unwrap();
+        clear_shared_config_state();
+        let dir = tempdir().expect("create tempdir");
+        let config_root = dir.path().join(SHARED_CONFIG_SUBDIR);
+        let host_dir = config_root.join("hosts").join("node-a");
+        let backend = SharedConfigBackend {
+            paths: SharedConfigPaths {
+                mount_dir: dir.path().to_path_buf(),
+                root_dir: config_root.clone(),
+                settings_path: config_root.join("settings.toml"),
+                catalog_path: config_root.join("catalog.toml"),
+                metadata_path: config_root.join("torrent_metadata.toml"),
+                host_dir: host_dir.clone(),
+                host_path: host_dir.join("config.toml"),
+                host_id: "node-a".to_string(),
+            },
+        };
+        write_toml_atomically(&backend.paths.host_path, &HostConfig::default())
+            .expect("seed host file");
+
+        let mut settings = backend.load_settings().expect("load shared settings");
+        settings.torrents = vec![
+            TorrentSettings {
+                torrent_or_magnet: "magnet:?xt=urn:btih:1111111111111111111111111111111111111111"
+                    .to_string(),
+                name: "Sample Alpha".to_string(),
+                ..TorrentSettings::default()
+            },
+            TorrentSettings {
+                torrent_or_magnet: "magnet:?xt=urn:btih:2222222222222222222222222222222222222222"
+                    .to_string(),
+                name: "Sample Beta".to_string(),
+                ..TorrentSettings::default()
+            },
+        ];
+        backend
+            .save_settings(&settings)
+            .expect("save initial catalog");
+
+        settings.torrents.pop();
+        backend
+            .save_settings(&settings)
+            .expect("save reduced catalog");
+
+        let backup_dir = backend.paths.root_dir.join("backups").join("catalog");
+        let backup_path = fs::read_dir(backup_dir)
+            .expect("read backup dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .next()
+            .expect("backup should exist");
+        let backup_catalog: CatalogConfig =
+            read_toml_or_default(&backup_path).expect("read backup catalog");
+        let current_catalog: CatalogConfig =
+            read_toml_or_default(&backend.paths.catalog_path).expect("read current catalog");
+
+        assert_eq!(backup_catalog.torrents.len(), 2);
+        assert_eq!(current_catalog.torrents.len(), 1);
     }
 
     #[test]
