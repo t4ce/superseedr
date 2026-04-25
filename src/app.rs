@@ -5391,6 +5391,9 @@ impl App {
             details: EventDetails::Ingest {
                 origin,
                 ingest_kind,
+                download_path: None,
+                container_name: None,
+                payload_path: None,
             },
             ..Default::default()
         });
@@ -5589,6 +5592,18 @@ impl App {
                 Some(message.clone()),
             ),
         };
+        let (download_path, container_name, payload_path) = info_hash_hex
+            .as_deref()
+            .and_then(|hash| hex::decode(hash).ok())
+            .and_then(|info_hash| self.app_state.torrents.get(&info_hash))
+            .map(|torrent| {
+                (
+                    torrent.latest_state.download_path.clone(),
+                    torrent.latest_state.container_name.clone(),
+                    Self::torrent_saved_location(&torrent.latest_state),
+                )
+            })
+            .unwrap_or_default();
 
         self.append_event_journal_entry(EventJournalEntry {
             host_id: self.event_journal_host_id.clone(),
@@ -5604,6 +5619,9 @@ impl App {
             details: EventDetails::Ingest {
                 origin,
                 ingest_kind,
+                download_path,
+                container_name,
+                payload_path,
             },
             ..Default::default()
         });
@@ -8270,17 +8288,34 @@ mod tests {
             .await
             .expect("build app");
         let queued_path = std::env::temp_dir().join("event-journal-alpha.magnet");
+        let download_path = std::env::temp_dir().join("event-journal-downloads");
+        let info_hash = vec![0x11; 20];
+        app.app_state.torrents.insert(
+            info_hash.clone(),
+            TorrentDisplayState {
+                latest_state: TorrentMetrics {
+                    info_hash: info_hash.clone(),
+                    torrent_name: "Sample Alpha".to_string(),
+                    download_path: Some(download_path.clone()),
+                    container_name: Some("Sample Alpha".to_string()),
+                    is_multi_file: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let initial_entry_count = app.app_state.event_journal_state.entries.len();
 
         app.record_watch_path_discovered(&queued_path);
         app.record_ingest_result(
             &queued_path,
             &CommandIngestResult::Duplicate {
-                info_hash: Some(vec![0x11; 20]),
+                info_hash: Some(info_hash),
                 torrent_name: Some("Sample Alpha".to_string()),
             },
         );
 
-        let entries = &app.app_state.event_journal_state.entries;
+        let entries = &app.app_state.event_journal_state.entries[initial_entry_count..];
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].event_type, EventType::IngestQueued);
         assert_eq!(entries[1].event_type, EventType::IngestDuplicate);
@@ -8292,6 +8327,19 @@ mod tests {
             EventDetails::Ingest {
                 origin: IngestOrigin::WatchFolder,
                 ingest_kind: IngestKind::MagnetFile,
+                download_path: None,
+                container_name: None,
+                payload_path: None,
+            }
+        );
+        assert_eq!(
+            entries[1].details,
+            EventDetails::Ingest {
+                origin: IngestOrigin::WatchFolder,
+                ingest_kind: IngestKind::MagnetFile,
+                download_path: Some(download_path.clone()),
+                container_name: Some("Sample Alpha".to_string()),
+                payload_path: Some(download_path.join("Sample Alpha")),
             }
         );
 

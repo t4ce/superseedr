@@ -91,6 +91,12 @@ pub enum EventDetails {
     Ingest {
         origin: IngestOrigin,
         ingest_kind: IngestKind,
+        #[serde(default)]
+        download_path: Option<PathBuf>,
+        #[serde(default)]
+        container_name: Option<String>,
+        #[serde(default)]
+        payload_path: Option<PathBuf>,
     },
     DataHealth {
         issue_count: usize,
@@ -366,6 +372,9 @@ mod tests {
                 details: EventDetails::Ingest {
                     origin: IngestOrigin::WatchFolder,
                     ingest_kind: IngestKind::MagnetFile,
+                    download_path: Some(PathBuf::from("/downloads")),
+                    container_name: Some("Sample Alpha".to_string()),
+                    payload_path: Some(PathBuf::from("/downloads/Sample Alpha")),
                 },
             }],
         };

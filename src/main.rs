@@ -38,6 +38,8 @@ use std::fs::File;
 use std::io;
 use std::io::Write;
 
+use std::collections::HashSet;
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -45,9 +47,10 @@ use crate::config::Settings;
 use crate::config::{
     clear_persisted_host_id, clear_persisted_shared_config, convert_shared_to_standalone,
     convert_standalone_to_shared, effective_host_id_selection, effective_shared_config_selection,
-    is_shared_config_mode, load_settings, load_settings_for_cli, persisted_host_id_path,
-    persisted_shared_config_path, resolve_command_watch_path, set_persisted_host_id,
-    set_persisted_shared_config, shared_lock_path, HostIdSource, SharedConfigSource,
+    get_watch_path, is_shared_config_mode, load_settings, load_settings_for_cli,
+    persisted_host_id_path, persisted_shared_config_path, resolve_command_watch_path,
+    set_persisted_host_id, set_persisted_shared_config, shared_lock_path, shared_processed_path,
+    HostIdSource, SharedConfigSource,
 };
 use crate::control_service::{
     apply_offline_control_request, apply_offline_purge, control_event_details, list_torrent_files,
@@ -65,8 +68,8 @@ use crate::integrations::control::ControlRequest;
 use crate::integrations::status::{offline_output_json, status_file_path};
 use crate::persistence::event_journal::{
     append_event_journal_entry, event_journal_json, load_event_journal_state,
-    save_event_journal_state, ControlOrigin, EventCategory, EventJournalEntry, EventScope,
-    EventType,
+    save_event_journal_state, ControlOrigin, EventCategory, EventDetails, EventJournalEntry,
+    EventJournalState, EventScope, EventType, IngestKind,
 };
 use crate::torrent_identity::info_hash_from_torrent_source;
 use serde_json::{json, Value};
@@ -753,8 +756,8 @@ fn process_cli_request(
             }
             Ok(())
         }
-        Commands::Journal => {
-            process_journal_command(output_mode)?;
+        Commands::Journal { catalog_recovery } => {
+            process_journal_command(settings, *catalog_recovery, output_mode)?;
             Ok(())
         }
         Commands::SetSharedConfig { path } => process_set_shared_config_command(path, output_mode),
@@ -1135,7 +1138,252 @@ fn process_files_command(
     Ok(())
 }
 
-fn process_journal_command(output_mode: OutputMode) -> io::Result<()> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CatalogRecoveryStatus {
+    AlreadyInCatalog,
+    Recoverable,
+    SourceMissing,
+    SourceHashMismatch,
+    UnsupportedSource,
+}
+
+impl CatalogRecoveryStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::AlreadyInCatalog => "already_in_catalog",
+            Self::Recoverable => "recoverable",
+            Self::SourceMissing => "source_missing",
+            Self::SourceHashMismatch => "source_hash_mismatch",
+            Self::UnsupportedSource => "unsupported_source",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CatalogRecoveryCandidate {
+    event_id: u64,
+    ts_iso: String,
+    info_hash_hex: String,
+    source_path: Option<PathBuf>,
+    payload_path: Option<PathBuf>,
+    recovered_validation_status: bool,
+    status: CatalogRecoveryStatus,
+}
+
+fn catalog_info_hashes(settings: &Settings) -> HashSet<String> {
+    settings
+        .torrents
+        .iter()
+        .filter_map(|torrent| info_hash_from_torrent_source(&torrent.torrent_or_magnet))
+        .map(hex::encode)
+        .collect()
+}
+
+fn processed_source_candidates(source_path: &Path) -> Vec<PathBuf> {
+    let Some(file_name) = source_path.file_name() else {
+        return Vec::new();
+    };
+
+    let mut candidates = Vec::new();
+    if source_path.exists() {
+        candidates.push(source_path.to_path_buf());
+    }
+    if let Some(shared_processed) = shared_processed_path() {
+        candidates.push(shared_processed.join(file_name));
+    }
+    if let Some((_, processed)) = get_watch_path() {
+        candidates.push(processed.join(file_name));
+    }
+    candidates
+}
+
+fn recover_source_from_journal_entry(entry: &EventJournalEntry) -> Option<(String, PathBuf)> {
+    let source_path = entry.source_path.as_ref()?;
+    for candidate in processed_source_candidates(source_path) {
+        if !candidate.exists() {
+            continue;
+        }
+
+        if candidate
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("magnet"))
+        {
+            let Ok(content) = fs::read_to_string(&candidate) else {
+                continue;
+            };
+            let magnet = content.trim();
+            if magnet.starts_with("magnet:") {
+                return Some((magnet.to_string(), candidate));
+            }
+        } else {
+            return Some((candidate.to_string_lossy().to_string(), candidate));
+        }
+    }
+
+    None
+}
+
+fn ingest_payload_path(entry: &EventJournalEntry) -> Option<PathBuf> {
+    match &entry.details {
+        EventDetails::Ingest { payload_path, .. } => payload_path.clone(),
+        _ => None,
+    }
+}
+
+fn recovered_validation_status(entry: &EventJournalEntry) -> bool {
+    ingest_payload_path(entry)
+        .as_deref()
+        .is_some_and(|path| path.exists())
+}
+
+fn analyze_catalog_recovery(
+    settings: &Settings,
+    journal: &EventJournalState,
+) -> Vec<CatalogRecoveryCandidate> {
+    let mut known_hashes = catalog_info_hashes(settings);
+    let mut candidates = Vec::new();
+
+    for entry in journal.entries.iter().rev() {
+        if entry.category != EventCategory::Ingest || entry.event_type != EventType::IngestAdded {
+            continue;
+        }
+        if !matches!(
+            entry.details,
+            EventDetails::Ingest {
+                ingest_kind: IngestKind::MagnetFile
+                    | IngestKind::TorrentFile
+                    | IngestKind::PathFile,
+                ..
+            }
+        ) {
+            continue;
+        }
+
+        let Some(info_hash_hex) = entry
+            .info_hash_hex
+            .as_ref()
+            .map(|value| value.to_ascii_lowercase())
+        else {
+            continue;
+        };
+
+        if known_hashes.contains(&info_hash_hex) {
+            candidates.push(CatalogRecoveryCandidate {
+                event_id: entry.id,
+                ts_iso: entry.ts_iso.clone(),
+                info_hash_hex,
+                source_path: entry.source_path.clone(),
+                payload_path: ingest_payload_path(entry),
+                recovered_validation_status: recovered_validation_status(entry),
+                status: CatalogRecoveryStatus::AlreadyInCatalog,
+            });
+            continue;
+        }
+
+        let status = match recover_source_from_journal_entry(entry) {
+            Some((source, _)) => {
+                if info_hash_from_torrent_source(&source)
+                    .map(|hash| hex::encode(hash).eq_ignore_ascii_case(&info_hash_hex))
+                    .unwrap_or(false)
+                {
+                    known_hashes.insert(info_hash_hex.clone());
+                    CatalogRecoveryStatus::Recoverable
+                } else {
+                    CatalogRecoveryStatus::SourceHashMismatch
+                }
+            }
+            None if entry.source_path.is_some() => CatalogRecoveryStatus::SourceMissing,
+            None => CatalogRecoveryStatus::UnsupportedSource,
+        };
+
+        candidates.push(CatalogRecoveryCandidate {
+            event_id: entry.id,
+            ts_iso: entry.ts_iso.clone(),
+            info_hash_hex,
+            source_path: entry.source_path.clone(),
+            payload_path: ingest_payload_path(entry),
+            recovered_validation_status: recovered_validation_status(entry),
+            status,
+        });
+    }
+
+    candidates.reverse();
+    candidates
+}
+
+fn print_catalog_recovery_report(candidates: &[CatalogRecoveryCandidate], output_mode: OutputMode) {
+    let recoverable = candidates
+        .iter()
+        .filter(|candidate| candidate.status == CatalogRecoveryStatus::Recoverable)
+        .count();
+    let already_in_catalog = candidates
+        .iter()
+        .filter(|candidate| candidate.status == CatalogRecoveryStatus::AlreadyInCatalog)
+        .count();
+
+    if output_mode == OutputMode::Json {
+        print_success(
+            output_mode,
+            "journal",
+            "Analyzed catalog recovery from journal.",
+            json!({
+                "recoverable": recoverable,
+                "already_in_catalog": already_in_catalog,
+                "candidates": candidates.iter().map(|candidate| json!({
+                    "event_id": candidate.event_id,
+                    "ts_iso": candidate.ts_iso,
+                    "info_hash_hex": candidate.info_hash_hex,
+                    "source_path": candidate.source_path,
+                    "payload_path": candidate.payload_path,
+                    "recovered_validation_status": candidate.recovered_validation_status,
+                    "status": candidate.status.as_str(),
+                })).collect::<Vec<_>>(),
+            }),
+        );
+        return;
+    }
+
+    println!(
+        "Catalog recovery: {} recoverable, {} already in catalog",
+        recoverable, already_in_catalog
+    );
+    for candidate in candidates
+        .iter()
+        .filter(|candidate| candidate.status != CatalogRecoveryStatus::AlreadyInCatalog)
+    {
+        println!(
+            "{}\tverified={}\t{}\t{}\t{}\t{}",
+            candidate.status.as_str(),
+            candidate.recovered_validation_status,
+            candidate.info_hash_hex,
+            candidate.event_id,
+            candidate
+                .source_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+            candidate
+                .payload_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string())
+        );
+    }
+}
+
+fn process_journal_command(
+    settings: &Settings,
+    catalog_recovery: bool,
+    output_mode: OutputMode,
+) -> io::Result<()> {
+    if catalog_recovery {
+        let journal = load_event_journal_state();
+        let candidates = analyze_catalog_recovery(settings, &journal);
+        print_catalog_recovery_report(&candidates, output_mode);
+        return Ok(());
+    }
+
     match output_mode {
         OutputMode::Json => {
             let raw = event_journal_json()?;
@@ -1288,7 +1536,22 @@ fn format_event_details(details: &crate::persistence::event_journal::EventDetail
         crate::persistence::event_journal::EventDetails::Ingest {
             origin,
             ingest_kind,
-        } => format!("ingest origin={origin:?} kind={ingest_kind:?}"),
+            download_path,
+            container_name,
+            payload_path,
+        } => {
+            let mut details = format!("ingest origin={origin:?} kind={ingest_kind:?}");
+            if let Some(path) = download_path {
+                details.push_str(&format!(" download_path={}", path.display()));
+            }
+            if let Some(name) = container_name {
+                details.push_str(&format!(" container_name={}", name));
+            }
+            if let Some(path) = payload_path {
+                details.push_str(&format!(" payload_path={}", path.display()));
+            }
+            details
+        }
         crate::persistence::event_journal::EventDetails::DataHealth {
             issue_count,
             issue_files,
@@ -1357,7 +1620,7 @@ fn cli_command_name(command: Option<&Commands>) -> Option<&'static str> {
     match command {
         Some(Commands::Add { .. }) => Some("add"),
         Some(Commands::StopClient) => Some("stop-client"),
-        Some(Commands::Journal) => Some("journal"),
+        Some(Commands::Journal { .. }) => Some("journal"),
         Some(Commands::SetSharedConfig { .. }) => Some("set-shared-config"),
         Some(Commands::ClearSharedConfig) => Some("clear-shared-config"),
         Some(Commands::ShowSharedConfig) => Some("show-shared-config"),
