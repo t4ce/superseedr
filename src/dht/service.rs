@@ -1892,6 +1892,38 @@ impl DhtServiceModel {
     }
 }
 
+struct DhtServiceState {
+    service: DhtServiceModel,
+    demand_planner: DemandPlannerModel,
+    demand_subscribers: DemandSubscriberRegistry,
+    slice_metrics: DemandSliceMetrics,
+    recent_unique_peers: RecentUniquePeers,
+}
+
+impl DhtServiceState {
+    fn new(config: DhtServiceConfig, generation: u64, warning: Option<String>) -> Self {
+        Self {
+            service: DhtServiceModel::new(config, generation, warning),
+            demand_planner: DemandPlannerModel::new(Instant::now()),
+            demand_subscribers: DemandSubscriberRegistry::new(),
+            slice_metrics: DemandSliceMetrics::default(),
+            recent_unique_peers: RecentUniquePeers::new(DHT_UNIQUE_PEERS_FOUND_WINDOW),
+        }
+    }
+
+    fn has_draining_demands(&self) -> bool {
+        self.demand_planner.has_draining_demands()
+    }
+
+    fn record_recent_peers(&mut self, peers: &[SocketAddr]) {
+        self.recent_unique_peers.record_batch(Instant::now(), peers);
+    }
+
+    fn expire_recent_peers(&mut self) {
+        let _ = self.recent_unique_peers.unique_count(Instant::now());
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DhtLifecycleAction {
     StartupBootstrapDue {
@@ -2760,11 +2792,7 @@ async fn run_service(
     drain_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut maintenance_interval = tokio::time::interval(DHT_MAINTENANCE_INTERVAL);
     let mut health_interval = tokio::time::interval(DHT_HEALTH_REFRESH_INTERVAL);
-    let mut service_model = DhtServiceModel::new(config, status_tx.borrow().generation, warning);
-    let mut demand_planner = DemandPlannerModel::new(Instant::now());
-    let mut demand_subscribers = DemandSubscriberRegistry::new();
-    let mut slice_metrics = DemandSliceMetrics::default();
-    let mut recent_unique_peers = RecentUniquePeers::new(DHT_UNIQUE_PEERS_FOUND_WINDOW);
+    let mut service_state = DhtServiceState::new(config, status_tx.borrow().generation, warning);
 
     loop {
         if let Some(active) = active_runtime.as_ref() {
@@ -2777,13 +2805,10 @@ async fn run_service(
                     });
                 apply_dht_lifecycle_effects(
                     reduction.effects,
-                    &mut service_model,
+                    &mut service_state,
                     &mut active_runtime,
                     &status_tx,
                     &command_tx,
-                    &mut demand_planner,
-                    &mut slice_metrics,
-                    &mut recent_unique_peers,
                 )
                 .await;
             }
@@ -2793,7 +2818,7 @@ async fn run_service(
             tokio::select! {
                 biased;
                 _ = shutdown_rx.recv() => LoopEvent::Shutdown,
-                _ = drain_interval.tick(), if demand_planner.has_draining_demands() => LoopEvent::DrainTick,
+                _ = drain_interval.tick(), if service_state.has_draining_demands() => LoopEvent::DrainTick,
                 maybe_command = command_rx.recv() => command_event(maybe_command),
                 _ = demand_tick.tick() => LoopEvent::DemandTick,
                 _ = maintenance_interval.tick() => LoopEvent::MaintenanceTick,
@@ -2803,7 +2828,7 @@ async fn run_service(
         } else {
             tokio::select! {
                 _ = shutdown_rx.recv() => LoopEvent::Shutdown,
-                _ = drain_interval.tick(), if demand_planner.has_draining_demands() => LoopEvent::DrainTick,
+                _ = drain_interval.tick(), if service_state.has_draining_demands() => LoopEvent::DrainTick,
                 maybe_command = command_rx.recv() => command_event(maybe_command),
                 _ = demand_tick.tick() => LoopEvent::DemandTick,
                 _ = maintenance_interval.tick() => LoopEvent::MaintenanceTick,
@@ -2816,13 +2841,10 @@ async fn run_service(
                 let reduction = DhtLifecycleModel::update(DhtLifecycleAction::Shutdown);
                 apply_dht_lifecycle_effects(
                     reduction.effects,
-                    &mut service_model,
+                    &mut service_state,
                     &mut active_runtime,
                     &status_tx,
                     &command_tx,
-                    &mut demand_planner,
-                    &mut slice_metrics,
-                    &mut recent_unique_peers,
                 )
                 .await;
                 break;
@@ -2834,23 +2856,23 @@ async fn run_service(
                             let _ = previous.runtime.save_state().await;
                         }
                         active_runtime = built.active_runtime;
-                        service_model.update(DhtServiceAction::ReconfigureSucceeded {
-                            config: new_config,
-                            warning: built.warning,
-                        })
+                        service_state
+                            .service
+                            .update(DhtServiceAction::ReconfigureSucceeded {
+                                config: new_config,
+                                warning: built.warning,
+                            })
                     }
-                    Err(error) => {
-                        service_model.update(DhtServiceAction::ReconfigureFailed { warning: error })
-                    }
+                    Err(error) => service_state
+                        .service
+                        .update(DhtServiceAction::ReconfigureFailed { warning: error }),
                 };
                 apply_dht_service_effects(
                     reduction.effects,
-                    &service_model,
+                    &mut service_state,
                     &mut active_runtime,
                     &status_tx,
                     &command_tx,
-                    &mut demand_planner,
-                    &mut slice_metrics,
                 )
                 .await;
             }
@@ -2860,88 +2882,83 @@ async fn run_service(
                 subscriber_tx,
                 response_tx,
             }) => {
-                let reduction = demand_subscribers.update(DemandSubscriberAction::Register {
-                    info_hash,
-                    demand,
-                    subscriber_tx,
-                });
+                let reduction =
+                    service_state
+                        .demand_subscribers
+                        .update(DemandSubscriberAction::Register {
+                            info_hash,
+                            demand,
+                            subscriber_tx,
+                        });
                 let _ = response_tx.send(reduction.subscriber_id);
                 apply_demand_subscriber_effects(
-                    &mut demand_subscribers,
+                    &mut service_state,
                     active_runtime.as_mut(),
-                    &mut demand_planner,
                     &command_tx,
-                    &mut slice_metrics,
                     reduction.effects,
                 );
-                start_due_demands(
-                    active_runtime.as_mut(),
-                    &command_tx,
-                    &mut demand_planner,
-                    &mut slice_metrics,
-                )
-                .await;
+                start_due_demands_for_state(&mut active_runtime, &command_tx, &mut service_state)
+                    .await;
             }
             LoopEvent::Command(DhtCommand::UpdateDemand { info_hash, demand }) => {
                 let now = Instant::now();
-                let reduction = demand_planner.update(DemandPlannerAction::DemandUpdated {
-                    info_hash,
-                    demand,
-                    now,
-                });
-                apply_demand_planner_effects(
+                let reduction =
+                    service_state
+                        .demand_planner
+                        .update(DemandPlannerAction::DemandUpdated {
+                            info_hash,
+                            demand,
+                            now,
+                        });
+                apply_demand_planner_effects_for_state(
                     active_runtime.as_mut(),
-                    &mut demand_planner,
                     &command_tx,
-                    &mut slice_metrics,
+                    &mut service_state,
                     reduction.effects,
                 );
-                start_due_demands(
-                    active_runtime.as_mut(),
-                    &command_tx,
-                    &mut demand_planner,
-                    &mut slice_metrics,
-                )
-                .await;
+                start_due_demands_for_state(&mut active_runtime, &command_tx, &mut service_state)
+                    .await;
             }
             LoopEvent::Command(DhtCommand::UnregisterDemand {
                 info_hash,
                 subscriber_id,
             }) => {
-                let reduction = demand_subscribers.update(DemandSubscriberAction::Unregister {
-                    info_hash,
-                    subscriber_id,
-                });
+                let reduction =
+                    service_state
+                        .demand_subscribers
+                        .update(DemandSubscriberAction::Unregister {
+                            info_hash,
+                            subscriber_id,
+                        });
                 apply_demand_subscriber_effects(
-                    &mut demand_subscribers,
+                    &mut service_state,
                     active_runtime.as_mut(),
-                    &mut demand_planner,
                     &command_tx,
-                    &mut slice_metrics,
                     reduction.effects,
                 );
             }
             LoopEvent::Command(DhtCommand::DemandPeers { info_hash, peers }) => {
-                recent_unique_peers.record_batch(Instant::now(), &peers);
-                let reduction = demand_planner.update(DemandPlannerAction::PeersReceived {
-                    info_hash,
-                    peers: &peers,
-                });
-                apply_demand_planner_effects(
+                service_state.record_recent_peers(&peers);
+                let reduction =
+                    service_state
+                        .demand_planner
+                        .update(DemandPlannerAction::PeersReceived {
+                            info_hash,
+                            peers: &peers,
+                        });
+                apply_demand_planner_effects_for_state(
                     active_runtime.as_mut(),
-                    &mut demand_planner,
                     &command_tx,
-                    &mut slice_metrics,
+                    &mut service_state,
                     reduction.effects,
                 );
-                let reduction = demand_subscribers
+                let reduction = service_state
+                    .demand_subscribers
                     .update(DemandSubscriberAction::DeliverPeers { info_hash, peers });
                 apply_demand_subscriber_effects(
-                    &mut demand_subscribers,
+                    &mut service_state,
                     active_runtime.as_mut(),
-                    &mut demand_planner,
                     &command_tx,
-                    &mut slice_metrics,
                     reduction.effects,
                 );
             }
@@ -2952,27 +2969,24 @@ async fn run_service(
                 unique_peers,
             }) => {
                 let now = Instant::now();
-                let reduction = demand_planner.update(DemandPlannerAction::LookupFinished {
-                    info_hash,
-                    slice_class,
-                    total_peers,
-                    unique_peers,
-                    now,
-                });
-                apply_demand_planner_effects(
+                let reduction =
+                    service_state
+                        .demand_planner
+                        .update(DemandPlannerAction::LookupFinished {
+                            info_hash,
+                            slice_class,
+                            total_peers,
+                            unique_peers,
+                            now,
+                        });
+                apply_demand_planner_effects_for_state(
                     active_runtime.as_mut(),
-                    &mut demand_planner,
                     &command_tx,
-                    &mut slice_metrics,
+                    &mut service_state,
                     reduction.effects,
                 );
-                start_due_demands(
-                    active_runtime.as_mut(),
-                    &command_tx,
-                    &mut demand_planner,
-                    &mut slice_metrics,
-                )
-                .await;
+                start_due_demands_for_state(&mut active_runtime, &command_tx, &mut service_state)
+                    .await;
             }
             LoopEvent::Command(DhtCommand::StartGetPeers {
                 info_hash,
@@ -2987,8 +3001,7 @@ async fn run_service(
                     reduction.effects,
                     &mut active_runtime,
                     &command_tx,
-                    &mut demand_planner,
-                    &mut slice_metrics,
+                    &mut service_state,
                 )
                 .await;
             }
@@ -3018,8 +3031,7 @@ async fn run_service(
                     reduction.effects,
                     &mut active_runtime,
                     &command_tx,
-                    &mut demand_planner,
-                    &mut slice_metrics,
+                    &mut service_state,
                 )
                 .await;
             }
@@ -3032,8 +3044,7 @@ async fn run_service(
                     reduction.effects,
                     &mut active_runtime,
                     &command_tx,
-                    &mut demand_planner,
-                    &mut slice_metrics,
+                    &mut service_state,
                 )
                 .await;
             }
@@ -3058,8 +3069,7 @@ async fn run_service(
                     reduction.effects,
                     &mut active_runtime,
                     &command_tx,
-                    &mut demand_planner,
-                    &mut slice_metrics,
+                    &mut service_state,
                 )
                 .await;
             }
@@ -3071,30 +3081,32 @@ async fn run_service(
                     reduction.effects,
                     &mut active_runtime,
                     &command_tx,
-                    &mut demand_planner,
-                    &mut slice_metrics,
+                    &mut service_state,
                 )
                 .await;
             }
             LoopEvent::DrainTick => {
-                let runtime_ready = demand_planner.drain_runtime_readiness(active_runtime.as_ref());
-                let reduction = demand_planner.update(DemandPlannerAction::DrainTick {
-                    now: Instant::now(),
-                    runtime_ready,
-                });
-                let finalized_any = apply_demand_planner_effects(
+                let runtime_ready = service_state
+                    .demand_planner
+                    .drain_runtime_readiness(active_runtime.as_ref());
+                let reduction =
+                    service_state
+                        .demand_planner
+                        .update(DemandPlannerAction::DrainTick {
+                            now: Instant::now(),
+                            runtime_ready,
+                        });
+                let finalized_any = apply_demand_planner_effects_for_state(
                     active_runtime.as_mut(),
-                    &mut demand_planner,
                     &command_tx,
-                    &mut slice_metrics,
+                    &mut service_state,
                     reduction.effects,
                 );
                 if finalized_any {
-                    start_due_demands(
-                        active_runtime.as_mut(),
+                    start_due_demands_for_state(
+                        &mut active_runtime,
                         &command_tx,
-                        &mut demand_planner,
-                        &mut slice_metrics,
+                        &mut service_state,
                     )
                     .await;
                 }
@@ -3114,19 +3126,13 @@ async fn run_service(
                     reduction.effects,
                     &mut active_runtime,
                     &command_tx,
-                    &mut demand_planner,
-                    &mut slice_metrics,
+                    &mut service_state,
                 )
                 .await;
             }
             LoopEvent::DemandTick => {
-                start_due_demands(
-                    active_runtime.as_mut(),
-                    &command_tx,
-                    &mut demand_planner,
-                    &mut slice_metrics,
-                )
-                .await;
+                start_due_demands_for_state(&mut active_runtime, &command_tx, &mut service_state)
+                    .await;
             }
             LoopEvent::MaintenanceTick => {
                 let reduction = DhtLifecycleModel::update(DhtLifecycleAction::MaintenanceTick {
@@ -3136,13 +3142,10 @@ async fn run_service(
                 });
                 apply_dht_lifecycle_effects(
                     reduction.effects,
-                    &mut service_model,
+                    &mut service_state,
                     &mut active_runtime,
                     &status_tx,
                     &command_tx,
-                    &mut demand_planner,
-                    &mut slice_metrics,
-                    &mut recent_unique_peers,
                 )
                 .await;
             }
@@ -3150,13 +3153,10 @@ async fn run_service(
                 let reduction = DhtLifecycleModel::update(DhtLifecycleAction::HealthTick);
                 apply_dht_lifecycle_effects(
                     reduction.effects,
-                    &mut service_model,
+                    &mut service_state,
                     &mut active_runtime,
                     &status_tx,
                     &command_tx,
-                    &mut demand_planner,
-                    &mut slice_metrics,
-                    &mut recent_unique_peers,
                 )
                 .await;
             }
@@ -3167,13 +3167,10 @@ async fn run_service(
                 });
                 apply_dht_lifecycle_effects(
                     reduction.effects,
-                    &mut service_model,
+                    &mut service_state,
                     &mut active_runtime,
                     &status_tx,
                     &command_tx,
-                    &mut demand_planner,
-                    &mut slice_metrics,
-                    &mut recent_unique_peers,
                 )
                 .await;
             }
@@ -3182,44 +3179,67 @@ async fn run_service(
         publish_wave_telemetry(
             &wave_telemetry_tx,
             active_runtime.as_ref(),
-            &mut recent_unique_peers,
+            &mut service_state.recent_unique_peers,
         );
     }
 }
 
+async fn start_due_demands_for_state(
+    active_runtime: &mut Option<ActiveRuntime>,
+    command_tx: &DhtCommandSender,
+    service_state: &mut DhtServiceState,
+) {
+    start_due_demands(
+        active_runtime.as_mut(),
+        command_tx,
+        &mut service_state.demand_planner,
+        &mut service_state.slice_metrics,
+    )
+    .await;
+}
+
+fn apply_demand_planner_effects_for_state(
+    active_runtime: Option<&mut ActiveRuntime>,
+    command_tx: &DhtCommandSender,
+    service_state: &mut DhtServiceState,
+    effects: Vec<DemandPlannerEffect>,
+) -> bool {
+    apply_demand_planner_effects(
+        active_runtime,
+        &mut service_state.demand_planner,
+        command_tx,
+        &mut service_state.slice_metrics,
+        effects,
+    )
+}
+
 async fn apply_dht_service_effects(
     effects: Vec<DhtServiceEffect>,
-    service_model: &DhtServiceModel,
+    service_state: &mut DhtServiceState,
     active_runtime: &mut Option<ActiveRuntime>,
     status_tx: &watch::Sender<DhtStatus>,
     command_tx: &DhtCommandSender,
-    demand_planner: &mut DemandPlannerModel,
-    slice_metrics: &mut DemandSliceMetrics,
 ) {
     for effect in effects {
         match effect {
             DhtServiceEffect::ResetDemandPlanner => {
-                demand_planner.update(DemandPlannerAction::RuntimeReset {
-                    now: Instant::now(),
-                });
+                service_state
+                    .demand_planner
+                    .update(DemandPlannerAction::RuntimeReset {
+                        now: Instant::now(),
+                    });
             }
             DhtServiceEffect::PublishStatus => {
                 publish_status(
                     status_tx,
                     active_runtime.as_ref(),
-                    service_model.warning_owned(),
-                    service_model.generation(),
-                    service_model.config().preferred_backend,
+                    service_state.service.warning_owned(),
+                    service_state.service.generation(),
+                    service_state.service.config().preferred_backend,
                 );
             }
             DhtServiceEffect::StartDueDemands => {
-                start_due_demands(
-                    active_runtime.as_mut(),
-                    command_tx,
-                    demand_planner,
-                    slice_metrics,
-                )
-                .await;
+                start_due_demands_for_state(active_runtime, command_tx, service_state).await;
             }
         }
     }
@@ -3227,13 +3247,10 @@ async fn apply_dht_service_effects(
 
 async fn apply_dht_lifecycle_effects(
     effects: Vec<DhtLifecycleEffect>,
-    service_model: &mut DhtServiceModel,
+    service_state: &mut DhtServiceState,
     active_runtime: &mut Option<ActiveRuntime>,
     status_tx: &watch::Sender<DhtStatus>,
     command_tx: &DhtCommandSender,
-    demand_planner: &mut DemandPlannerModel,
-    slice_metrics: &mut DemandSliceMetrics,
-    recent_unique_peers: &mut RecentUniquePeers,
 ) {
     let mut pending_effects = VecDeque::from(effects);
 
@@ -3280,16 +3297,16 @@ async fn apply_dht_lifecycle_effects(
                 warning,
                 publish_status,
             } => {
-                let reduction = service_model.update(DhtServiceAction::RuntimeWarning { warning });
+                let reduction = service_state
+                    .service
+                    .update(DhtServiceAction::RuntimeWarning { warning });
                 if publish_status {
                     apply_dht_service_effects(
                         reduction.effects,
-                        service_model,
+                        service_state,
                         active_runtime,
                         status_tx,
                         command_tx,
-                        demand_planner,
-                        slice_metrics,
                     )
                     .await;
                 }
@@ -3298,13 +3315,13 @@ async fn apply_dht_lifecycle_effects(
                 publish_status(
                     status_tx,
                     active_runtime.as_ref(),
-                    service_model.warning_owned(),
-                    service_model.generation(),
-                    service_model.config().preferred_backend,
+                    service_state.service.warning_owned(),
+                    service_state.service.generation(),
+                    service_state.service.config().preferred_backend,
                 );
             }
             DhtLifecycleEffect::ExpireRecentUniquePeers => {
-                let _ = recent_unique_peers.unique_count(Instant::now());
+                service_state.expire_recent_peers();
             }
             DhtLifecycleEffect::SaveRuntimeState => {
                 if let Some(active) = active_runtime.as_ref() {
@@ -3316,13 +3333,17 @@ async fn apply_dht_lifecycle_effects(
 }
 
 fn apply_demand_subscriber_effects(
-    demand_subscribers: &mut DemandSubscriberRegistry,
+    service_state: &mut DhtServiceState,
     mut active_runtime: Option<&mut ActiveRuntime>,
-    demand_planner: &mut DemandPlannerModel,
     command_tx: &DhtCommandSender,
-    slice_metrics: &mut DemandSliceMetrics,
     effects: Vec<DemandSubscriberEffect>,
 ) {
+    let DhtServiceState {
+        demand_planner,
+        demand_subscribers,
+        slice_metrics,
+        ..
+    } = service_state;
     let mut pending_effects = VecDeque::from(effects);
 
     while let Some(effect) = pending_effects.pop_front() {
@@ -3389,8 +3410,7 @@ async fn apply_dht_runtime_command_effects(
     effects: Vec<DhtRuntimeCommandEffect>,
     active_runtime: &mut Option<ActiveRuntime>,
     command_tx: &DhtCommandSender,
-    demand_planner: &mut DemandPlannerModel,
-    slice_metrics: &mut DemandSliceMetrics,
+    service_state: &mut DhtServiceState,
 ) {
     for effect in effects {
         match effect {
@@ -3401,7 +3421,7 @@ async fn apply_dht_runtime_command_effects(
                 let result = start_get_peers_lookup(
                     active_runtime.as_mut(),
                     command_tx,
-                    demand_planner,
+                    &mut service_state.demand_planner,
                     None,
                     info_hash,
                     DemandSliceClass::RoutineRefresh,
@@ -3413,9 +3433,9 @@ async fn apply_dht_runtime_command_effects(
             DhtRuntimeCommandEffect::AttachLookupFamily(request) => {
                 let _ = attach_lookup_family(
                     active_runtime.as_mut(),
-                    demand_planner,
+                    &mut service_state.demand_planner,
                     if request.record_metrics {
-                        Some(slice_metrics)
+                        Some(&mut service_state.slice_metrics)
                     } else {
                         None
                     },
@@ -3444,28 +3464,30 @@ async fn apply_dht_runtime_command_effects(
                 unique_peers,
                 lookup_ids,
             } => {
-                let requested = demand_planner.update(DemandPlannerAction::LookupParkRequested {
-                    info_hash,
-                    slice_class,
-                    stop_reason,
-                    total_peers,
-                    unique_peers,
-                    lookup_ids,
-                });
-                apply_demand_planner_effects(
+                let requested =
+                    service_state
+                        .demand_planner
+                        .update(DemandPlannerAction::LookupParkRequested {
+                            info_hash,
+                            slice_class,
+                            stop_reason,
+                            total_peers,
+                            unique_peers,
+                            lookup_ids,
+                        });
+                apply_demand_planner_effects_for_state(
                     active_runtime.as_mut(),
-                    demand_planner,
                     command_tx,
-                    slice_metrics,
+                    service_state,
                     requested.effects,
                 );
             }
             DhtRuntimeCommandEffect::FinalizeDrainedDemandLookups { info_hash } => {
                 finish_drained_demand_lookup(
                     active_runtime.as_mut(),
-                    demand_planner,
+                    &mut service_state.demand_planner,
                     command_tx,
-                    slice_metrics,
+                    &mut service_state.slice_metrics,
                     info_hash,
                     false,
                 );
@@ -3479,13 +3501,7 @@ async fn apply_dht_runtime_command_effects(
                 let _ = response_tx.send(success);
             }
             DhtRuntimeCommandEffect::StartDueDemands => {
-                start_due_demands(
-                    active_runtime.as_mut(),
-                    command_tx,
-                    demand_planner,
-                    slice_metrics,
-                )
-                .await;
+                start_due_demands_for_state(active_runtime, command_tx, service_state).await;
             }
         }
     }
@@ -6068,6 +6084,26 @@ mod tests {
         assert_eq!(model.generation(), 11);
         assert_eq!(model.warning_owned().as_deref(), Some("maintenance failed"));
         assert_eq!(reduction.effects, vec![DhtServiceEffect::PublishStatus]);
+    }
+
+    #[test]
+    fn dht_service_state_initializes_helper_models() {
+        let config = disabled_service_config();
+        let mut state =
+            DhtServiceState::new(config.clone(), 42, Some("initial warning".to_string()));
+
+        assert_eq!(state.service.config(), &config);
+        assert_eq!(state.service.generation(), 42);
+        assert_eq!(
+            state.service.warning_owned().as_deref(),
+            Some("initial warning")
+        );
+        assert!(!state.has_draining_demands());
+        assert!(state.demand_subscribers.subscribers.is_empty());
+
+        state.record_recent_peers(&[peer("198.51.100.30:6881")]);
+        assert_eq!(state.recent_unique_peers.unique_count(Instant::now()), 1);
+        state.expire_recent_peers();
     }
 
     #[test]
