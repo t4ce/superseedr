@@ -71,7 +71,7 @@ use crate::persistence::event_journal::{
     save_event_journal_state, ControlOrigin, EventCategory, EventDetails, EventJournalEntry,
     EventJournalState, EventScope, EventType, IngestKind,
 };
-use crate::torrent_identity::info_hash_from_torrent_source;
+use crate::torrent_identity::{info_hash_from_torrent_bytes, info_hash_from_torrent_source};
 use serde_json::{json, Value};
 
 use tracing_appender::rolling::RollingFileAppender;
@@ -1199,29 +1199,56 @@ fn processed_source_candidates(source_path: &Path) -> Vec<PathBuf> {
 
 fn recover_source_from_journal_entry(entry: &EventJournalEntry) -> Option<(String, PathBuf)> {
     let source_path = entry.source_path.as_ref()?;
+    let ingest_kind = match &entry.details {
+        EventDetails::Ingest { ingest_kind, .. } => *ingest_kind,
+        _ => return None,
+    };
+
     for candidate in processed_source_candidates(source_path) {
         if !candidate.exists() {
             continue;
         }
 
-        if candidate
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("magnet"))
-        {
-            let Ok(content) = fs::read_to_string(&candidate) else {
-                continue;
-            };
-            let magnet = content.trim();
-            if magnet.starts_with("magnet:") {
-                return Some((magnet.to_string(), candidate));
+        match ingest_kind {
+            IngestKind::MagnetFile => {
+                let Ok(content) = fs::read_to_string(&candidate) else {
+                    continue;
+                };
+                let magnet = content.trim();
+                if magnet.starts_with("magnet:") {
+                    return Some((magnet.to_string(), candidate));
+                }
             }
-        } else {
-            return Some((candidate.to_string_lossy().to_string(), candidate));
+            IngestKind::PathFile => {
+                let Ok(content) = fs::read_to_string(&candidate) else {
+                    continue;
+                };
+                let Ok(torrent_path) =
+                    crate::config::resolve_shared_cli_torrent_path(Path::new(content.trim()))
+                else {
+                    continue;
+                };
+                if torrent_path.exists() {
+                    return Some((torrent_path.to_string_lossy().to_string(), torrent_path));
+                }
+            }
+            IngestKind::TorrentFile => {
+                return Some((candidate.to_string_lossy().to_string(), candidate));
+            }
         }
     }
 
     None
+}
+
+fn recovered_source_info_hash(source: &str, recovered_path: &Path) -> Option<Vec<u8>> {
+    if source.starts_with("magnet:") {
+        return info_hash_from_torrent_source(source);
+    }
+
+    fs::read(recovered_path)
+        .ok()
+        .and_then(|bytes| info_hash_from_torrent_bytes(&bytes))
 }
 
 fn ingest_payload_path(entry: &EventJournalEntry) -> Option<PathBuf> {
@@ -1282,8 +1309,8 @@ fn analyze_catalog_recovery(
         }
 
         let status = match recover_source_from_journal_entry(entry) {
-            Some((source, _)) => {
-                if info_hash_from_torrent_source(&source)
+            Some((source, recovered_path)) => {
+                if recovered_source_info_hash(&source, &recovered_path)
                     .map(|hash| hex::encode(hash).eq_ignore_ascii_case(&info_hash_hex))
                     .unwrap_or(false)
                 {
@@ -1814,6 +1841,55 @@ mod tests {
         (dir, path.to_string_lossy().to_string())
     }
 
+    fn write_recovery_torrent_file(file_name: &str) -> (tempfile::TempDir, PathBuf, String) {
+        let dir = tempdir().expect("create tempdir");
+        let torrent = crate::torrent_file::Torrent {
+            info: crate::torrent_file::Info {
+                name: "sample-recovery-pack".to_string(),
+                piece_length: 16_384,
+                pieces: vec![1; 20],
+                files: vec![crate::torrent_file::InfoFile {
+                    length: 12,
+                    path: vec!["payload".to_string(), "item.bin".to_string()],
+                    md5sum: None,
+                    attr: None,
+                }],
+                ..Default::default()
+            },
+            announce: Some("http://tracker.test".to_string()),
+            ..Default::default()
+        };
+        let bytes = serde_bencode::to_bytes(&torrent).expect("serialize recovery torrent");
+        let info_hash_hex =
+            hex::encode(info_hash_from_torrent_bytes(&bytes).expect("recovery torrent info hash"));
+        let path = dir.path().join(file_name);
+        fs::write(&path, bytes).expect("write recovery torrent fixture");
+        (dir, path, info_hash_hex)
+    }
+
+    fn ingest_added_entry(
+        info_hash_hex: String,
+        source_path: PathBuf,
+        ingest_kind: IngestKind,
+    ) -> EventJournalEntry {
+        EventJournalEntry {
+            id: 1,
+            ts_iso: "2026-01-01T00:00:00Z".to_string(),
+            category: EventCategory::Ingest,
+            event_type: EventType::IngestAdded,
+            info_hash_hex: Some(info_hash_hex),
+            source_path: Some(source_path),
+            details: EventDetails::Ingest {
+                origin: crate::persistence::event_journal::IngestOrigin::WatchFolder,
+                ingest_kind,
+                download_path: None,
+                container_name: None,
+                payload_path: None,
+            },
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn offline_pause_updates_torrent_control_state() {
         let mut settings = sample_settings();
@@ -1857,6 +1933,48 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(settings.torrents.is_empty());
+    }
+
+    #[test]
+    fn catalog_recovery_validates_torrent_file_contents_for_normal_filename() {
+        let (_dir, torrent_path, info_hash_hex) =
+            write_recovery_torrent_file("manual-input.torrent");
+        let journal = EventJournalState {
+            next_id: 2,
+            entries: vec![ingest_added_entry(
+                info_hash_hex.clone(),
+                torrent_path,
+                IngestKind::TorrentFile,
+            )],
+        };
+
+        let candidates = analyze_catalog_recovery(&Settings::default(), &journal);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].info_hash_hex, info_hash_hex);
+        assert_eq!(candidates[0].status, CatalogRecoveryStatus::Recoverable);
+    }
+
+    #[test]
+    fn catalog_recovery_validates_path_file_by_referenced_torrent_contents() {
+        let (dir, torrent_path, info_hash_hex) = write_recovery_torrent_file("payload.torrent");
+        let path_file = dir.path().join("manual-input.path");
+        fs::write(&path_file, torrent_path.to_string_lossy().as_bytes())
+            .expect("write path fixture");
+        let journal = EventJournalState {
+            next_id: 2,
+            entries: vec![ingest_added_entry(
+                info_hash_hex.clone(),
+                path_file,
+                IngestKind::PathFile,
+            )],
+        };
+
+        let candidates = analyze_catalog_recovery(&Settings::default(), &journal);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].info_hash_hex, info_hash_hex);
+        assert_eq!(candidates[0].status, CatalogRecoveryStatus::Recoverable);
     }
 
     #[test]
