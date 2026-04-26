@@ -91,7 +91,10 @@ use self::effects::*;
 use self::lifecycle::{DhtLifecycleAction, DhtLifecycleEffect, DhtLifecycleModel};
 use self::planner::*;
 pub(super) use self::runtime::*;
-use self::state::{DhtServiceAction, DhtServiceEffect, DhtServiceModel, DhtServiceState};
+use self::state::{
+    DhtDemandCommandAction, DhtDemandCommandEffect, DhtServiceAction, DhtServiceEffect,
+    DhtServiceModel, DhtServiceState,
+};
 use self::status::*;
 use self::subscribers::{DemandSubscriberAction, DemandSubscriberEffect, DemandSubscriberRegistry};
 

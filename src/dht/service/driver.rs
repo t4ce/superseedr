@@ -130,84 +130,65 @@ pub(in crate::dht::service) async fn run_service(
                 response_tx,
             }) => {
                 let reduction =
-                    service_state
-                        .demand_subscribers
-                        .update(DemandSubscriberAction::Register {
-                            info_hash,
-                            demand,
-                            subscriber_tx,
-                        });
-                let _ = response_tx.send(reduction.subscriber_id);
-                apply_demand_subscriber_effects(
-                    &mut service_state,
-                    active_runtime.as_mut(),
-                    &command_tx,
+                    service_state.update_demand_command(DhtDemandCommandAction::Register {
+                        info_hash,
+                        demand,
+                        subscriber_tx,
+                        response_tx,
+                    });
+                apply_dht_demand_command_effects(
                     reduction.effects,
-                );
-                start_due_demands_for_state(&mut active_runtime, &command_tx, &mut service_state)
-                    .await;
+                    &mut service_state,
+                    &mut active_runtime,
+                    &command_tx,
+                )
+                .await;
             }
             LoopEvent::Command(DhtCommand::UpdateDemand { info_hash, demand }) => {
-                let now = Instant::now();
                 let reduction =
-                    service_state
-                        .demand_planner
-                        .update(DemandPlannerAction::DemandUpdated {
-                            info_hash,
-                            demand,
-                            now,
-                        });
-                apply_demand_planner_effects_for_state(
-                    active_runtime.as_mut(),
-                    &command_tx,
-                    &mut service_state,
+                    service_state.update_demand_command(DhtDemandCommandAction::Update {
+                        info_hash,
+                        demand,
+                        now: Instant::now(),
+                    });
+                apply_dht_demand_command_effects(
                     reduction.effects,
-                );
-                start_due_demands_for_state(&mut active_runtime, &command_tx, &mut service_state)
-                    .await;
+                    &mut service_state,
+                    &mut active_runtime,
+                    &command_tx,
+                )
+                .await;
             }
             LoopEvent::Command(DhtCommand::UnregisterDemand {
                 info_hash,
                 subscriber_id,
             }) => {
                 let reduction =
-                    service_state
-                        .demand_subscribers
-                        .update(DemandSubscriberAction::Unregister {
-                            info_hash,
-                            subscriber_id,
-                        });
-                apply_demand_subscriber_effects(
-                    &mut service_state,
-                    active_runtime.as_mut(),
-                    &command_tx,
+                    service_state.update_demand_command(DhtDemandCommandAction::Unregister {
+                        info_hash,
+                        subscriber_id,
+                    });
+                apply_dht_demand_command_effects(
                     reduction.effects,
-                );
+                    &mut service_state,
+                    &mut active_runtime,
+                    &command_tx,
+                )
+                .await;
             }
             LoopEvent::Command(DhtCommand::DemandPeers { info_hash, peers }) => {
-                service_state.record_recent_peers(&peers);
                 let reduction =
-                    service_state
-                        .demand_planner
-                        .update(DemandPlannerAction::PeersReceived {
-                            info_hash,
-                            peers: &peers,
-                        });
-                apply_demand_planner_effects_for_state(
-                    active_runtime.as_mut(),
-                    &command_tx,
-                    &mut service_state,
+                    service_state.update_demand_command(DhtDemandCommandAction::PeersReceived {
+                        info_hash,
+                        peers,
+                    });
+                apply_dht_demand_command_effects(
                     reduction.effects,
-                );
-                let reduction = service_state
-                    .demand_subscribers
-                    .update(DemandSubscriberAction::DeliverPeers { info_hash, peers });
-                apply_demand_subscriber_effects(
                     &mut service_state,
-                    active_runtime.as_mut(),
+                    &mut active_runtime,
                     &command_tx,
-                    reduction.effects,
-                );
+                )
+                .await;
             }
             LoopEvent::Command(DhtCommand::DemandLookupFinished {
                 info_hash,
@@ -215,25 +196,21 @@ pub(in crate::dht::service) async fn run_service(
                 total_peers,
                 unique_peers,
             }) => {
-                let now = Instant::now();
                 let reduction =
-                    service_state
-                        .demand_planner
-                        .update(DemandPlannerAction::LookupFinished {
-                            info_hash,
-                            slice_class,
-                            total_peers,
-                            unique_peers,
-                            now,
-                        });
-                apply_demand_planner_effects_for_state(
-                    active_runtime.as_mut(),
-                    &command_tx,
-                    &mut service_state,
+                    service_state.update_demand_command(DhtDemandCommandAction::LookupFinished {
+                        info_hash,
+                        slice_class,
+                        total_peers,
+                        unique_peers,
+                        now: Instant::now(),
+                    });
+                apply_dht_demand_command_effects(
                     reduction.effects,
-                );
-                start_due_demands_for_state(&mut active_runtime, &command_tx, &mut service_state)
-                    .await;
+                    &mut service_state,
+                    &mut active_runtime,
+                    &command_tx,
+                )
+                .await;
             }
             LoopEvent::Command(DhtCommand::StartGetPeers {
                 info_hash,

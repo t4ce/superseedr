@@ -64,6 +64,43 @@ pub(in crate::dht::service) async fn apply_dht_service_effects(
     }
 }
 
+pub(in crate::dht::service) async fn apply_dht_demand_command_effects(
+    effects: Vec<DhtDemandCommandEffect>,
+    service_state: &mut DhtServiceState,
+    active_runtime: &mut Option<ActiveRuntime>,
+    command_tx: &DhtCommandSender,
+) {
+    for effect in effects {
+        match effect {
+            DhtDemandCommandEffect::SendRegisterResponse {
+                response_tx,
+                subscriber_id,
+            } => {
+                let _ = response_tx.send(subscriber_id);
+            }
+            DhtDemandCommandEffect::ApplySubscriberEffects(effects) => {
+                apply_demand_subscriber_effects(
+                    service_state,
+                    active_runtime.as_mut(),
+                    command_tx,
+                    effects,
+                );
+            }
+            DhtDemandCommandEffect::ApplyPlannerEffects(effects) => {
+                apply_demand_planner_effects_for_state(
+                    active_runtime.as_mut(),
+                    command_tx,
+                    service_state,
+                    effects,
+                );
+            }
+            DhtDemandCommandEffect::StartDueDemands => {
+                start_due_demands_for_state(active_runtime, command_tx, service_state).await;
+            }
+        }
+    }
+}
+
 pub(in crate::dht::service) async fn apply_dht_lifecycle_effects(
     effects: Vec<DhtLifecycleEffect>,
     service_state: &mut DhtServiceState,

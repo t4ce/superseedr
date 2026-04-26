@@ -95,3 +95,139 @@ fn dht_service_state_initializes_helper_models() {
     assert_eq!(state.recent_unique_peers.unique_count(Instant::now()), 1);
     state.expire_recent_peers();
 }
+
+#[test]
+fn dht_demand_command_register_and_unregister_emit_subscriber_effects() {
+    let config = disabled_service_config();
+    let mut state = DhtServiceState::new(config, 0, None);
+    let info_hash = hash_index(90);
+    let (subscriber_tx, _subscriber_rx) = mpsc::unbounded_channel();
+    let (response_tx, mut response_rx) = oneshot::channel();
+    let demand = DhtDemandState {
+        awaiting_metadata: true,
+        connected_peers: 0,
+    };
+
+    let reduction = state.update_demand_command(DhtDemandCommandAction::Register {
+        info_hash,
+        demand,
+        subscriber_tx,
+        response_tx,
+    });
+
+    assert_eq!(state.demand_subscribers.subscriber_count(info_hash), 1);
+    let mut effects = reduction.effects.into_iter();
+    let Some(DhtDemandCommandEffect::SendRegisterResponse {
+        response_tx,
+        subscriber_id,
+    }) = effects.next()
+    else {
+        panic!("expected register response effect");
+    };
+    assert_eq!(subscriber_id, Some(1));
+    response_tx.send(subscriber_id).expect("send subscriber id");
+    assert_eq!(response_rx.try_recv(), Ok(Some(1)));
+
+    let Some(DhtDemandCommandEffect::ApplySubscriberEffects(subscriber_effects)) = effects.next()
+    else {
+        panic!("expected subscriber effects");
+    };
+    assert_eq!(subscriber_effects.len(), 1);
+    assert!(matches!(
+        subscriber_effects.as_slice(),
+        [DemandSubscriberEffect::Registered {
+            info_hash: registered_hash,
+            demand: registered_demand,
+            subscriber_id: 1,
+        }] if *registered_hash == info_hash && *registered_demand == demand
+    ));
+    assert!(matches!(
+        effects.next(),
+        Some(DhtDemandCommandEffect::StartDueDemands)
+    ));
+    assert!(effects.next().is_none());
+
+    let reduction = state.update_demand_command(DhtDemandCommandAction::Unregister {
+        info_hash,
+        subscriber_id: 1,
+    });
+
+    assert_eq!(state.demand_subscribers.subscriber_count(info_hash), 0);
+    let mut effects = reduction.effects.into_iter();
+    let Some(DhtDemandCommandEffect::ApplySubscriberEffects(subscriber_effects)) = effects.next()
+    else {
+        panic!("expected subscriber removal effects");
+    };
+    assert!(matches!(
+        subscriber_effects.as_slice(),
+        [DemandSubscriberEffect::SubscriberRemoved { info_hash: removed_hash }]
+            if *removed_hash == info_hash
+    ));
+    assert!(effects.next().is_none());
+}
+
+#[test]
+fn dht_demand_command_peer_and_finish_actions_emit_planner_followups() {
+    let config = disabled_service_config();
+    let mut state = DhtServiceState::new(config, 0, None);
+    let info_hash = hash_index(91);
+    let (subscriber_tx, _subscriber_rx) = mpsc::unbounded_channel();
+    let (response_tx, _response_rx) = oneshot::channel();
+
+    let _ = state.update_demand_command(DhtDemandCommandAction::Register {
+        info_hash,
+        demand: DhtDemandState {
+            awaiting_metadata: false,
+            connected_peers: 0,
+        },
+        subscriber_tx,
+        response_tx,
+    });
+
+    let peers = vec![peer("127.0.0.91:6881")];
+    let reduction = state.update_demand_command(DhtDemandCommandAction::PeersReceived {
+        info_hash,
+        peers: peers.clone(),
+    });
+
+    assert_eq!(state.recent_unique_peers.unique_count(Instant::now()), 1);
+    let mut effects = reduction.effects.into_iter();
+    assert!(matches!(
+        effects.next(),
+        Some(DhtDemandCommandEffect::ApplyPlannerEffects(_))
+    ));
+    let Some(DhtDemandCommandEffect::ApplySubscriberEffects(subscriber_effects)) = effects.next()
+    else {
+        panic!("expected subscriber delivery effects");
+    };
+    assert!(matches!(
+        subscriber_effects.as_slice(),
+        [DemandSubscriberEffect::DeliverPeers {
+            info_hash: delivered_hash,
+            peers: delivered_peers,
+            deliveries,
+        }] if *delivered_hash == info_hash
+            && delivered_peers == &peers
+            && deliveries.len() == 1
+    ));
+    assert!(effects.next().is_none());
+
+    let reduction = state.update_demand_command(DhtDemandCommandAction::LookupFinished {
+        info_hash,
+        slice_class: DemandSliceClass::NoConnectedPeers,
+        total_peers: 1,
+        unique_peers: 1,
+        now: Instant::now(),
+    });
+
+    let mut effects = reduction.effects.into_iter();
+    assert!(matches!(
+        effects.next(),
+        Some(DhtDemandCommandEffect::ApplyPlannerEffects(_))
+    ));
+    assert!(matches!(
+        effects.next(),
+        Some(DhtDemandCommandEffect::StartDueDemands)
+    ));
+    assert!(effects.next().is_none());
+}
