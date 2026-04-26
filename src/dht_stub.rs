@@ -166,7 +166,16 @@ pub mod service {
             self.status_rx.borrow().warning.clone()
         }
 
-        pub fn reconfigure(&self, _config: DhtServiceConfig) {}
+        pub fn reconfigure(&self, config: DhtServiceConfig) {
+            #[cfg(test)]
+            if let Some(recorder) = &self.handle.recorder {
+                recorder
+                    .reconfigure_requests
+                    .lock()
+                    .expect("test dht reconfigure recorder lock")
+                    .push(config);
+            }
+        }
     }
 
     #[cfg(test)]
@@ -231,6 +240,7 @@ pub mod service {
     #[derive(Debug, Clone, Default)]
     pub(crate) struct TestDhtRecorder {
         announce_requests: Arc<StdMutex<Vec<(Vec<u8>, Option<u16>)>>>,
+        reconfigure_requests: Arc<StdMutex<Vec<DhtServiceConfig>>>,
     }
 
     #[cfg(test)]
@@ -239,6 +249,13 @@ pub mod service {
             self.announce_requests
                 .lock()
                 .expect("test dht recorder lock")
+                .clone()
+        }
+
+        pub(crate) fn recorded_reconfigures(&self) -> Vec<DhtServiceConfig> {
+            self.reconfigure_requests
+                .lock()
+                .expect("test dht reconfigure recorder lock")
                 .clone()
         }
     }

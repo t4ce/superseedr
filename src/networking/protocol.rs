@@ -891,6 +891,7 @@ mod tests {
                 serde_bencode::from_bytes(&payload_bytes).unwrap();
 
             assert_eq!(payload.metadata_size, Some(metadata_size));
+            #[cfg(feature = "pex")]
             assert!(payload.m.contains_key("ut_pex"));
             assert!(payload.m.contains_key("ut_metadata"));
         } else {
