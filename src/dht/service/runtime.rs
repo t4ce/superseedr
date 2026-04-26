@@ -178,7 +178,7 @@ pub(in crate::dht::service) async fn start_get_peers_lookup(
             attach_lookup_family(
                 Some(active_runtime),
                 demand_planner,
-                slice_metrics.as_deref_mut(),
+                slice_metrics,
                 info_hash,
                 AddressFamily::Ipv6,
                 slice_class,
