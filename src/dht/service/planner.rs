@@ -3,6 +3,10 @@
 
 use super::*;
 
+#[cfg(test)]
+#[path = "planner_tests.rs"]
+mod tests;
+
 #[derive(Debug, Clone)]
 pub(super) struct ActiveDemandLookup {
     pub(super) lookup_ids: Arc<StdMutex<Vec<LookupId>>>,
