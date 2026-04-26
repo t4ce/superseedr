@@ -13,8 +13,20 @@ mod drain;
 pub(super) use drain::*;
 
 #[cfg(test)]
-#[path = "planner_tests.rs"]
-mod tests;
+#[path = "planner/test_support.rs"]
+mod test_support;
+
+#[cfg(test)]
+#[path = "planner/selection_tests.rs"]
+mod selection_tests;
+
+#[cfg(test)]
+#[path = "planner/drain_tests.rs"]
+mod drain_tests;
+
+#[cfg(test)]
+#[path = "planner/reducer_tests.rs"]
+mod reducer_tests;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct DemandPlannerActionView {
