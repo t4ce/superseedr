@@ -7,7 +7,8 @@ use std::time::Instant;
 use super::{
     DemandPlannerAction, DemandPlannerEffect, DemandPlannerModel, DemandSliceClass,
     DemandSliceMetrics, DemandSubscriberAction, DemandSubscriberEffect, DemandSubscriberRegistry,
-    DhtDemandState, DhtServiceConfig, InfoHash, RecentUniquePeers, DHT_UNIQUE_PEERS_FOUND_WINDOW,
+    DhtCommand, DhtDemandState, DhtServiceConfig, InfoHash, RecentUniquePeers,
+    DHT_UNIQUE_PEERS_FOUND_WINDOW,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -172,6 +173,61 @@ impl DhtServiceState {
 
     pub(super) fn expire_recent_peers(&mut self) {
         let _ = self.recent_unique_peers.unique_count(Instant::now());
+    }
+
+    pub(in crate::dht::service) fn update_demand_command_from_command(
+        &mut self,
+        command: DhtCommand,
+        now: Instant,
+    ) -> Option<DhtDemandCommandReduction> {
+        let action = match command {
+            DhtCommand::RegisterDemand {
+                info_hash,
+                demand,
+                subscriber_tx,
+                response_tx,
+            } => DhtDemandCommandAction::Register {
+                info_hash,
+                demand,
+                subscriber_tx,
+                response_tx,
+            },
+            DhtCommand::UpdateDemand { info_hash, demand } => DhtDemandCommandAction::Update {
+                info_hash,
+                demand,
+                now,
+            },
+            DhtCommand::UnregisterDemand {
+                info_hash,
+                subscriber_id,
+            } => DhtDemandCommandAction::Unregister {
+                info_hash,
+                subscriber_id,
+            },
+            DhtCommand::DemandPeers { info_hash, peers } => {
+                DhtDemandCommandAction::PeersReceived { info_hash, peers }
+            }
+            DhtCommand::DemandLookupFinished {
+                info_hash,
+                slice_class,
+                total_peers,
+                unique_peers,
+            } => DhtDemandCommandAction::LookupFinished {
+                info_hash,
+                slice_class,
+                total_peers,
+                unique_peers,
+                now,
+            },
+            DhtCommand::Reconfigure(_)
+            | DhtCommand::StartGetPeers { .. }
+            | DhtCommand::StartGetPeersFamily { .. }
+            | DhtCommand::CancelLookups { .. }
+            | DhtCommand::ParkDemandLookups { .. }
+            | DhtCommand::FinalizeDrainedDemandLookups { .. }
+            | DhtCommand::AnnouncePeer { .. } => return None,
+        };
+        Some(self.update_demand_command(action))
     }
 
     pub(in crate::dht::service) fn update_demand_command(

@@ -97,6 +97,55 @@ fn dht_service_state_initializes_helper_models() {
 }
 
 #[test]
+fn dht_service_state_reduces_demand_commands_only() {
+    let config = disabled_service_config();
+    let mut state = DhtServiceState::new(config, 0, None);
+    let info_hash = hash_index(89);
+    let (subscriber_tx, _subscriber_rx) = mpsc::unbounded_channel();
+    let (response_tx, mut response_rx) = oneshot::channel();
+    let demand = DhtDemandState {
+        awaiting_metadata: false,
+        connected_peers: 0,
+    };
+
+    let reduction = state
+        .update_demand_command_from_command(
+            DhtCommand::RegisterDemand {
+                info_hash,
+                demand,
+                subscriber_tx,
+                response_tx,
+            },
+            Instant::now(),
+        )
+        .expect("demand command reduction");
+
+    assert_eq!(state.demand_subscribers.subscriber_count(info_hash), 1);
+    let mut effects = reduction.effects.into_iter();
+    let Some(DhtDemandCommandEffect::SendRegisterResponse {
+        response_tx,
+        subscriber_id,
+    }) = effects.next()
+    else {
+        panic!("expected register response effect");
+    };
+    assert_eq!(subscriber_id, Some(1));
+    response_tx.send(subscriber_id).expect("send subscriber id");
+    assert_eq!(response_rx.try_recv(), Ok(Some(1)));
+
+    let (lookup_response_tx, _lookup_response_rx) = oneshot::channel();
+    assert!(state
+        .update_demand_command_from_command(
+            DhtCommand::StartGetPeers {
+                info_hash,
+                response_tx: lookup_response_tx,
+            },
+            Instant::now(),
+        )
+        .is_none());
+}
+
+#[test]
 fn dht_demand_command_register_and_unregister_emit_subscriber_effects() {
     let config = disabled_service_config();
     let mut state = DhtServiceState::new(config, 0, None);
