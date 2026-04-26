@@ -114,6 +114,7 @@ pub(in crate::dht::service) async fn start_get_peers_lookup(
     let (merged_tx, merged_rx) = mpsc::unbounded_channel();
     let first_batch_seen = Arc::new(AtomicBool::new(false));
     let accepting_families = Arc::new(AtomicBool::new(true));
+    let mut slice_metrics = slice_metrics;
 
     let primary_family = if active_runtime.runtime.family_bound(AddressFamily::Ipv4) {
         Some(AddressFamily::Ipv4)
@@ -129,7 +130,7 @@ pub(in crate::dht::service) async fn start_get_peers_lookup(
         attach_lookup_family(
             Some(active_runtime),
             demand_planner,
-            slice_metrics,
+            slice_metrics.as_deref_mut(),
             info_hash,
             family,
             slice_class,
@@ -141,33 +142,53 @@ pub(in crate::dht::service) async fn start_get_peers_lookup(
         .await?;
     }
 
-    if primary_family == Some(AddressFamily::Ipv4)
-        && active_runtime.runtime.family_bound(AddressFamily::Ipv6)
-    {
-        let command_tx = command_tx.clone();
-        let merged_tx = merged_tx.clone();
-        let lookup_ids = lookup_ids.clone();
-        let first_batch_seen = first_batch_seen.clone();
-        let accepting_families = accepting_families.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(DHT_IPV6_HEDGE_DELAY).await;
-            if merged_tx.is_closed() || !accepting_families.load(Ordering::Acquire) {
-                return;
-            }
-            let _ = send_dht_command(
-                &command_tx,
-                DhtCommand::StartGetPeersFamily {
-                    info_hash,
-                    family: AddressFamily::Ipv6,
-                    slice_class,
-                    record_metrics,
-                    merged_tx,
-                    lookup_ids,
-                    first_batch_seen,
-                    accepting_families,
-                },
-            );
-        });
+    let can_try_ipv6_hedge = primary_family == Some(AddressFamily::Ipv4)
+        && active_runtime.runtime.family_bound(AddressFamily::Ipv6);
+    if can_try_ipv6_hedge {
+        let primary_started = !lookup_ids
+            .lock()
+            .expect("managed dht lookup ids lock")
+            .is_empty();
+        if primary_started {
+            let command_tx = command_tx.clone();
+            let merged_tx = merged_tx.clone();
+            let lookup_ids = lookup_ids.clone();
+            let first_batch_seen = first_batch_seen.clone();
+            let accepting_families = accepting_families.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(DHT_IPV6_HEDGE_DELAY).await;
+                if merged_tx.is_closed() || !accepting_families.load(Ordering::Acquire) {
+                    return;
+                }
+                let _ = send_dht_command(
+                    &command_tx,
+                    DhtCommand::StartGetPeersFamily {
+                        info_hash,
+                        family: AddressFamily::Ipv6,
+                        slice_class,
+                        record_metrics,
+                        merged_tx,
+                        lookup_ids,
+                        first_batch_seen,
+                        accepting_families,
+                    },
+                );
+            });
+        } else {
+            attach_lookup_family(
+                Some(active_runtime),
+                demand_planner,
+                slice_metrics.as_deref_mut(),
+                info_hash,
+                AddressFamily::Ipv6,
+                slice_class,
+                merged_tx.clone(),
+                lookup_ids.clone(),
+                first_batch_seen.clone(),
+                accepting_families.clone(),
+            )
+            .await?;
+        }
     }
 
     if lookup_ids
@@ -263,6 +284,10 @@ pub(in crate::dht::service) async fn attach_lookup_family(
             .await
             .map_err(|error| error.to_string())?,
     };
+    if !active_runtime.runtime.is_lookup_active(lookup_id) {
+        return Ok(());
+    }
+
     if let Some(metrics) = slice_metrics {
         metrics.record_start(slice_class, resumed);
     }

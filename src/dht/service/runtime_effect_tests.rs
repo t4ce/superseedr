@@ -25,6 +25,34 @@ async fn start_get_peers_lookup_without_runtime_returns_empty_lookup() {
         .is_empty());
     assert!(!started.accepting_families.load(Ordering::Acquire));
 }
+
+#[tokio::test]
+async fn start_get_peers_lookup_without_seed_candidates_returns_empty_lookup() {
+    let (command_tx, _command_rx) = mpsc::unbounded_channel();
+    let mut planner = DemandPlannerModel::new(Instant::now());
+    let mut active_runtime = local_ipv4_active_runtime_without_bootstrap().await;
+
+    let started = start_get_peers_lookup(
+        Some(&mut active_runtime),
+        &command_tx,
+        &mut planner,
+        None,
+        hash_index(74),
+        DemandSliceClass::NoConnectedPeers,
+        false,
+    )
+    .await
+    .expect("seedless runtime should return an empty lookup");
+
+    assert!(started
+        .lookup_ids
+        .lock()
+        .expect("test lookup ids")
+        .is_empty());
+    assert_eq!(active_runtime.runtime.active_lookup_count(), 0);
+    assert!(!started.accepting_families.load(Ordering::Acquire));
+}
+
 #[tokio::test]
 async fn runtime_backed_park_lookup_moves_active_state_to_parked_crawl() {
     let mut active_runtime = local_ipv4_active_runtime().await;
@@ -287,7 +315,7 @@ async fn attach_lookup_family_records_fresh_and_resumed_state() {
     assert!(!planner.parked_crawls.contains_key(&parked_hash));
 }
 #[tokio::test]
-async fn runtime_backed_drain_rejection_parks_lookup_when_no_queries_are_inflight() {
+async fn runtime_backed_start_skips_lookup_when_no_seed_candidates_exist() {
     let mut active_runtime = local_ipv4_active_runtime_without_bootstrap().await;
     let info_hash = hash_index(82);
     let (lookup_id, peer_rx) = active_runtime
@@ -296,14 +324,11 @@ async fn runtime_backed_drain_rejection_parks_lookup_when_no_queries_are_infligh
         .await
         .expect("start runtime lookup");
     let _keep_receiver_open = peer_rx;
-    assert_eq!(
-        active_runtime
-            .runtime
-            .lookup_quality_snapshot(lookup_id)
-            .expect("lookup quality")
-            .inflight_len,
-        0
-    );
+    assert!(!active_runtime.runtime.is_lookup_active(lookup_id));
+    assert!(active_runtime
+        .runtime
+        .lookup_quality_snapshot(lookup_id)
+        .is_none());
 
     let mut planner = DemandPlannerModel::new(Instant::now());
     let (command_tx, _command_rx) = mpsc::unbounded_channel();
@@ -321,7 +346,7 @@ async fn runtime_backed_drain_rejection_parks_lookup_when_no_queries_are_infligh
     assert!(parked_outcome.is_none());
     assert!(planner.draining_demands.is_empty());
     assert_eq!(active_runtime.runtime.active_lookup_count(), 0);
-    assert!(planner.parked_crawls.contains_key(&info_hash));
+    assert!(!planner.parked_crawls.contains_key(&info_hash));
 }
 #[tokio::test]
 async fn runtime_backed_drain_rejection_parks_lookup_when_score_is_not_productive() {

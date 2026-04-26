@@ -246,6 +246,10 @@ impl LookupState {
     }
 
     pub fn next_candidates(&self) -> Vec<LookupCandidate> {
+        if self.visited.len() >= self.config.max_visits {
+            return Vec::new();
+        }
+
         let base_concurrency = if self.visited.is_empty() {
             self.config.initial_concurrency
         } else {
@@ -365,6 +369,10 @@ impl LookupState {
     }
 
     pub fn is_finished(&self) -> bool {
+        if self.inflight.is_empty() && self.visited.len() >= self.config.max_visits {
+            return true;
+        }
+
         if self.inflight.is_empty() && self.frontier.is_empty() {
             return true;
         }
@@ -1151,6 +1159,57 @@ mod tests {
             .frontier
             .iter()
             .any(|entry| entry.addr == candidate.addr));
+    }
+
+    #[test]
+    fn visit_cap_finishes_lookup_even_when_frontier_remains() {
+        let info_hash = seeded_info_hash(0x24);
+        let bootstrap_nodes = vec![socket(127, 0, 10, 11, 31011), socket(127, 0, 10, 12, 31012)];
+
+        let manager = LookupManager::new(LookupConfig {
+            initial_concurrency: 1,
+            concurrency: 1,
+            max_visits: 1,
+            max_referrals_per_response: 16,
+            per_prefix_limit: 2,
+            termination_k: 8,
+        });
+        let now = Instant::now();
+        let mut state = manager.start(
+            LookupRequest {
+                lookup_id: LookupId(4),
+                kind: LookupKind::GetPeers,
+                target: LookupTarget::InfoHash(info_hash),
+            },
+            AddressFamily::Ipv4,
+            &empty_routing_snapshot(AddressFamily::Ipv4),
+            &bootstrap_nodes,
+            &[],
+            now,
+        );
+
+        let candidate = state
+            .next_candidates()
+            .into_iter()
+            .next()
+            .expect("first bootstrap candidate");
+        let transaction_id = TransactionId::from(10u32.to_be_bytes());
+        assert!(state
+            .mark_inflight(transaction_id, candidate.addr, now)
+            .is_some());
+        assert!(
+            state
+                .frontier
+                .iter()
+                .any(|entry| entry.addr != candidate.addr),
+            "second bootstrap candidate should remain in frontier"
+        );
+
+        let update = state.handle_timeout(transaction_id);
+
+        assert!(update.finished);
+        assert!(state.is_finished());
+        assert!(state.next_candidates().is_empty());
     }
 
     proptest! {

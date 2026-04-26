@@ -333,6 +333,10 @@ impl Runtime {
             .count()
     }
 
+    pub fn is_lookup_active(&self, lookup_id: LookupId) -> bool {
+        self.active_lookups.contains_key(&lookup_id)
+    }
+
     pub fn draining_lookup_count(&self) -> usize {
         self.active_lookups
             .values()
@@ -510,6 +514,10 @@ impl Runtime {
             now,
         );
         let (peer_tx, peer_rx) = mpsc::unbounded_channel();
+        if state.is_finished() || state.next_candidates().is_empty() {
+            return Ok((lookup_id, peer_rx));
+        }
+
         self.active_lookups.insert(
             lookup_id,
             ActiveLookup {
@@ -555,6 +563,10 @@ impl Runtime {
         self.next_lookup_id = self.next_lookup_id.saturating_add(1);
         state.resume(lookup_id, Instant::now());
         let (peer_tx, peer_rx) = mpsc::unbounded_channel();
+        if state.is_finished() || state.next_candidates().is_empty() {
+            return Ok((lookup_id, peer_rx));
+        }
+
         self.active_lookups.insert(
             lookup_id,
             ActiveLookup {
@@ -1348,7 +1360,9 @@ impl Runtime {
         }
 
         let (lookup_id, rx) = self.start_find_node(family, target).await?;
-        self.maintenance_lookup_receivers.insert(lookup_id, rx);
+        if self.is_lookup_active(lookup_id) {
+            self.maintenance_lookup_receivers.insert(lookup_id, rx);
+        }
         Ok(())
     }
 
@@ -1779,6 +1793,30 @@ mod tests {
 
         assert!(runtime.family_bound(AddressFamily::Ipv4));
         assert!(!runtime.family_bound(AddressFamily::Ipv6));
+    }
+
+    #[tokio::test]
+    async fn runtime_does_not_register_lookup_without_seed_candidates() {
+        let mut runtime = Runtime::bind(RuntimeConfig {
+            local_node_id: seeded_node_id(0x03),
+            bootstrap_nodes: Vec::new(),
+            bootstrap_sources: Vec::new(),
+            ipv4_bind_addr: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
+            ipv6_bind_addr: None,
+            persistence: None,
+        })
+        .await
+        .expect("bind runtime");
+
+        let (lookup_id, mut peer_rx) = runtime
+            .start_get_peers(AddressFamily::Ipv4, seeded_info_hash(0x04))
+            .await
+            .expect("empty lookup should not fail");
+
+        assert!(!runtime.is_lookup_active(lookup_id));
+        assert_eq!(runtime.active_lookup_count(), 0);
+        assert!(runtime.lookup_quality_snapshot(lookup_id).is_none());
+        assert!(peer_rx.recv().await.is_none());
     }
 
     fn ipv6_test_bind_unavailable(error: &io::Error) -> bool {
