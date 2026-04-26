@@ -4664,6 +4664,8 @@ mod tests {
             advance_ms: u16,
         },
         PlanTick {
+            runtime_available: bool,
+            fail_mask: u8,
             advance_ms: u16,
         },
         FinishActive {
@@ -4674,6 +4676,7 @@ mod tests {
         ParkActive {
             key: u8,
             unique_peers: u8,
+            stop_reason: u8,
             advance_ms: u16,
         },
         AddDrainPeers {
@@ -4687,6 +4690,9 @@ mod tests {
         },
         DrainTick {
             runtime_ready: bool,
+            advance_ms: u16,
+        },
+        RuntimeReset {
             advance_ms: u16,
         },
         ResetActive {
@@ -4715,9 +4721,13 @@ mod tests {
             ),
             (key.clone(), advance_ms.clone())
                 .prop_map(|(key, advance_ms)| { PlannerMachineOp::Unregister { key, advance_ms } }),
-            advance_ms
-                .clone()
-                .prop_map(|advance_ms| PlannerMachineOp::PlanTick { advance_ms }),
+            (any::<bool>(), any::<u8>(), advance_ms.clone()).prop_map(
+                |(runtime_available, fail_mask, advance_ms)| PlannerMachineOp::PlanTick {
+                    runtime_available,
+                    fail_mask,
+                    advance_ms,
+                },
+            ),
             (key.clone(), 0u8..=96, advance_ms.clone()).prop_map(
                 |(key, unique_peers, advance_ms)| PlannerMachineOp::FinishActive {
                     key,
@@ -4725,10 +4735,11 @@ mod tests {
                     advance_ms,
                 }
             ),
-            (key.clone(), 0u8..=96, advance_ms.clone()).prop_map(
-                |(key, unique_peers, advance_ms)| PlannerMachineOp::ParkActive {
+            (key.clone(), 0u8..=96, any::<u8>(), advance_ms.clone()).prop_map(
+                |(key, unique_peers, stop_reason, advance_ms)| PlannerMachineOp::ParkActive {
                     key,
                     unique_peers,
+                    stop_reason,
                     advance_ms,
                 }
             ),
@@ -4748,6 +4759,9 @@ mod tests {
                     advance_ms,
                 }
             }),
+            advance_ms
+                .clone()
+                .prop_map(|advance_ms| PlannerMachineOp::RuntimeReset { advance_ms }),
             advance_ms.prop_map(|advance_ms| PlannerMachineOp::ResetActive { advance_ms }),
         ]
     }
@@ -4873,9 +4887,30 @@ mod tests {
         unique_peers: u8,
         now: Instant,
     ) {
+        insert_synthetic_drain_with_stop_reason(
+            draining_demands,
+            info_hash,
+            key,
+            lookup_id,
+            slice_class,
+            DemandSliceStopReason::WallTime,
+            unique_peers,
+            now,
+        );
+    }
+
+    fn insert_synthetic_drain_with_stop_reason(
+        draining_demands: &mut HashMap<InfoHash, DrainingDemandLookup>,
+        info_hash: InfoHash,
+        key: u8,
+        lookup_id: LookupId,
+        slice_class: DemandSliceClass,
+        stop_reason: DemandSliceStopReason,
+        unique_peers: u8,
+        now: Instant,
+    ) {
         let unique_peers = synthetic_peers(key, unique_peers);
         let unique_peer_count = unique_peers.len();
-        let stop_reason = DemandSliceStopReason::WallTime;
         let parked_outcome =
             slice_class.parked_slice_outcome(stop_reason, unique_peer_count, false);
         let duration = demand_drain_duration(
@@ -4904,6 +4939,15 @@ mod tests {
         );
     }
 
+    fn prop_stop_reason(code: u8) -> DemandSliceStopReason {
+        match code % 4 {
+            0 => DemandSliceStopReason::WallTime,
+            1 => DemandSliceStopReason::IdleTimeout,
+            2 => DemandSliceStopReason::FirstBatch,
+            _ => DemandSliceStopReason::UniquePeerCap,
+        }
+    }
+
     struct PlannerMachine {
         now: Instant,
         planner: DemandPlannerModel,
@@ -4924,16 +4968,27 @@ mod tests {
             self.now += Duration::from_millis(u64::from(advance_ms));
         }
 
-        fn plan_tick(&mut self) {
+        fn plan_tick(&mut self, runtime_available: bool, fail_mask: u8) {
             let reduction = self.planner.update(DemandPlannerAction::PlanDue {
                 now: self.now,
-                runtime_available: true,
+                runtime_available,
             });
 
+            let mut launch_index = 0u8;
             for effect in reduction.effects {
                 let DemandPlannerEffect::StartLookup(start) = effect else {
                     continue;
                 };
+                let fail_start = (fail_mask & (1 << (launch_index % 8))) != 0;
+                launch_index = launch_index.wrapping_add(1);
+                if fail_start {
+                    self.planner.update(DemandPlannerAction::LookupStartFailed {
+                        info_hash: start.candidate.info_hash,
+                        slice_class: start.plan.class,
+                        now: self.now,
+                    });
+                    continue;
+                }
                 let lookup_id = LookupId(self.next_lookup_id);
                 self.next_lookup_id = self.next_lookup_id.saturating_add(1);
                 self.planner.update(DemandPlannerAction::LookupStarted {
@@ -4959,17 +5014,18 @@ mod tests {
             });
         }
 
-        fn park_active(&mut self, key: u8, unique_peers: u8) {
+        fn park_active(&mut self, key: u8, unique_peers: u8, stop_reason: u8) {
             let info_hash = hash_index(u32::from(key));
             let Some(active) = self.planner.active.get(&info_hash).cloned() else {
                 return;
             };
+            let stop_reason = prop_stop_reason(stop_reason);
             let requested = self
                 .planner
                 .update(DemandPlannerAction::LookupParkRequested {
                     info_hash,
                     slice_class: active.slice_class,
-                    stop_reason: DemandSliceStopReason::WallTime,
+                    stop_reason,
                     total_peers: usize::from(unique_peers),
                     unique_peers: synthetic_peers(key, unique_peers),
                     lookup_ids: active.lookup_ids,
@@ -4989,12 +5045,13 @@ mod tests {
                         .first()
                         .copied()
                         .unwrap_or(LookupId(0));
-                    insert_synthetic_drain(
+                    insert_synthetic_drain_with_stop_reason(
                         &mut self.planner.draining_demands,
                         admit.info_hash,
                         key,
                         lookup_id,
                         admit.slice_class,
+                        admit.stop_reason,
                         unique_peers,
                         self.now,
                     );
@@ -5063,12 +5120,13 @@ mod tests {
                 PlannerMachineOp::Register { advance_ms, .. }
                 | PlannerMachineOp::Update { advance_ms, .. }
                 | PlannerMachineOp::Unregister { advance_ms, .. }
-                | PlannerMachineOp::PlanTick { advance_ms }
+                | PlannerMachineOp::PlanTick { advance_ms, .. }
                 | PlannerMachineOp::FinishActive { advance_ms, .. }
                 | PlannerMachineOp::ParkActive { advance_ms, .. }
                 | PlannerMachineOp::AddDrainPeers { advance_ms, .. }
                 | PlannerMachineOp::FinalizeDrain { advance_ms, .. }
                 | PlannerMachineOp::DrainTick { advance_ms, .. }
+                | PlannerMachineOp::RuntimeReset { advance_ms }
                 | PlannerMachineOp::ResetActive { advance_ms } => *advance_ms,
             };
             self.advance(advance_ms);
@@ -5099,13 +5157,20 @@ mod tests {
                     self.planner
                         .update(DemandPlannerAction::DemandSubscriberRemoved { info_hash });
                 }
-                PlannerMachineOp::PlanTick { .. } => self.plan_tick(),
+                PlannerMachineOp::PlanTick {
+                    runtime_available,
+                    fail_mask,
+                    ..
+                } => self.plan_tick(runtime_available, fail_mask),
                 PlannerMachineOp::FinishActive {
                     key, unique_peers, ..
                 } => self.finish_active(key, unique_peers),
                 PlannerMachineOp::ParkActive {
-                    key, unique_peers, ..
-                } => self.park_active(key, unique_peers),
+                    key,
+                    unique_peers,
+                    stop_reason,
+                    ..
+                } => self.park_active(key, unique_peers, stop_reason),
                 PlannerMachineOp::AddDrainPeers {
                     key, peer_count, ..
                 } => {
@@ -5136,6 +5201,10 @@ mod tests {
                         }
                     }
                 }
+                PlannerMachineOp::RuntimeReset { .. } => {
+                    self.planner
+                        .update(DemandPlannerAction::RuntimeReset { now: self.now });
+                }
                 PlannerMachineOp::ResetActive { .. } => {
                     self.planner.active.clear();
                     self.planner.draining_demands.clear();
@@ -5146,6 +5215,7 @@ mod tests {
 
         fn assert_invariants(&self) -> Result<(), TestCaseError> {
             let mut occupied = HashSet::new();
+            let mut lookup_ids = HashSet::new();
             for (&info_hash, active) in &self.planner.active {
                 prop_assert!(occupied.insert(info_hash));
                 let snapshot = self
@@ -5154,7 +5224,11 @@ mod tests {
                     .entry_snapshot(info_hash)
                     .expect("active demand must have scheduler entry");
                 prop_assert!(snapshot.in_progress);
-                prop_assert!(active.lookup_ids.lock().expect("test lookup id lock").len() == 1);
+                let active_ids = active.lookup_ids.lock().expect("test lookup id lock");
+                prop_assert_eq!(active_ids.len(), 1);
+                for lookup_id in active_ids.iter().copied() {
+                    prop_assert!(lookup_ids.insert(lookup_id));
+                }
             }
 
             for (&info_hash, drain) in &self.planner.draining_demands {
@@ -5165,10 +5239,39 @@ mod tests {
                     .entry_snapshot(info_hash)
                     .expect("draining demand must have scheduler entry");
                 prop_assert!(snapshot.in_progress);
+                prop_assert!(!drain.lookup_ids.is_empty());
+                for lookup_id in drain.lookup_ids.iter().copied() {
+                    prop_assert!(lookup_ids.insert(lookup_id));
+                }
                 prop_assert!(drain.deadline >= drain.started_at);
                 prop_assert!(drain.no_late_yield_deadline <= drain.deadline);
                 prop_assert!(drain.unique_peer_count() >= drain.initial_unique_peers);
+                prop_assert!(drain.late_unique_peer_count() <= drain.unique_peer_count());
+                prop_assert!(drain.total_peers >= drain.unique_peer_count());
+                prop_assert!(drain.initial_inflight_queries > 0);
             }
+
+            let scheduler_snapshots = self.planner.scheduler.entry_snapshots();
+            for snapshot in &scheduler_snapshots {
+                prop_assert!(snapshot.subscriber_count > 0);
+                if snapshot.in_progress {
+                    prop_assert!(
+                        self.planner.active.contains_key(&snapshot.info_hash)
+                            || self
+                                .planner
+                                .draining_demands
+                                .contains_key(&snapshot.info_hash)
+                    );
+                }
+            }
+            let expected_metadata_waiters = scheduler_snapshots
+                .iter()
+                .filter(|snapshot| snapshot.demand.awaiting_metadata)
+                .count();
+            prop_assert_eq!(
+                self.planner.metadata_waiter_count(),
+                expected_metadata_waiters
+            );
 
             let active_counts = active_demand_lookup_slot_counts(&self.planner.active);
             prop_assert!(active_counts.awaiting_metadata <= DHT_AWAITING_METADATA_SLOT_CAP);
