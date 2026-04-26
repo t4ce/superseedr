@@ -1396,6 +1396,7 @@ fn trace_lookup_result(transaction_id: TransactionId, stage: &str) {
 mod tests {
     use super::*;
     use crate::dht::krpc::{decode_message, KrpcInboundMessage, KrpcIncomingQuery};
+    use crate::dht::routing::RoutingSnapshot;
     use crate::dht::test_support::{seeded_info_hash, seeded_node_id};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::{Arc, Mutex};
@@ -1753,6 +1754,71 @@ mod tests {
             handle.abort();
             let _ = handle.await;
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_bind_restores_persisted_routes_only_for_matching_node_id() {
+        let temp_dir = tempfile::tempdir().expect("temp dht persistence dir");
+        let path = temp_dir.path().join("dht_state.json");
+        let local_node_id = seeded_node_id(0x51);
+        let manager = PersistenceManager::new(PersistenceConfig {
+            path: path.clone(),
+            max_age: Duration::from_secs(60),
+        });
+        let route = NodeRecord::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 45151),
+            Some(seeded_node_id(0x52)),
+            Instant::now(),
+        );
+        let empty_ipv6 = RoutingSnapshot {
+            family: AddressFamily::Ipv6,
+            buckets: Vec::new(),
+            nodes: Vec::new(),
+            replacement_count: 0,
+            refresh_due_count: 0,
+        };
+        let ipv4_routes = RoutingSnapshot {
+            family: AddressFamily::Ipv4,
+            buckets: Vec::new(),
+            nodes: vec![route],
+            replacement_count: 0,
+            refresh_due_count: 0,
+        };
+        let snapshot =
+            manager.build_snapshot(local_node_id, &ipv4_routes, &empty_ipv6, SystemTime::now());
+        manager
+            .save_snapshot(&snapshot)
+            .expect("save persisted dht state");
+
+        let matching = Runtime::bind(RuntimeConfig {
+            local_node_id,
+            bootstrap_nodes: Vec::new(),
+            ipv4_bind_addr: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
+            ipv6_bind_addr: None,
+            persistence: Some(PersistenceConfig {
+                path: path.clone(),
+                max_age: Duration::from_secs(60),
+            }),
+        })
+        .await
+        .expect("bind matching runtime");
+        assert_eq!(matching.active_route_count(AddressFamily::Ipv4), 1);
+        assert_eq!(matching.active_route_count(AddressFamily::Ipv6), 0);
+
+        let mismatched = Runtime::bind(RuntimeConfig {
+            local_node_id: seeded_node_id(0x53),
+            bootstrap_nodes: Vec::new(),
+            ipv4_bind_addr: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
+            ipv6_bind_addr: None,
+            persistence: Some(PersistenceConfig {
+                path,
+                max_age: Duration::from_secs(60),
+            }),
+        })
+        .await
+        .expect("bind mismatched runtime");
+        assert_eq!(mismatched.active_route_count(AddressFamily::Ipv4), 0);
+        assert_eq!(mismatched.active_route_count(AddressFamily::Ipv6), 0);
     }
 
     #[tokio::test]

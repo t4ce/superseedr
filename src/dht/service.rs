@@ -3581,7 +3581,23 @@ impl DemandPlannerModel {
                 now,
             } => {
                 demand_scheduler.register(info_hash, demand, now);
-                DemandPlannerReduction::default()
+                let effects = if draining_demands
+                    .get(&info_hash)
+                    .is_some_and(|drain| drain.slice_class != DemandSliceClass::from_demand(demand))
+                {
+                    vec![DemandPlannerEffect::FinalizeDrainingLookup(
+                        DemandFinalizeDrainingLookupEffect {
+                            info_hash,
+                            force: true,
+                        },
+                    )]
+                } else {
+                    Vec::new()
+                };
+                DemandPlannerReduction {
+                    effects,
+                    plan_stats: None,
+                }
             }
             DemandPlannerAction::DemandUpdated {
                 info_hash,
@@ -6627,6 +6643,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_service_reconfigure_to_disabled_publishes_status_and_preserves_subscriber() {
+        let config = DhtServiceConfig {
+            port: 0,
+            bootstrap_nodes: Vec::new(),
+            preferred_backend: DhtBackendKind::InternalPrototype,
+            force_internal_failure: false,
+        };
+        let active_runtime = local_ipv4_active_runtime().await;
+        let initial_status = build_status(
+            Some(&active_runtime),
+            DhtBackendKind::InternalPrototype,
+            config.preferred_backend,
+            None,
+            0,
+            active_runtime.bootstrap,
+        );
+        let (status_tx, mut status_rx) = watch::channel(initial_status);
+        let (wave_tx, _wave_rx) = watch::channel(DhtWaveTelemetry::default());
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let task = tokio::spawn(run_service(
+            config,
+            NodeId::from([4u8; NodeId::LEN]),
+            Some(active_runtime),
+            None,
+            status_tx,
+            wave_tx,
+            command_tx.clone(),
+            command_rx,
+            shutdown_rx,
+        ));
+
+        let info_hash = hash_index(88);
+        let (subscriber_tx, mut subscriber_rx) = mpsc::unbounded_channel();
+        let (response_tx, response_rx) = oneshot::channel();
+        send_dht_command(
+            &command_tx,
+            DhtCommand::RegisterDemand {
+                info_hash,
+                demand: DhtDemandState {
+                    awaiting_metadata: false,
+                    connected_peers: 0,
+                },
+                subscriber_tx,
+                response_tx,
+            },
+        )
+        .expect("register demand before reconfigure");
+        let subscriber_id = response_rx.await.expect("subscriber response");
+        assert_eq!(subscriber_id, Some(1));
+
+        send_dht_command(
+            &command_tx,
+            DhtCommand::Reconfigure(disabled_service_config()),
+        )
+        .expect("send disabled reconfigure");
+        let status = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                status_rx.changed().await.expect("status channel open");
+                let status = status_rx.borrow().clone();
+                if status.generation == 1 && status.health.backend == DhtBackendKind::Disabled {
+                    break status;
+                }
+            }
+        })
+        .await
+        .expect("disabled status update");
+        assert_eq!(status.generation, 1);
+        assert_eq!(status.health.backend, DhtBackendKind::Disabled);
+        assert_eq!(
+            status.health.preferred_backend,
+            Some(DhtBackendKind::Disabled)
+        );
+        assert!(!status.health.enabled);
+
+        let peers = vec![peer("127.0.0.88:6881")];
+        send_dht_command(
+            &command_tx,
+            DhtCommand::DemandPeers {
+                info_hash,
+                peers: peers.clone(),
+            },
+        )
+        .expect("send peers after disabled reconfigure");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), subscriber_rx.recv())
+                .await
+                .expect("subscriber peers after disabled reconfigure"),
+            Some(peers)
+        );
+
+        let _ = shutdown_tx.send(());
+        task.await.expect("service task join");
+    }
+
+    #[tokio::test]
     async fn runtime_backed_park_lookup_moves_active_state_to_parked_crawl() {
         let mut active_runtime = local_ipv4_active_runtime().await;
         let info_hash = hash_index(76);
@@ -8085,6 +8197,69 @@ mod tests {
             DemandPlannerEffect::FinalizeDrainingLookup(finalize)
                 if finalize.info_hash == info_hash && finalize.force
         )));
+    }
+
+    #[test]
+    fn demand_planner_duplicate_register_requests_drain_finalize_on_class_mismatch() {
+        let now = Instant::now();
+        let info_hash = hash_index(47);
+        let mut planner = DemandPlannerModel::new(now);
+        planner.update(DemandPlannerAction::DemandRegistered {
+            info_hash,
+            demand: DhtDemandState {
+                awaiting_metadata: false,
+                connected_peers: 0,
+            },
+            now,
+        });
+        insert_synthetic_drain(
+            &mut planner.draining_demands,
+            info_hash,
+            47,
+            LookupId(17),
+            DemandSliceClass::NoConnectedPeers,
+            1,
+            now,
+        );
+
+        let same_class = planner.update(DemandPlannerAction::DemandRegistered {
+            info_hash,
+            demand: DhtDemandState {
+                awaiting_metadata: false,
+                connected_peers: 0,
+            },
+            now,
+        });
+        assert!(same_class.effects.is_empty());
+        assert_eq!(
+            planner
+                .scheduler
+                .entry_snapshot(info_hash)
+                .expect("demand entry")
+                .subscriber_count,
+            2
+        );
+
+        let class_change = planner.update(DemandPlannerAction::DemandRegistered {
+            info_hash,
+            demand: DhtDemandState {
+                awaiting_metadata: true,
+                connected_peers: 0,
+            },
+            now,
+        });
+
+        assert!(class_change.effects.iter().any(|effect| matches!(
+            effect,
+            DemandPlannerEffect::FinalizeDrainingLookup(finalize)
+                if finalize.info_hash == info_hash && finalize.force
+        )));
+        let snapshot = planner
+            .scheduler
+            .entry_snapshot(info_hash)
+            .expect("demand entry");
+        assert_eq!(snapshot.subscriber_count, 3);
+        assert!(snapshot.demand.awaiting_metadata);
     }
 
     #[test]
