@@ -1892,6 +1892,101 @@ impl DhtServiceModel {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DhtLifecycleAction {
+    StartupBootstrapDue {
+        now: Instant,
+        due: Instant,
+        active_user_lookup_count: usize,
+    },
+    StartupBootstrapSucceeded,
+    StartupBootstrapFailed {
+        warning: String,
+        retry_at: Instant,
+    },
+    MaintenanceTick {
+        active_user_lookup_count: Option<usize>,
+    },
+    MaintenanceFailed {
+        warning: String,
+    },
+    HealthTick,
+    RuntimeStepFailed {
+        warning: String,
+    },
+    Shutdown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DhtLifecycleEffect {
+    RunStartupBootstrap,
+    ClearStartupBootstrapDue,
+    SetStartupBootstrapDue(Instant),
+    RunMaintenance,
+    RecordRuntimeWarning {
+        warning: String,
+        publish_status: bool,
+    },
+    PublishStatus,
+    ExpireRecentUniquePeers,
+    SaveRuntimeState,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DhtLifecycleReduction {
+    effects: Vec<DhtLifecycleEffect>,
+}
+
+struct DhtLifecycleModel;
+
+impl DhtLifecycleModel {
+    fn update(action: DhtLifecycleAction) -> DhtLifecycleReduction {
+        let effects = match action {
+            DhtLifecycleAction::StartupBootstrapDue {
+                now,
+                due,
+                active_user_lookup_count,
+            } => {
+                if now >= due && active_user_lookup_count == 0 {
+                    vec![DhtLifecycleEffect::RunStartupBootstrap]
+                } else {
+                    Vec::new()
+                }
+            }
+            DhtLifecycleAction::StartupBootstrapSucceeded => {
+                vec![DhtLifecycleEffect::ClearStartupBootstrapDue]
+            }
+            DhtLifecycleAction::StartupBootstrapFailed { warning, retry_at } => {
+                vec![
+                    DhtLifecycleEffect::RecordRuntimeWarning {
+                        warning,
+                        publish_status: false,
+                    },
+                    DhtLifecycleEffect::SetStartupBootstrapDue(retry_at),
+                ]
+            }
+            DhtLifecycleAction::MaintenanceTick {
+                active_user_lookup_count: Some(0),
+            } => vec![DhtLifecycleEffect::RunMaintenance],
+            DhtLifecycleAction::MaintenanceTick { .. } => Vec::new(),
+            DhtLifecycleAction::MaintenanceFailed { warning }
+            | DhtLifecycleAction::RuntimeStepFailed { warning } => {
+                vec![DhtLifecycleEffect::RecordRuntimeWarning {
+                    warning,
+                    publish_status: true,
+                }]
+            }
+            DhtLifecycleAction::HealthTick => vec![
+                DhtLifecycleEffect::PublishStatus,
+                DhtLifecycleEffect::ExpireRecentUniquePeers,
+                DhtLifecycleEffect::SaveRuntimeState,
+            ],
+            DhtLifecycleAction::Shutdown => vec![DhtLifecycleEffect::SaveRuntimeState],
+        };
+        DhtLifecycleReduction { effects }
+    }
+}
+
 struct DemandSubscriberDelivery {
     subscriber_id: u64,
     subscriber_tx: mpsc::UnboundedSender<Vec<SocketAddr>>,
@@ -2672,20 +2767,25 @@ async fn run_service(
     let mut recent_unique_peers = RecentUniquePeers::new(DHT_UNIQUE_PEERS_FOUND_WINDOW);
 
     loop {
-        if let Some(active) = active_runtime.as_mut() {
-            if let Some(startup_due) = active.startup_bootstrap_due {
-                if Instant::now() >= startup_due && active.runtime.active_user_lookup_count() == 0 {
-                    match active.runtime.bootstrap_startup().await {
-                        Ok(()) => active.startup_bootstrap_due = None,
-                        Err(error) => {
-                            let _ = service_model.update(DhtServiceAction::RuntimeWarning {
-                                warning: format!("DHT startup bootstrap failed: {error}"),
-                            });
-                            active.startup_bootstrap_due =
-                                Some(Instant::now() + DHT_STARTUP_BOOTSTRAP_DELAY);
-                        }
-                    }
-                }
+        if let Some(active) = active_runtime.as_ref() {
+            if let Some(due) = active.startup_bootstrap_due {
+                let reduction =
+                    DhtLifecycleModel::update(DhtLifecycleAction::StartupBootstrapDue {
+                        now: Instant::now(),
+                        due,
+                        active_user_lookup_count: active.runtime.active_user_lookup_count(),
+                    });
+                apply_dht_lifecycle_effects(
+                    reduction.effects,
+                    &mut service_model,
+                    &mut active_runtime,
+                    &status_tx,
+                    &command_tx,
+                    &mut demand_planner,
+                    &mut slice_metrics,
+                    &mut recent_unique_peers,
+                )
+                .await;
             }
         }
 
@@ -2713,9 +2813,18 @@ async fn run_service(
 
         match event {
             LoopEvent::Shutdown | LoopEvent::CommandClosed => {
-                if let Some(active) = active_runtime.as_ref() {
-                    let _ = active.runtime.save_state().await;
-                }
+                let reduction = DhtLifecycleModel::update(DhtLifecycleAction::Shutdown);
+                apply_dht_lifecycle_effects(
+                    reduction.effects,
+                    &mut service_model,
+                    &mut active_runtime,
+                    &status_tx,
+                    &command_tx,
+                    &mut demand_planner,
+                    &mut slice_metrics,
+                    &mut recent_unique_peers,
+                )
+                .await;
                 break;
             }
             LoopEvent::Command(DhtCommand::Reconfigure(new_config)) => {
@@ -3020,64 +3129,51 @@ async fn run_service(
                 .await;
             }
             LoopEvent::MaintenanceTick => {
-                if let Some(active) = active_runtime.as_mut() {
-                    if active.runtime.active_user_lookup_count() == 0 {
-                        if let Err(error) = active.runtime.run_maintenance().await {
-                            let reduction =
-                                service_model.update(DhtServiceAction::RuntimeWarning {
-                                    warning: format!("DHT maintenance failed: {error}"),
-                                });
-                            apply_dht_service_effects(
-                                reduction.effects,
-                                &service_model,
-                                &mut active_runtime,
-                                &status_tx,
-                                &command_tx,
-                                &mut demand_planner,
-                                &mut slice_metrics,
-                            )
-                            .await;
-                        }
-                    }
-                }
-            }
-            LoopEvent::HealthTick => {
-                let backend = active_runtime
-                    .as_ref()
-                    .map(|active| active.backend)
-                    .unwrap_or(DhtBackendKind::Disabled);
-                let bootstrap = active_runtime
-                    .as_ref()
-                    .map(|active| active.bootstrap)
-                    .unwrap_or_default();
-                let status = build_status(
-                    active_runtime.as_ref(),
-                    backend,
-                    service_model.config().preferred_backend,
-                    service_model.warning_owned(),
-                    service_model.generation(),
-                    bootstrap,
-                );
-                let _ = status_tx.send(status.clone());
-                let _ = recent_unique_peers.unique_count(Instant::now());
-
-                if let Some(active) = active_runtime.as_ref() {
-                    let _ = active.runtime.save_state().await;
-                }
-            }
-            LoopEvent::RuntimeStep(Ok(_)) => {}
-            LoopEvent::RuntimeStep(Err(error)) => {
-                let reduction = service_model.update(DhtServiceAction::RuntimeWarning {
-                    warning: format!("DHT runtime step failed: {error}"),
+                let reduction = DhtLifecycleModel::update(DhtLifecycleAction::MaintenanceTick {
+                    active_user_lookup_count: active_runtime
+                        .as_ref()
+                        .map(|active| active.runtime.active_user_lookup_count()),
                 });
-                apply_dht_service_effects(
+                apply_dht_lifecycle_effects(
                     reduction.effects,
-                    &service_model,
+                    &mut service_model,
                     &mut active_runtime,
                     &status_tx,
                     &command_tx,
                     &mut demand_planner,
                     &mut slice_metrics,
+                    &mut recent_unique_peers,
+                )
+                .await;
+            }
+            LoopEvent::HealthTick => {
+                let reduction = DhtLifecycleModel::update(DhtLifecycleAction::HealthTick);
+                apply_dht_lifecycle_effects(
+                    reduction.effects,
+                    &mut service_model,
+                    &mut active_runtime,
+                    &status_tx,
+                    &command_tx,
+                    &mut demand_planner,
+                    &mut slice_metrics,
+                    &mut recent_unique_peers,
+                )
+                .await;
+            }
+            LoopEvent::RuntimeStep(Ok(_)) => {}
+            LoopEvent::RuntimeStep(Err(error)) => {
+                let reduction = DhtLifecycleModel::update(DhtLifecycleAction::RuntimeStepFailed {
+                    warning: format!("DHT runtime step failed: {error}"),
+                });
+                apply_dht_lifecycle_effects(
+                    reduction.effects,
+                    &mut service_model,
+                    &mut active_runtime,
+                    &status_tx,
+                    &command_tx,
+                    &mut demand_planner,
+                    &mut slice_metrics,
+                    &mut recent_unique_peers,
                 )
                 .await;
             }
@@ -3124,6 +3220,96 @@ async fn apply_dht_service_effects(
                     slice_metrics,
                 )
                 .await;
+            }
+        }
+    }
+}
+
+async fn apply_dht_lifecycle_effects(
+    effects: Vec<DhtLifecycleEffect>,
+    service_model: &mut DhtServiceModel,
+    active_runtime: &mut Option<ActiveRuntime>,
+    status_tx: &watch::Sender<DhtStatus>,
+    command_tx: &DhtCommandSender,
+    demand_planner: &mut DemandPlannerModel,
+    slice_metrics: &mut DemandSliceMetrics,
+    recent_unique_peers: &mut RecentUniquePeers,
+) {
+    let mut pending_effects = VecDeque::from(effects);
+
+    while let Some(effect) = pending_effects.pop_front() {
+        match effect {
+            DhtLifecycleEffect::RunStartupBootstrap => {
+                if let Some(active) = active_runtime.as_mut() {
+                    let reduction = match active.runtime.bootstrap_startup().await {
+                        Ok(()) => {
+                            DhtLifecycleModel::update(DhtLifecycleAction::StartupBootstrapSucceeded)
+                        }
+                        Err(error) => {
+                            DhtLifecycleModel::update(DhtLifecycleAction::StartupBootstrapFailed {
+                                warning: format!("DHT startup bootstrap failed: {error}"),
+                                retry_at: Instant::now() + DHT_STARTUP_BOOTSTRAP_DELAY,
+                            })
+                        }
+                    };
+                    pending_effects.extend(reduction.effects);
+                }
+            }
+            DhtLifecycleEffect::ClearStartupBootstrapDue => {
+                if let Some(active) = active_runtime.as_mut() {
+                    active.startup_bootstrap_due = None;
+                }
+            }
+            DhtLifecycleEffect::SetStartupBootstrapDue(due) => {
+                if let Some(active) = active_runtime.as_mut() {
+                    active.startup_bootstrap_due = Some(due);
+                }
+            }
+            DhtLifecycleEffect::RunMaintenance => {
+                if let Some(active) = active_runtime.as_mut() {
+                    if let Err(error) = active.runtime.run_maintenance().await {
+                        let reduction =
+                            DhtLifecycleModel::update(DhtLifecycleAction::MaintenanceFailed {
+                                warning: format!("DHT maintenance failed: {error}"),
+                            });
+                        pending_effects.extend(reduction.effects);
+                    }
+                }
+            }
+            DhtLifecycleEffect::RecordRuntimeWarning {
+                warning,
+                publish_status,
+            } => {
+                let reduction = service_model.update(DhtServiceAction::RuntimeWarning { warning });
+                if publish_status {
+                    apply_dht_service_effects(
+                        reduction.effects,
+                        service_model,
+                        active_runtime,
+                        status_tx,
+                        command_tx,
+                        demand_planner,
+                        slice_metrics,
+                    )
+                    .await;
+                }
+            }
+            DhtLifecycleEffect::PublishStatus => {
+                publish_status(
+                    status_tx,
+                    active_runtime.as_ref(),
+                    service_model.warning_owned(),
+                    service_model.generation(),
+                    service_model.config().preferred_backend,
+                );
+            }
+            DhtLifecycleEffect::ExpireRecentUniquePeers => {
+                let _ = recent_unique_peers.unique_count(Instant::now());
+            }
+            DhtLifecycleEffect::SaveRuntimeState => {
+                if let Some(active) = active_runtime.as_ref() {
+                    let _ = active.runtime.save_state().await;
+                }
             }
         }
     }
@@ -5882,6 +6068,129 @@ mod tests {
         assert_eq!(model.generation(), 11);
         assert_eq!(model.warning_owned().as_deref(), Some("maintenance failed"));
         assert_eq!(reduction.effects, vec![DhtServiceEffect::PublishStatus]);
+    }
+
+    #[test]
+    fn dht_lifecycle_model_startup_bootstrap_runs_only_when_due_and_idle() {
+        let now = Instant::now();
+        let due = now - Duration::from_millis(1);
+
+        let reduction = DhtLifecycleModel::update(DhtLifecycleAction::StartupBootstrapDue {
+            now,
+            due,
+            active_user_lookup_count: 0,
+        });
+        assert_eq!(
+            reduction.effects,
+            vec![DhtLifecycleEffect::RunStartupBootstrap]
+        );
+
+        let not_due = DhtLifecycleModel::update(DhtLifecycleAction::StartupBootstrapDue {
+            now,
+            due: now + Duration::from_millis(1),
+            active_user_lookup_count: 0,
+        });
+        assert!(not_due.effects.is_empty());
+
+        let busy = DhtLifecycleModel::update(DhtLifecycleAction::StartupBootstrapDue {
+            now,
+            due,
+            active_user_lookup_count: 1,
+        });
+        assert!(busy.effects.is_empty());
+    }
+
+    #[test]
+    fn dht_lifecycle_model_startup_bootstrap_result_updates_retry_state() {
+        let retry_at = Instant::now() + DHT_STARTUP_BOOTSTRAP_DELAY;
+
+        let failed = DhtLifecycleModel::update(DhtLifecycleAction::StartupBootstrapFailed {
+            warning: "DHT startup bootstrap failed: route lookup failed".to_string(),
+            retry_at,
+        });
+        assert_eq!(
+            failed.effects,
+            vec![
+                DhtLifecycleEffect::RecordRuntimeWarning {
+                    warning: "DHT startup bootstrap failed: route lookup failed".to_string(),
+                    publish_status: false,
+                },
+                DhtLifecycleEffect::SetStartupBootstrapDue(retry_at),
+            ]
+        );
+
+        let succeeded = DhtLifecycleModel::update(DhtLifecycleAction::StartupBootstrapSucceeded);
+        assert_eq!(
+            succeeded.effects,
+            vec![DhtLifecycleEffect::ClearStartupBootstrapDue]
+        );
+    }
+
+    #[test]
+    fn dht_lifecycle_model_maintenance_only_runs_when_runtime_idle() {
+        let no_runtime = DhtLifecycleModel::update(DhtLifecycleAction::MaintenanceTick {
+            active_user_lookup_count: None,
+        });
+        assert!(no_runtime.effects.is_empty());
+
+        let busy = DhtLifecycleModel::update(DhtLifecycleAction::MaintenanceTick {
+            active_user_lookup_count: Some(2),
+        });
+        assert!(busy.effects.is_empty());
+
+        let idle = DhtLifecycleModel::update(DhtLifecycleAction::MaintenanceTick {
+            active_user_lookup_count: Some(0),
+        });
+        assert_eq!(idle.effects, vec![DhtLifecycleEffect::RunMaintenance]);
+    }
+
+    #[test]
+    fn dht_lifecycle_model_health_tick_publishes_expires_and_saves() {
+        let reduction = DhtLifecycleModel::update(DhtLifecycleAction::HealthTick);
+
+        assert_eq!(
+            reduction.effects,
+            vec![
+                DhtLifecycleEffect::PublishStatus,
+                DhtLifecycleEffect::ExpireRecentUniquePeers,
+                DhtLifecycleEffect::SaveRuntimeState,
+            ]
+        );
+    }
+
+    #[test]
+    fn dht_lifecycle_model_runtime_failures_publish_warning_status() {
+        let maintenance = DhtLifecycleModel::update(DhtLifecycleAction::MaintenanceFailed {
+            warning: "DHT maintenance failed: maintenance error".to_string(),
+        });
+        assert_eq!(
+            maintenance.effects,
+            vec![DhtLifecycleEffect::RecordRuntimeWarning {
+                warning: "DHT maintenance failed: maintenance error".to_string(),
+                publish_status: true,
+            }]
+        );
+
+        let runtime_step = DhtLifecycleModel::update(DhtLifecycleAction::RuntimeStepFailed {
+            warning: "DHT runtime step failed: step error".to_string(),
+        });
+        assert_eq!(
+            runtime_step.effects,
+            vec![DhtLifecycleEffect::RecordRuntimeWarning {
+                warning: "DHT runtime step failed: step error".to_string(),
+                publish_status: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn dht_lifecycle_model_shutdown_saves_runtime_state() {
+        let reduction = DhtLifecycleModel::update(DhtLifecycleAction::Shutdown);
+
+        assert_eq!(
+            reduction.effects,
+            vec![DhtLifecycleEffect::SaveRuntimeState]
+        );
     }
 
     #[test]
