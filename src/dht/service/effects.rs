@@ -392,6 +392,9 @@ pub(in crate::dht::service) fn apply_demand_planner_effects(
     slice_metrics: &mut DemandSliceMetrics,
     effects: Vec<DemandPlannerEffect>,
 ) -> bool {
+    // Direct planner reductions in this loop are planner effect continuations:
+    // the effect adapter has just learned runtime-dependent outcomes and feeds
+    // them back into the planner model without crossing the service boundary.
     let mut finalized_any = false;
     let mut pending_effects = VecDeque::from(effects);
 
