@@ -737,11 +737,6 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig {
-            cases: 128,
-            ..ProptestConfig::default()
-        })]
-
         #[test]
         fn demand_scheduler_state_fuzz_keeps_entries_consistent(
             ops in prop::collection::vec(scheduler_op_strategy(), 1..160)
