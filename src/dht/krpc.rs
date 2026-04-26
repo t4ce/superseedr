@@ -101,7 +101,7 @@ impl<A> KrpcQueryEnvelope<A> {
             y: "q",
             q: query.as_str(),
             a: args,
-            ro: Some(1),
+            ro: None,
             v: version.map(|bytes| ByteBuf::from(bytes.to_vec())),
         }
     }
@@ -697,4 +697,27 @@ pub fn encode_compact_nodes(nodes: &[CompactNode], family: AddressFamily) -> Byt
     }
 
     ByteBuf::from(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outbound_queries_do_not_advertise_read_only_by_default() {
+        let envelope = KrpcQueryEnvelope::new(
+            TransactionId::from([1, 2, 3, 4]),
+            KrpcQueryKind::Ping,
+            KrpcPingArgs::new(NodeId::from([3; NodeId::LEN])),
+        );
+
+        assert_eq!(envelope.ro, None);
+        let encoded = serde_bencode::to_bytes(&envelope).expect("encode query envelope");
+        assert!(
+            !encoded
+                .windows(b"2:ro".len())
+                .any(|window| window == b"2:ro"),
+            "encoded query must omit BEP 43 read-only flag"
+        );
+    }
 }
