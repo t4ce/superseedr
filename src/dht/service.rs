@@ -2048,6 +2048,139 @@ impl DemandSubscriberRegistry {
     }
 }
 
+struct DhtRuntimeLookupFamilyRequest {
+    info_hash: InfoHash,
+    family: AddressFamily,
+    slice_class: DemandSliceClass,
+    record_metrics: bool,
+    merged_tx: mpsc::UnboundedSender<Vec<SocketAddr>>,
+    lookup_ids: Arc<StdMutex<Vec<LookupId>>>,
+    first_batch_seen: Arc<AtomicBool>,
+    accepting_families: Arc<AtomicBool>,
+}
+
+enum DhtRuntimeCommandAction {
+    StartGetPeers {
+        info_hash: InfoHash,
+        response_tx: oneshot::Sender<Result<StartedLookup, String>>,
+    },
+    StartGetPeersFamily(DhtRuntimeLookupFamilyRequest),
+    CancelLookups {
+        lookup_ids: Vec<LookupId>,
+    },
+    ParkDemandLookups {
+        info_hash: InfoHash,
+        slice_class: DemandSliceClass,
+        stop_reason: DemandSliceStopReason,
+        total_peers: usize,
+        unique_peers: HashSet<SocketAddr>,
+        lookup_ids: Arc<StdMutex<Vec<LookupId>>>,
+    },
+    FinalizeDrainedDemandLookups {
+        info_hash: InfoHash,
+    },
+    AnnouncePeer {
+        info_hash: InfoHash,
+        port: Option<u16>,
+        response_tx: oneshot::Sender<bool>,
+    },
+}
+
+enum DhtRuntimeCommandEffect {
+    StartGetPeers {
+        info_hash: InfoHash,
+        response_tx: oneshot::Sender<Result<StartedLookup, String>>,
+    },
+    AttachLookupFamily(DhtRuntimeLookupFamilyRequest),
+    CancelLookups {
+        lookup_ids: Vec<LookupId>,
+    },
+    ParkDemandLookups {
+        info_hash: InfoHash,
+        slice_class: DemandSliceClass,
+        stop_reason: DemandSliceStopReason,
+        total_peers: usize,
+        unique_peers: HashSet<SocketAddr>,
+        lookup_ids: Arc<StdMutex<Vec<LookupId>>>,
+    },
+    FinalizeDrainedDemandLookups {
+        info_hash: InfoHash,
+    },
+    AnnouncePeer {
+        info_hash: InfoHash,
+        port: Option<u16>,
+        response_tx: oneshot::Sender<bool>,
+    },
+    StartDueDemands,
+}
+
+#[derive(Default)]
+struct DhtRuntimeCommandReduction {
+    effects: Vec<DhtRuntimeCommandEffect>,
+}
+
+struct DhtRuntimeCommandModel;
+
+impl DhtRuntimeCommandModel {
+    fn update(action: DhtRuntimeCommandAction) -> DhtRuntimeCommandReduction {
+        let effects = match action {
+            DhtRuntimeCommandAction::StartGetPeers {
+                info_hash,
+                response_tx,
+            } => {
+                vec![DhtRuntimeCommandEffect::StartGetPeers {
+                    info_hash,
+                    response_tx,
+                }]
+            }
+            DhtRuntimeCommandAction::StartGetPeersFamily(request) => {
+                vec![DhtRuntimeCommandEffect::AttachLookupFamily(request)]
+            }
+            DhtRuntimeCommandAction::CancelLookups { lookup_ids } => {
+                vec![DhtRuntimeCommandEffect::CancelLookups { lookup_ids }]
+            }
+            DhtRuntimeCommandAction::ParkDemandLookups {
+                info_hash,
+                slice_class,
+                stop_reason,
+                total_peers,
+                unique_peers,
+                lookup_ids,
+            } => {
+                vec![
+                    DhtRuntimeCommandEffect::ParkDemandLookups {
+                        info_hash,
+                        slice_class,
+                        stop_reason,
+                        total_peers,
+                        unique_peers,
+                        lookup_ids,
+                    },
+                    DhtRuntimeCommandEffect::StartDueDemands,
+                ]
+            }
+            DhtRuntimeCommandAction::FinalizeDrainedDemandLookups { info_hash } => {
+                vec![
+                    DhtRuntimeCommandEffect::FinalizeDrainedDemandLookups { info_hash },
+                    DhtRuntimeCommandEffect::StartDueDemands,
+                ]
+            }
+            DhtRuntimeCommandAction::AnnouncePeer {
+                info_hash,
+                port,
+                response_tx,
+            } => {
+                vec![DhtRuntimeCommandEffect::AnnouncePeer {
+                    info_hash,
+                    port,
+                    response_tx,
+                }]
+            }
+        };
+        DhtRuntimeCommandReduction { effects }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct BootstrapSummary {
     total: usize,
@@ -2736,17 +2869,19 @@ async fn run_service(
                 info_hash,
                 response_tx,
             }) => {
-                let result = start_get_peers_lookup(
-                    active_runtime.as_mut(),
+                let reduction =
+                    DhtRuntimeCommandModel::update(DhtRuntimeCommandAction::StartGetPeers {
+                        info_hash,
+                        response_tx,
+                    });
+                apply_dht_runtime_command_effects(
+                    reduction.effects,
+                    &mut active_runtime,
                     &command_tx,
                     &mut demand_planner,
-                    None,
-                    info_hash,
-                    DemandSliceClass::RoutineRefresh,
-                    false,
+                    &mut slice_metrics,
                 )
                 .await;
-                let _ = response_tx.send(result);
             }
             LoopEvent::Command(DhtCommand::StartGetPeersFamily {
                 info_hash,
@@ -2758,30 +2893,40 @@ async fn run_service(
                 first_batch_seen,
                 accepting_families,
             }) => {
-                let _ = attach_lookup_family(
-                    active_runtime.as_mut(),
+                let reduction = DhtRuntimeCommandModel::update(
+                    DhtRuntimeCommandAction::StartGetPeersFamily(DhtRuntimeLookupFamilyRequest {
+                        info_hash,
+                        family,
+                        slice_class,
+                        record_metrics,
+                        merged_tx,
+                        lookup_ids,
+                        first_batch_seen,
+                        accepting_families,
+                    }),
+                );
+                apply_dht_runtime_command_effects(
+                    reduction.effects,
+                    &mut active_runtime,
+                    &command_tx,
                     &mut demand_planner,
-                    if record_metrics {
-                        Some(&mut slice_metrics)
-                    } else {
-                        None
-                    },
-                    info_hash,
-                    family,
-                    slice_class,
-                    merged_tx,
-                    lookup_ids,
-                    first_batch_seen,
-                    accepting_families,
+                    &mut slice_metrics,
                 )
                 .await;
             }
             LoopEvent::Command(DhtCommand::CancelLookups { lookup_ids }) => {
-                if let Some(active_runtime) = active_runtime.as_mut() {
-                    for lookup_id in lookup_ids {
-                        active_runtime.runtime.cancel_lookup(lookup_id);
-                    }
-                }
+                let reduction =
+                    DhtRuntimeCommandModel::update(DhtRuntimeCommandAction::CancelLookups {
+                        lookup_ids,
+                    });
+                apply_dht_runtime_command_effects(
+                    reduction.effects,
+                    &mut active_runtime,
+                    &command_tx,
+                    &mut demand_planner,
+                    &mut slice_metrics,
+                )
+                .await;
             }
             LoopEvent::Command(DhtCommand::ParkDemandLookups {
                 info_hash,
@@ -2791,23 +2936,18 @@ async fn run_service(
                 unique_peers,
                 lookup_ids,
             }) => {
-                let requested = demand_planner.update(DemandPlannerAction::LookupParkRequested {
-                    info_hash,
-                    slice_class,
-                    stop_reason,
-                    total_peers,
-                    unique_peers,
-                    lookup_ids,
-                });
-                apply_demand_planner_effects(
-                    active_runtime.as_mut(),
-                    &mut demand_planner,
-                    &command_tx,
-                    &mut slice_metrics,
-                    requested.effects,
-                );
-                start_due_demands(
-                    active_runtime.as_mut(),
+                let reduction =
+                    DhtRuntimeCommandModel::update(DhtRuntimeCommandAction::ParkDemandLookups {
+                        info_hash,
+                        slice_class,
+                        stop_reason,
+                        total_peers,
+                        unique_peers,
+                        lookup_ids,
+                    });
+                apply_dht_runtime_command_effects(
+                    reduction.effects,
+                    &mut active_runtime,
                     &command_tx,
                     &mut demand_planner,
                     &mut slice_metrics,
@@ -2815,16 +2955,12 @@ async fn run_service(
                 .await;
             }
             LoopEvent::Command(DhtCommand::FinalizeDrainedDemandLookups { info_hash }) => {
-                finish_drained_demand_lookup(
-                    active_runtime.as_mut(),
-                    &mut demand_planner,
-                    &command_tx,
-                    &mut slice_metrics,
-                    info_hash,
-                    false,
+                let reduction = DhtRuntimeCommandModel::update(
+                    DhtRuntimeCommandAction::FinalizeDrainedDemandLookups { info_hash },
                 );
-                start_due_demands(
-                    active_runtime.as_mut(),
+                apply_dht_runtime_command_effects(
+                    reduction.effects,
+                    &mut active_runtime,
                     &command_tx,
                     &mut demand_planner,
                     &mut slice_metrics,
@@ -2859,8 +2995,20 @@ async fn run_service(
                 port,
                 response_tx,
             }) => {
-                let success = announce_peer(active_runtime.as_mut(), info_hash, port).await;
-                let _ = response_tx.send(success);
+                let reduction =
+                    DhtRuntimeCommandModel::update(DhtRuntimeCommandAction::AnnouncePeer {
+                        info_hash,
+                        port,
+                        response_tx,
+                    });
+                apply_dht_runtime_command_effects(
+                    reduction.effects,
+                    &mut active_runtime,
+                    &command_tx,
+                    &mut demand_planner,
+                    &mut slice_metrics,
+                )
+                .await;
             }
             LoopEvent::DemandTick => {
                 start_due_demands(
@@ -3046,6 +3194,112 @@ fn apply_demand_subscriber_effects(
                         });
                     pending_effects.extend(reduction.effects);
                 }
+            }
+        }
+    }
+}
+
+async fn apply_dht_runtime_command_effects(
+    effects: Vec<DhtRuntimeCommandEffect>,
+    active_runtime: &mut Option<ActiveRuntime>,
+    command_tx: &DhtCommandSender,
+    demand_planner: &mut DemandPlannerModel,
+    slice_metrics: &mut DemandSliceMetrics,
+) {
+    for effect in effects {
+        match effect {
+            DhtRuntimeCommandEffect::StartGetPeers {
+                info_hash,
+                response_tx,
+            } => {
+                let result = start_get_peers_lookup(
+                    active_runtime.as_mut(),
+                    command_tx,
+                    demand_planner,
+                    None,
+                    info_hash,
+                    DemandSliceClass::RoutineRefresh,
+                    false,
+                )
+                .await;
+                let _ = response_tx.send(result);
+            }
+            DhtRuntimeCommandEffect::AttachLookupFamily(request) => {
+                let _ = attach_lookup_family(
+                    active_runtime.as_mut(),
+                    demand_planner,
+                    if request.record_metrics {
+                        Some(slice_metrics)
+                    } else {
+                        None
+                    },
+                    request.info_hash,
+                    request.family,
+                    request.slice_class,
+                    request.merged_tx,
+                    request.lookup_ids,
+                    request.first_batch_seen,
+                    request.accepting_families,
+                )
+                .await;
+            }
+            DhtRuntimeCommandEffect::CancelLookups { lookup_ids } => {
+                if let Some(active_runtime) = active_runtime.as_mut() {
+                    for lookup_id in lookup_ids {
+                        active_runtime.runtime.cancel_lookup(lookup_id);
+                    }
+                }
+            }
+            DhtRuntimeCommandEffect::ParkDemandLookups {
+                info_hash,
+                slice_class,
+                stop_reason,
+                total_peers,
+                unique_peers,
+                lookup_ids,
+            } => {
+                let requested = demand_planner.update(DemandPlannerAction::LookupParkRequested {
+                    info_hash,
+                    slice_class,
+                    stop_reason,
+                    total_peers,
+                    unique_peers,
+                    lookup_ids,
+                });
+                apply_demand_planner_effects(
+                    active_runtime.as_mut(),
+                    demand_planner,
+                    command_tx,
+                    slice_metrics,
+                    requested.effects,
+                );
+            }
+            DhtRuntimeCommandEffect::FinalizeDrainedDemandLookups { info_hash } => {
+                finish_drained_demand_lookup(
+                    active_runtime.as_mut(),
+                    demand_planner,
+                    command_tx,
+                    slice_metrics,
+                    info_hash,
+                    false,
+                );
+            }
+            DhtRuntimeCommandEffect::AnnouncePeer {
+                info_hash,
+                port,
+                response_tx,
+            } => {
+                let success = announce_peer(active_runtime.as_mut(), info_hash, port).await;
+                let _ = response_tx.send(success);
+            }
+            DhtRuntimeCommandEffect::StartDueDemands => {
+                start_due_demands(
+                    active_runtime.as_mut(),
+                    command_tx,
+                    demand_planner,
+                    slice_metrics,
+                )
+                .await;
             }
         }
     }
@@ -5769,6 +6023,162 @@ mod tests {
         };
         assert_eq!(deliveries.len(), 1);
         assert_eq!(deliveries[0].subscriber_id, live_id);
+    }
+
+    #[test]
+    fn dht_runtime_command_model_routes_start_get_peers_and_announce() {
+        let info_hash = hash_index(44);
+        let (lookup_response_tx, _lookup_response_rx) = oneshot::channel();
+
+        let mut reduction =
+            DhtRuntimeCommandModel::update(DhtRuntimeCommandAction::StartGetPeers {
+                info_hash,
+                response_tx: lookup_response_tx,
+            });
+
+        assert_eq!(reduction.effects.len(), 1);
+        match reduction.effects.pop().expect("start get peers effect") {
+            DhtRuntimeCommandEffect::StartGetPeers {
+                info_hash: effect_hash,
+                ..
+            } => assert_eq!(effect_hash, info_hash),
+            _ => panic!("expected start get peers effect"),
+        }
+
+        let (announce_response_tx, _announce_response_rx) = oneshot::channel();
+        let mut reduction = DhtRuntimeCommandModel::update(DhtRuntimeCommandAction::AnnouncePeer {
+            info_hash,
+            port: Some(6881),
+            response_tx: announce_response_tx,
+        });
+
+        assert_eq!(reduction.effects.len(), 1);
+        match reduction.effects.pop().expect("announce effect") {
+            DhtRuntimeCommandEffect::AnnouncePeer {
+                info_hash: effect_hash,
+                port,
+                ..
+            } => {
+                assert_eq!(effect_hash, info_hash);
+                assert_eq!(port, Some(6881));
+            }
+            _ => panic!("expected announce peer effect"),
+        }
+    }
+
+    #[test]
+    fn dht_runtime_command_model_routes_family_attach_and_cancel() {
+        let info_hash = hash_index(45);
+        let (merged_tx, _merged_rx) = mpsc::unbounded_channel();
+        let lookup_ids = Arc::new(StdMutex::new(Vec::new()));
+        let expected_lookup_ids = lookup_ids.clone();
+        let first_batch_seen = Arc::new(AtomicBool::new(false));
+        let expected_first_batch_seen = first_batch_seen.clone();
+        let accepting_families = Arc::new(AtomicBool::new(true));
+        let expected_accepting_families = accepting_families.clone();
+
+        let mut reduction = DhtRuntimeCommandModel::update(
+            DhtRuntimeCommandAction::StartGetPeersFamily(DhtRuntimeLookupFamilyRequest {
+                info_hash,
+                family: AddressFamily::Ipv6,
+                slice_class: DemandSliceClass::AwaitingMetadata,
+                record_metrics: true,
+                merged_tx,
+                lookup_ids,
+                first_batch_seen,
+                accepting_families,
+            }),
+        );
+
+        assert_eq!(reduction.effects.len(), 1);
+        match reduction.effects.pop().expect("attach family effect") {
+            DhtRuntimeCommandEffect::AttachLookupFamily(request) => {
+                assert_eq!(request.info_hash, info_hash);
+                assert_eq!(request.family, AddressFamily::Ipv6);
+                assert_eq!(request.slice_class, DemandSliceClass::AwaitingMetadata);
+                assert!(request.record_metrics);
+                assert!(Arc::ptr_eq(&request.lookup_ids, &expected_lookup_ids));
+                assert!(Arc::ptr_eq(
+                    &request.first_batch_seen,
+                    &expected_first_batch_seen
+                ));
+                assert!(Arc::ptr_eq(
+                    &request.accepting_families,
+                    &expected_accepting_families
+                ));
+            }
+            _ => panic!("expected attach lookup family effect"),
+        }
+
+        let mut reduction =
+            DhtRuntimeCommandModel::update(DhtRuntimeCommandAction::CancelLookups {
+                lookup_ids: vec![LookupId(7), LookupId(9)],
+            });
+
+        assert_eq!(reduction.effects.len(), 1);
+        match reduction.effects.pop().expect("cancel effect") {
+            DhtRuntimeCommandEffect::CancelLookups { lookup_ids } => {
+                assert_eq!(lookup_ids, vec![LookupId(7), LookupId(9)]);
+            }
+            _ => panic!("expected cancel lookups effect"),
+        }
+    }
+
+    #[test]
+    fn dht_runtime_command_model_routes_planner_work_with_start_due_followup() {
+        let info_hash = hash_index(46);
+        let lookup_ids = Arc::new(StdMutex::new(vec![LookupId(11)]));
+        let expected_lookup_ids = lookup_ids.clone();
+        let unique_peers = HashSet::from([peer("127.0.0.1:6881")]);
+
+        let reduction =
+            DhtRuntimeCommandModel::update(DhtRuntimeCommandAction::ParkDemandLookups {
+                info_hash,
+                slice_class: DemandSliceClass::NoConnectedPeers,
+                stop_reason: DemandSliceStopReason::WallTime,
+                total_peers: 3,
+                unique_peers: unique_peers.clone(),
+                lookup_ids,
+            });
+
+        assert_eq!(reduction.effects.len(), 2);
+        match &reduction.effects[0] {
+            DhtRuntimeCommandEffect::ParkDemandLookups {
+                info_hash: effect_hash,
+                slice_class,
+                stop_reason,
+                total_peers,
+                unique_peers: effect_unique_peers,
+                lookup_ids,
+            } => {
+                assert_eq!(*effect_hash, info_hash);
+                assert_eq!(*slice_class, DemandSliceClass::NoConnectedPeers);
+                assert_eq!(*stop_reason, DemandSliceStopReason::WallTime);
+                assert_eq!(*total_peers, 3);
+                assert_eq!(effect_unique_peers, &unique_peers);
+                assert!(Arc::ptr_eq(lookup_ids, &expected_lookup_ids));
+            }
+            _ => panic!("expected park demand lookups effect"),
+        }
+        assert!(matches!(
+            reduction.effects[1],
+            DhtRuntimeCommandEffect::StartDueDemands
+        ));
+
+        let reduction =
+            DhtRuntimeCommandModel::update(DhtRuntimeCommandAction::FinalizeDrainedDemandLookups {
+                info_hash,
+            });
+        assert_eq!(reduction.effects.len(), 2);
+        assert!(matches!(
+            reduction.effects[0],
+            DhtRuntimeCommandEffect::FinalizeDrainedDemandLookups { info_hash: effect_hash }
+                if effect_hash == info_hash
+        ));
+        assert!(matches!(
+            reduction.effects[1],
+            DhtRuntimeCommandEffect::StartDueDemands
+        ));
     }
 
     async fn local_ipv4_active_runtime() -> ActiveRuntime {
