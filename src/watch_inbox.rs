@@ -11,6 +11,10 @@ pub fn is_cross_device_link_error(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(18) | Some(17))
 }
 
+pub fn open_for_timestamp_update(destination: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new().write(true).open(destination)
+}
+
 pub fn move_file_with_fallback_impl<F>(
     source: &Path,
     destination: &Path,
@@ -26,7 +30,23 @@ where
     match rename_op(source, destination) {
         Ok(()) => Ok(()),
         Err(error) if is_cross_device_link_error(&error) => {
+            let metadata = fs::metadata(source)?;
             fs::copy(source, destination)?;
+
+            if let Ok(mtime) = metadata.modified() {
+                let timestamp = fs::FileTimes::new().set_modified(mtime);
+                if let Err(error) = open_for_timestamp_update(destination)
+                    .and_then(|file| file.set_times(timestamp))
+                {
+                    tracing::warn!(
+                        ?source,
+                        ?destination,
+                        ?error,
+                        "failed to preserve copied file timestamp"
+                    );
+                }
+            }
+
             fs::remove_file(source)?;
             Ok(())
         }
