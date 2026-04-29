@@ -70,6 +70,31 @@ fn dht_service_model_reconfigure_failure_preserves_config_and_generation() {
 
     let reduction = model.update(DhtServiceAction::ReconfigureFailed {
         warning: "runtime unavailable".to_string(),
+        runtime_reset: false,
+    });
+
+    assert_eq!(model.config(), &initial);
+    assert_eq!(model.generation(), 3);
+    assert_eq!(
+        model.warning_owned().as_deref(),
+        Some("runtime unavailable")
+    );
+    assert_eq!(reduction.effects, vec![DhtServiceEffect::PublishStatus]);
+}
+
+#[test]
+fn dht_service_model_reconfigure_failure_resets_dependents_when_runtime_was_lost() {
+    let initial = DhtServiceConfig {
+        port: 6881,
+        bootstrap_nodes: vec!["198.51.100.10:6881".to_string()],
+        preferred_backend: DhtBackendKind::InternalPrototype,
+        force_internal_failure: false,
+    };
+    let mut model = DhtServiceModel::new(initial.clone(), 3, None);
+
+    let reduction = model.update(DhtServiceAction::ReconfigureFailed {
+        warning: "runtime unavailable".to_string(),
+        runtime_reset: true,
     });
 
     assert_eq!(model.config(), &initial);

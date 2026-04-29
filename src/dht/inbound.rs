@@ -11,6 +11,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant, SystemTime};
 
 const ERROR_PROTOCOL: i64 = 203;
+const RATE_LIMITER_IDLE_TTL: Duration = Duration::from_secs(300);
+const RATE_LIMITER_PRUNE_INTERVAL: Duration = Duration::from_secs(30);
+const MAX_RATE_LIMITER_ENTRIES: usize = 16_384;
 
 #[derive(Debug, Clone)]
 pub struct InboundConfig {
@@ -53,6 +56,7 @@ struct RateLimiter {
 pub struct InboundActor {
     config: InboundConfig,
     per_ip_rate_limits: HashMap<IpAddr, RateLimiter>,
+    last_rate_limiter_prune_at: Option<Instant>,
 }
 
 impl InboundActor {
@@ -60,6 +64,7 @@ impl InboundActor {
         Self {
             config,
             per_ip_rate_limits: HashMap::new(),
+            last_rate_limiter_prune_at: None,
         }
     }
 
@@ -195,6 +200,13 @@ impl InboundActor {
     }
 
     fn allow_query(&mut self, source_ip: IpAddr, now: Instant) -> bool {
+        self.prune_stale_rate_limiters(now);
+        if !self.per_ip_rate_limits.contains_key(&source_ip)
+            && self.per_ip_rate_limits.len() >= MAX_RATE_LIMITER_ENTRIES
+        {
+            return false;
+        }
+
         let burst = self
             .config
             .burst_capacity
@@ -217,6 +229,23 @@ impl InboundActor {
 
         limiter.tokens -= 1.0;
         true
+    }
+
+    fn prune_stale_rate_limiters(&mut self, now: Instant) {
+        let prune_due = match self.last_rate_limiter_prune_at {
+            Some(last_prune_at) => {
+                now.saturating_duration_since(last_prune_at) >= RATE_LIMITER_PRUNE_INTERVAL
+            }
+            None => true,
+        };
+        if !prune_due && self.per_ip_rate_limits.len() < MAX_RATE_LIMITER_ENTRIES {
+            return;
+        }
+
+        self.per_ip_rate_limits.retain(|_, limiter| {
+            now.saturating_duration_since(limiter.last_refill_at) <= RATE_LIMITER_IDLE_TTL
+        });
+        self.last_rate_limiter_prune_at = Some(now);
     }
 
     fn closest_nodes_for(
@@ -250,5 +279,51 @@ fn remember_inbound_node(
         let mut record = NodeRecord::new(source, Some(node_id), now);
         record.note_inbound_query(now);
         let _ = routing.insert(record, now);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn source_ip(index: usize) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(
+            10,
+            ((index >> 16) & 0xff) as u8,
+            ((index >> 8) & 0xff) as u8,
+            (index & 0xff) as u8,
+        ))
+    }
+
+    #[test]
+    fn rate_limiter_prunes_idle_sources() {
+        let start = Instant::now();
+        let mut actor = InboundActor::new(InboundConfig::default());
+
+        assert!(actor.allow_query(source_ip(1), start));
+        assert!(actor.allow_query(source_ip(2), start + Duration::from_secs(1)));
+        assert_eq!(actor.per_ip_rate_limits.len(), 2);
+
+        let later = start + RATE_LIMITER_IDLE_TTL + RATE_LIMITER_PRUNE_INTERVAL;
+        assert!(actor.allow_query(source_ip(3), later));
+
+        assert_eq!(actor.per_ip_rate_limits.len(), 1);
+        assert!(actor.per_ip_rate_limits.contains_key(&source_ip(3)));
+    }
+
+    #[test]
+    fn rate_limiter_rejects_new_sources_at_hard_cap() {
+        let start = Instant::now();
+        let mut actor = InboundActor::new(InboundConfig::default());
+
+        for index in 0..MAX_RATE_LIMITER_ENTRIES {
+            assert!(actor.allow_query(source_ip(index), start));
+        }
+
+        let rejected = source_ip(MAX_RATE_LIMITER_ENTRIES);
+        assert!(!actor.allow_query(rejected, start + Duration::from_secs(1)));
+        assert_eq!(actor.per_ip_rate_limits.len(), MAX_RATE_LIMITER_ENTRIES);
+        assert!(!actor.per_ip_rate_limits.contains_key(&rejected));
     }
 }

@@ -1852,6 +1852,15 @@ impl TorrentManager {
 
         let demand_state = self.current_dht_demand_state();
         let demand_metrics = self.current_dht_demand_metrics();
+        if self
+            .dht_task_handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished())
+        {
+            self.dht_task_handle = None;
+            self.dht_demand_state = None;
+            self.dht_demand_metrics = None;
+        }
         if self.dht_task_handle.is_none() {
             self.start_dht_lookup_task(demand_state, demand_metrics);
         }
@@ -3412,6 +3421,33 @@ mod resource_tests {
             global_ul_bucket: Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY)),
             file_priorities: HashMap::new(),
         }
+    }
+
+    #[cfg(feature = "dht")]
+    #[tokio::test]
+    async fn sync_dht_lookup_task_restarts_finished_handle() {
+        let mut manager =
+            TorrentManager::from_torrent(build_test_params(), create_dummy_torrent(1))
+                .expect("manager from torrent");
+        manager.run_loop_started = true;
+        manager.dht_task_handle = Some(tokio::spawn(async {}));
+        tokio::task::yield_now().await;
+
+        assert!(manager
+            .dht_task_handle
+            .as_ref()
+            .expect("finished dht task handle")
+            .is_finished());
+
+        manager.sync_dht_lookup_task();
+
+        assert!(manager.dht_task_handle.is_some());
+        assert!(!manager
+            .dht_task_handle
+            .as_ref()
+            .expect("replacement dht task handle")
+            .is_finished());
+        manager.stop_dht_lookup_task();
     }
 
     #[tokio::test]

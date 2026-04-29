@@ -39,6 +39,7 @@ pub(in crate::dht::service) async fn apply_dht_service_effects(
     while let Some(effect) = pending_effects.pop_front() {
         match effect {
             DhtServiceEffect::BuildRuntime { config } => {
+                let old_config = service_state.service.config().clone();
                 let old_port = service_state.service.config().port;
                 let drop_before_bind = active_runtime.is_some() && old_port == config.port;
                 if drop_before_bind {
@@ -47,26 +48,44 @@ pub(in crate::dht::service) async fn apply_dht_service_effects(
                     }
                 }
 
-                let reduction =
-                    match build_runtime(&config, local_node_id).await {
-                        Ok(built) => {
-                            if !drop_before_bind {
-                                if let Some(previous) = active_runtime.as_ref() {
-                                    let _ = previous.runtime.save_state().await;
+                let reduction = match build_runtime(&config, local_node_id).await {
+                    Ok(built) => {
+                        if !drop_before_bind {
+                            if let Some(previous) = active_runtime.as_ref() {
+                                let _ = previous.runtime.save_state().await;
+                            }
+                        }
+                        *active_runtime = built.active_runtime;
+                        service_state.update_service_action(
+                            DhtServiceAction::ReconfigureSucceeded {
+                                config,
+                                warning: built.warning,
+                            },
+                        )
+                    }
+                    Err(error) => {
+                        let mut warning = error;
+                        if drop_before_bind {
+                            match build_runtime(&old_config, local_node_id).await {
+                                Ok(restored) => {
+                                    *active_runtime = restored.active_runtime;
+                                    if let Some(restore_warning) = restored.warning {
+                                        warning.push_str("; restored previous runtime warning: ");
+                                        warning.push_str(&restore_warning);
+                                    }
+                                }
+                                Err(restore_error) => {
+                                    warning.push_str("; failed to restore previous runtime: ");
+                                    warning.push_str(&restore_error);
                                 }
                             }
-                            *active_runtime = built.active_runtime;
-                            service_state.update_service_action(
-                                DhtServiceAction::ReconfigureSucceeded {
-                                    config,
-                                    warning: built.warning,
-                                },
-                            )
                         }
-                        Err(error) => service_state.update_service_action(
-                            DhtServiceAction::ReconfigureFailed { warning: error },
-                        ),
-                    };
+                        service_state.update_service_action(DhtServiceAction::ReconfigureFailed {
+                            warning,
+                            runtime_reset: drop_before_bind,
+                        })
+                    }
+                };
                 pending_effects.extend(reduction.effects);
             }
             DhtServiceEffect::ResetDemandPlanner => {

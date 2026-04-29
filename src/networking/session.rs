@@ -690,11 +690,7 @@ impl PeerSession {
 
     #[cfg(feature = "pex")]
     fn handle_pex(&self, peers_list: Vec<String>) {
-        if let Some(pex_id) = self
-            .peer_extended_id_mappings
-            .get(ClientExtendedId::UtPex.as_str())
-            .copied()
-        {
+        if let Some(pex_id) = self.peer_advertised_extension_id(ClientExtendedId::UtPex) {
             let peers: Vec<SocketAddr> = peers_list
                 .iter()
                 .filter(|&ip| *ip != self.peer_ip_port)
@@ -733,11 +729,23 @@ impl PeerSession {
         }
     }
 
-    fn peer_extension_id(&self, extension: ClientExtendedId) -> u8 {
+    fn peer_advertised_extension_id(&self, extension: ClientExtendedId) -> Option<u8> {
         self.peer_extended_id_mappings
             .get(extension.as_str())
             .copied()
-            .unwrap_or_else(|| extension.id())
+            .filter(|id| *id != ClientExtendedId::Handshake.id())
+    }
+
+    fn peer_extension_id(&self, extension: ClientExtendedId) -> Option<u8> {
+        match self
+            .peer_extended_id_mappings
+            .get(extension.as_str())
+            .copied()
+        {
+            Some(id) if id == ClientExtendedId::Handshake.id() => None,
+            Some(id) => Some(id),
+            None => Some(extension.id()),
+        }
     }
 
     async fn handle_extended_message(
@@ -759,16 +767,19 @@ impl PeerSession {
                                 piece: 0,
                                 total_size: None,
                             };
-                            if let Ok(payload_bytes) = serde_bencode::to_bytes(&request) {
-                                let _ = self.writer_tx.try_send(Message::Extended(
-                                    self.peer_extension_id(ClientExtendedId::UtMetadata),
-                                    payload_bytes,
-                                ));
+                            if let (Some(metadata_id), Ok(payload_bytes)) = (
+                                self.peer_extension_id(ClientExtendedId::UtMetadata),
+                                serde_bencode::to_bytes(&request),
+                            ) {
+                                let _ = self
+                                    .writer_tx
+                                    .try_send(Message::Extended(metadata_id, payload_bytes));
                             }
                         }
                     }
                 }
             }
+            return Ok(());
         }
 
         #[cfg(feature = "pex")]
@@ -800,7 +811,7 @@ impl PeerSession {
             }
         }
 
-        if extended_id == self.peer_extension_id(ClientExtendedId::UtMetadata)
+        if Some(extended_id) == self.peer_extension_id(ClientExtendedId::UtMetadata)
             && !self.peer_session_established
         {
             if let Some(ref handshake_data) = self.peer_extended_handshake_payload {
@@ -843,11 +854,13 @@ impl PeerSession {
                                 piece: self.peer_torrent_metadata_piece_count,
                                 total_size: None,
                             };
-                            if let Ok(payload_bytes) = serde_bencode::to_bytes(&request) {
-                                let _ = self.writer_tx.try_send(Message::Extended(
-                                    self.peer_extension_id(ClientExtendedId::UtMetadata),
-                                    payload_bytes,
-                                ));
+                            if let (Some(metadata_id), Ok(payload_bytes)) = (
+                                self.peer_extension_id(ClientExtendedId::UtMetadata),
+                                serde_bencode::to_bytes(&request),
+                            ) {
+                                let _ = self
+                                    .writer_tx
+                                    .try_send(Message::Extended(metadata_id, payload_bytes));
                             }
                         }
                     }
@@ -1175,6 +1188,45 @@ mod tests {
             }
             other => panic!("expected metadata request on peer-advertised id, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn metadata_extension_id_zero_is_ignored() {
+        let (mut session, mut manager_rx) = build_session_for_extended_message_tests();
+        let mut extensions = HashMap::new();
+        extensions.insert(ClientExtendedId::UtMetadata.as_str().to_string(), 0);
+        let handshake = ExtendedHandshakePayload {
+            m: extensions,
+            metadata_size: Some(1),
+            lt_v2: None,
+        };
+
+        session
+            .handle_extended_message(
+                ClientExtendedId::Handshake.id(),
+                serde_bencode::to_bytes(&handshake).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(session.writer_rx.as_mut().unwrap().try_recv().is_err());
+        assert!(session.peer_torrent_metadata_pieces.is_empty());
+
+        let metadata_header = MetadataMessage {
+            msg_type: 1,
+            piece: 0,
+            total_size: Some(1),
+        };
+        let mut metadata_payload = serde_bencode::to_bytes(&metadata_header).unwrap();
+        metadata_payload.push(b'x');
+
+        session
+            .handle_extended_message(ClientExtendedId::Handshake.id(), metadata_payload)
+            .await
+            .unwrap();
+
+        assert!(session.peer_torrent_metadata_pieces.is_empty());
+        assert!(manager_rx.try_recv().is_err());
     }
 
     #[tokio::test]

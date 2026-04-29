@@ -14,6 +14,7 @@ pub(in crate::dht::service) enum DhtServiceAction {
     },
     ReconfigureFailed {
         warning: String,
+        runtime_reset: bool,
     },
     RuntimeWarning {
         warning: String,
@@ -86,15 +87,21 @@ impl DhtServiceModel {
                     ],
                 }
             }
-            DhtServiceAction::ReconfigureFailed { warning } => {
+            DhtServiceAction::ReconfigureFailed {
+                warning,
+                runtime_reset,
+            } => {
                 self.warning = Some(warning);
-                DhtServiceReduction {
-                    effects: vec![
+                let effects = if runtime_reset {
+                    vec![
                         DhtServiceEffect::ResetDemandPlanner,
                         DhtServiceEffect::PublishStatus,
                         DhtServiceEffect::StartDueDemands,
-                    ],
-                }
+                    ]
+                } else {
+                    vec![DhtServiceEffect::PublishStatus]
+                };
+                DhtServiceReduction { effects }
             }
             DhtServiceAction::RuntimeWarning { warning } => {
                 self.warning = Some(warning);
