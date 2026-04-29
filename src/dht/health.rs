@@ -5,6 +5,7 @@ use super::peer_store::PeerStore;
 use super::routing::RoutingSnapshot;
 use super::transport::TransportActor;
 use super::types::{Bep42State, NodeTrust};
+use std::net::SocketAddr;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DhtAnomalySummary {
@@ -30,6 +31,8 @@ pub struct DhtHealthSnapshot {
     pub bootstrap_responsive_count: usize,
     pub inbound_query_rate: usize,
     pub recent_lookup_success_rate: usize,
+    pub confirmed_public_addr_ipv4: Option<SocketAddr>,
+    pub confirmed_public_addr_ipv6: Option<SocketAddr>,
     pub anomalies: DhtAnomalySummary,
 }
 
@@ -79,6 +82,8 @@ impl DhtHealthSnapshot {
             bootstrap_responsive_count: 0,
             inbound_query_rate: 0,
             recent_lookup_success_rate: 0,
+            confirmed_public_addr_ipv4: None,
+            confirmed_public_addr_ipv6: None,
             anomalies,
         }
     }

@@ -12,6 +12,7 @@ pub mod krpc;
 pub mod lookup;
 pub mod peer_store;
 pub mod persist;
+pub mod public_addr;
 pub mod routing;
 mod scheduler;
 pub mod service;
@@ -54,6 +55,7 @@ use crate::dht::inbound::{InboundAction, InboundActor, InboundConfig, InboundReq
 use crate::dht::lookup::{LookupManager, LookupQualitySnapshot, LookupState, LookupUpdate};
 use crate::dht::peer_store::{PeerStore, PeerStoreConfig};
 use crate::dht::persist::PersistenceManager;
+use crate::dht::public_addr::PublicAddressObserver;
 use crate::dht::routing::{InsertOutcome, RoutingActor, RoutingConfig};
 use crate::dht::token::{TokenConfig, TokenService};
 use crate::dht::transport::{TransportActor, TransportConfig, TransportEvent, TransportReply};
@@ -164,6 +166,7 @@ pub struct Runtime {
     ipv6_inbound: InboundActor,
     token_service: TokenService,
     peer_store: PeerStore,
+    public_addresses: PublicAddressObserver,
     bootstrap: BootstrapCoordinator,
     lookup_manager: LookupManager,
     active_lookups: HashMap<LookupId, ActiveLookup>,
@@ -273,6 +276,7 @@ impl Runtime {
             }),
             token_service: TokenService::new(TokenConfig::default(), now),
             peer_store: PeerStore::new(PeerStoreConfig::default()),
+            public_addresses: PublicAddressObserver::default(),
             bootstrap: BootstrapCoordinator::new(BootstrapConfig {
                 bootstrap_nodes,
                 ..BootstrapConfig::default()
@@ -386,6 +390,10 @@ impl Runtime {
         health.bootstrap_responsive_count = self.bootstrap_responsive_count;
         health.inbound_query_rate = self.inbound_query_count;
         health.recent_lookup_success_rate = self.recent_lookup_success_count;
+        health.confirmed_public_addr_ipv4 =
+            self.public_addresses.confirmed_for(AddressFamily::Ipv4);
+        health.confirmed_public_addr_ipv6 =
+            self.public_addresses.confirmed_for(AddressFamily::Ipv6);
         health
     }
 
@@ -836,26 +844,34 @@ impl Runtime {
                 })?;
 
                 let action = match family {
-                    AddressFamily::Ipv4 => self.ipv4_inbound.handle_query(
-                        InboundRequestContext { source },
-                        query,
-                        local_node_id,
-                        self.ipv4_routing.table_mut(),
-                        &mut self.token_service,
-                        &mut self.peer_store,
-                        now,
-                        wall_clock,
-                    ),
-                    AddressFamily::Ipv6 => self.ipv6_inbound.handle_query(
-                        InboundRequestContext { source },
-                        query,
-                        local_node_id,
-                        self.ipv6_routing.table_mut(),
-                        &mut self.token_service,
-                        &mut self.peer_store,
-                        now,
-                        wall_clock,
-                    ),
+                    AddressFamily::Ipv4 => {
+                        let ipv6_routing = self.ipv6_routing.table().clone();
+                        self.ipv4_inbound.handle_query(
+                            InboundRequestContext { source },
+                            query,
+                            local_node_id,
+                            self.ipv4_routing.table_mut(),
+                            Some(&ipv6_routing),
+                            &mut self.token_service,
+                            &mut self.peer_store,
+                            now,
+                            wall_clock,
+                        )
+                    }
+                    AddressFamily::Ipv6 => {
+                        let ipv4_routing = self.ipv4_routing.table().clone();
+                        self.ipv6_inbound.handle_query(
+                            InboundRequestContext { source },
+                            query,
+                            local_node_id,
+                            self.ipv6_routing.table_mut(),
+                            Some(&ipv4_routing),
+                            &mut self.token_service,
+                            &mut self.peer_store,
+                            now,
+                            wall_clock,
+                        )
+                    }
                 };
 
                 match action {
@@ -886,6 +902,8 @@ impl Runtime {
         let mut completed_node_id = None;
         let mut discovered_nodes = Vec::new();
         let mut emitted_peers = Vec::new();
+        let mut cross_family_nodes = Vec::new();
+        let mut public_address_observation = None;
         let mut finished = false;
         let mut peer_tx = None;
         let mut receiver_closed = false;
@@ -899,6 +917,7 @@ impl Runtime {
             match result.outcome {
                 LookupTaskOutcome::Reply(reply) => match reply {
                     TransportReply::Response(response) => {
+                        let observed_addr = response.observed_addr();
                         let response_body = response.r.unwrap_or_default();
                         let update = active.state.handle_response(
                             result.transaction_id,
@@ -928,7 +947,13 @@ impl Runtime {
                         if let Some(query) = update.completed_query {
                             completed_addr = Some(query.candidate.addr);
                             completed_node_id = response_body.node_id();
+                            if let Some(observed_addr) = observed_addr {
+                                public_address_observation =
+                                    Some((query.candidate.addr, observed_addr));
+                            }
                         }
+                        cross_family_nodes =
+                            response_body.closest_nodes(opposite_family(result.family));
                         emitted_peers = update
                             .emitted_peers
                             .into_iter()
@@ -971,6 +996,22 @@ impl Runtime {
                     }
                     finished = update.finished;
                 }
+            }
+        }
+
+        if let Some((voter, observed_addr)) = public_address_observation {
+            self.public_addresses
+                .record_observation(voter, observed_addr);
+        }
+
+        let other_family = opposite_family(result.family);
+        for node in cross_family_nodes {
+            let record = NodeRecord::new(node.addr, Some(node.id), now);
+            let outcome = self
+                .routing_for_family_mut(other_family)
+                .insert(record, now);
+            if let InsertOutcome::NeedsProbe { targets } = outcome {
+                self.enqueue_probe_targets(other_family, &targets);
             }
         }
 
@@ -1111,24 +1152,20 @@ impl Runtime {
             let deferred = match request.kind {
                 LookupKind::FindNode => {
                     let target = request.target.as_node_id();
+                    let args = krpc::KrpcFindNodeArgs::new(self.config.local_node_id, target)
+                        .with_want(&self.wanted_node_families());
                     transport
-                        .send_query_deferred(
-                            candidate.addr,
-                            krpc::KrpcQueryKind::FindNode,
-                            krpc::KrpcFindNodeArgs::new(self.config.local_node_id, target),
-                        )
+                        .send_query_deferred(candidate.addr, krpc::KrpcQueryKind::FindNode, args)
                         .await
                 }
                 LookupKind::GetPeers => {
                     let LookupTarget::InfoHash(info_hash) = request.target else {
                         continue;
                     };
+                    let args = krpc::KrpcGetPeersArgs::new(self.config.local_node_id, info_hash)
+                        .with_want(&self.wanted_node_families());
                     transport
-                        .send_query_deferred(
-                            candidate.addr,
-                            krpc::KrpcQueryKind::GetPeers,
-                            krpc::KrpcGetPeersArgs::new(self.config.local_node_id, info_hash),
-                        )
+                        .send_query_deferred(candidate.addr, krpc::KrpcQueryKind::GetPeers, args)
                         .await
                 }
             };
@@ -1252,6 +1289,13 @@ impl Runtime {
             AddressFamily::Ipv4 => self.ipv4_routing.table(),
             AddressFamily::Ipv6 => self.ipv6_routing.table(),
         }
+    }
+
+    fn wanted_node_families(&self) -> Vec<AddressFamily> {
+        [AddressFamily::Ipv4, AddressFamily::Ipv6]
+            .into_iter()
+            .filter(|family| self.family_bound(*family))
+            .collect()
     }
 
     fn cleanup_closed_lookups(&mut self) {
@@ -1479,6 +1523,13 @@ fn trace_lookup_target(target: NodeId, message: impl AsRef<str>) {
 
 fn node_id_hex(node_id: NodeId) -> String {
     hex::encode(node_id.as_ref())
+}
+
+fn opposite_family(family: AddressFamily) -> AddressFamily {
+    match family {
+        AddressFamily::Ipv4 => AddressFamily::Ipv6,
+        AddressFamily::Ipv6 => AddressFamily::Ipv4,
+    }
 }
 
 fn ping_visit_enabled() -> bool {

@@ -92,6 +92,7 @@ impl InboundActor {
         query: KrpcIncomingQuery,
         local_node_id: NodeId,
         routing: &mut RoutingTable,
+        cross_family_routing: Option<&RoutingTable>,
         token_service: &mut TokenService,
         peer_store: &mut PeerStore,
         now: Instant,
@@ -121,7 +122,7 @@ impl InboundActor {
 
         match query {
             KrpcIncomingQuery::Ping { .. } => self.respond_to(
-                ctx.source.ip(),
+                ctx.source,
                 KrpcResponseEnvelope::new(&transaction_id, KrpcResponseBody::pong(local_node_id)),
                 now,
             ),
@@ -135,12 +136,19 @@ impl InboundActor {
                 };
 
                 let nodes = self.closest_nodes_for(routing, target, ctx.source, now);
+                let mut body =
+                    KrpcResponseBody::with_nodes(local_node_id, &nodes, self.config.family);
+                self.append_requested_cross_family_nodes(
+                    &mut body,
+                    cross_family_routing,
+                    |family| args.wants_family(family),
+                    target,
+                    ctx.source,
+                    now,
+                );
                 self.respond_to(
-                    ctx.source.ip(),
-                    KrpcResponseEnvelope::new(
-                        &transaction_id,
-                        KrpcResponseBody::with_nodes(local_node_id, &nodes, self.config.family),
-                    ),
+                    ctx.source,
+                    KrpcResponseEnvelope::new(&transaction_id, body),
                     now,
                 )
             }
@@ -160,7 +168,7 @@ impl InboundActor {
                 let token = token_service.mint_for(ctx.source.ip(), info_hash, now);
                 let peers = peer_store.peers_for(info_hash, self.config.family, wall_clock);
                 let nodes = self.closest_nodes_for(routing, info_hash.into(), ctx.source, now);
-                let body = if peers.is_empty() {
+                let mut body = if peers.is_empty() {
                     KrpcResponseBody::with_closest_nodes(
                         local_node_id,
                         &nodes,
@@ -176,9 +184,17 @@ impl InboundActor {
                         &token,
                     )
                 };
+                self.append_requested_cross_family_nodes(
+                    &mut body,
+                    cross_family_routing,
+                    |family| args.wants_family(family),
+                    info_hash.into(),
+                    ctx.source,
+                    now,
+                );
 
                 self.respond_to(
-                    ctx.source.ip(),
+                    ctx.source,
                     KrpcResponseEnvelope::new(&transaction_id, body),
                     now,
                 )
@@ -225,7 +241,7 @@ impl InboundActor {
                 peer_store.insert(info_hash, peer, wall_clock);
 
                 self.respond_to(
-                    ctx.source.ip(),
+                    ctx.source,
                     KrpcResponseEnvelope::new(
                         &transaction_id,
                         KrpcResponseBody::pong(local_node_id),
@@ -311,14 +327,15 @@ impl InboundActor {
 
     fn respond_to(
         &mut self,
-        source_ip: IpAddr,
+        source: SocketAddr,
         response: KrpcResponseEnvelope,
         now: Instant,
     ) -> InboundAction {
+        let response = response.with_observed_addr(source);
         let Ok(payload) = serde_bencode::to_bytes(&response) else {
             return InboundAction::Drop;
         };
-        if !self.allow_response_bytes(source_ip, payload.len(), now) {
+        if !self.allow_response_bytes(source.ip(), payload.len(), now) {
             return InboundAction::Drop;
         }
         InboundAction::Respond(response)
@@ -375,6 +392,29 @@ impl InboundActor {
             })
             .collect()
     }
+
+    fn append_requested_cross_family_nodes(
+        &self,
+        body: &mut KrpcResponseBody,
+        routing: Option<&RoutingTable>,
+        wants_family: impl Fn(AddressFamily) -> bool,
+        target: NodeId,
+        source: SocketAddr,
+        now: Instant,
+    ) {
+        let Some(routing) = routing else {
+            return;
+        };
+        let family = routing.family();
+        if family == self.config.family || !wants_family(family) {
+            return;
+        }
+
+        let nodes = self.closest_nodes_for(routing, target, source, now);
+        if !nodes.is_empty() {
+            body.set_closest_nodes(family, &nodes);
+        }
+    }
 }
 
 fn remember_inbound_node(
@@ -398,7 +438,7 @@ mod tests {
     use crate::dht::routing::RoutingConfig;
     use crate::dht::token::TokenConfig;
     use serde_bytes::ByteBuf;
-    use std::net::{Ipv4Addr, SocketAddr};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
     fn source_ip(index: usize) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(
@@ -506,6 +546,7 @@ mod tests {
             },
             node_id(1),
             &mut routing,
+            None,
             &mut token_service,
             &mut peer_store,
             now,
@@ -519,5 +560,63 @@ mod tests {
         assert_eq!(body.peers(AddressFamily::Ipv4).len(), 1);
         assert_eq!(body.closest_nodes(AddressFamily::Ipv4).len(), 1);
         assert!(!body.token.is_empty());
+    }
+
+    #[test]
+    fn get_peers_want_includes_cross_family_nodes() {
+        let now = Instant::now();
+        let wall_clock = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        let mut actor = InboundActor::new(InboundConfig::default());
+        let mut ipv4_routing = RoutingTable::new(
+            node_id(1),
+            RoutingConfig {
+                family: AddressFamily::Ipv4,
+                ..RoutingConfig::default()
+            },
+            now,
+        );
+        let mut ipv6_routing = RoutingTable::new(
+            node_id(1),
+            RoutingConfig {
+                family: AddressFamily::Ipv6,
+                ..RoutingConfig::default()
+            },
+            now,
+        );
+        let route_addr = SocketAddr::from((Ipv6Addr::LOCALHOST, 40_001));
+        let mut route = NodeRecord::new(route_addr, Some(node_id(4)), now);
+        route.note_query_response(Some(node_id(4)), now);
+        assert_eq!(
+            ipv6_routing.insert(route, now),
+            crate::dht::routing::InsertOutcome::Inserted
+        );
+
+        let hash = info_hash(9);
+        let mut peer_store = PeerStore::new(PeerStoreConfig::default());
+        let mut token_service = TokenService::new(TokenConfig::default(), now);
+
+        let action = actor.handle_query(
+            InboundRequestContext {
+                source: SocketAddr::from((Ipv4Addr::LOCALHOST, 60_001)),
+            },
+            KrpcIncomingQuery::GetPeers {
+                transaction_id: ByteBuf::from(vec![1, 2, 3, 4]),
+                version: None,
+                args: KrpcGetPeersArgs::new(node_id(2), hash).with_want(&[AddressFamily::Ipv6]),
+            },
+            node_id(1),
+            &mut ipv4_routing,
+            Some(&ipv6_routing),
+            &mut token_service,
+            &mut peer_store,
+            now,
+            wall_clock,
+        );
+
+        let InboundAction::Respond(response) = action else {
+            panic!("expected get_peers response");
+        };
+        let body = response.r.expect("response body");
+        assert_eq!(body.closest_nodes(AddressFamily::Ipv6).len(), 1);
     }
 }

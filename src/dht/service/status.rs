@@ -141,6 +141,9 @@ pub(super) fn build_status(
         health.inflight_lookups = active_runtime.runtime.active_lookup_count();
         health.inflight_ipv4_queries = runtime_health.inflight_queries_ipv4;
         health.inflight_ipv6_queries = runtime_health.inflight_queries_ipv6;
+        health.public_addr = runtime_health
+            .confirmed_public_addr_ipv4
+            .or(runtime_health.confirmed_public_addr_ipv6);
         health.server_mode = Some(health.bound_family_count > 0);
 
         let responsive = runtime_health.bootstrap_responsive_count;

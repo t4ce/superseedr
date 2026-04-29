@@ -11,6 +11,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use thiserror::Error;
 
 pub const DEFAULT_KRPC_VERSION: &[u8; 4] = b"RS\0\x05";
+const WANT_IPV4_NODES: &[u8; 2] = b"n4";
+const WANT_IPV6_NODES: &[u8; 2] = b"n6";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KrpcQueryKind {
@@ -135,6 +137,8 @@ impl Serialize for KrpcPingArgs {
 pub struct KrpcFindNodeArgs {
     pub id: ByteBuf,
     pub target: ByteBuf,
+    #[serde(default)]
+    pub want: Vec<ByteBuf>,
 }
 
 impl KrpcFindNodeArgs {
@@ -142,7 +146,17 @@ impl KrpcFindNodeArgs {
         Self {
             id: ByteBuf::from(id.as_ref().to_vec()),
             target: ByteBuf::from(target.as_ref().to_vec()),
+            want: Vec::new(),
         }
+    }
+
+    pub fn with_want(mut self, families: &[AddressFamily]) -> Self {
+        self.want = encode_want_entries(families);
+        self
+    }
+
+    pub fn wants_family(&self, family: AddressFamily) -> bool {
+        wants_family(&self.want, family)
     }
 }
 
@@ -151,9 +165,12 @@ impl Serialize for KrpcFindNodeArgs {
     where
         S: Serializer,
     {
-        let mut map = serializer.serialize_map(Some(2))?;
+        let mut map = serializer.serialize_map(Some(2 + usize::from(!self.want.is_empty())))?;
         map.serialize_entry("id", &self.id)?;
         map.serialize_entry("target", &self.target)?;
+        if !self.want.is_empty() {
+            map.serialize_entry("want", &self.want)?;
+        }
         map.end()
     }
 }
@@ -162,6 +179,8 @@ impl Serialize for KrpcFindNodeArgs {
 pub struct KrpcGetPeersArgs {
     pub id: ByteBuf,
     pub info_hash: ByteBuf,
+    #[serde(default)]
+    pub want: Vec<ByteBuf>,
 }
 
 impl KrpcGetPeersArgs {
@@ -169,7 +188,17 @@ impl KrpcGetPeersArgs {
         Self {
             id: ByteBuf::from(id.as_ref().to_vec()),
             info_hash: ByteBuf::from(info_hash.as_ref().to_vec()),
+            want: Vec::new(),
         }
+    }
+
+    pub fn with_want(mut self, families: &[AddressFamily]) -> Self {
+        self.want = encode_want_entries(families);
+        self
+    }
+
+    pub fn wants_family(&self, family: AddressFamily) -> bool {
+        wants_family(&self.want, family)
     }
 }
 
@@ -178,9 +207,12 @@ impl Serialize for KrpcGetPeersArgs {
     where
         S: Serializer,
     {
-        let mut map = serializer.serialize_map(Some(2))?;
+        let mut map = serializer.serialize_map(Some(2 + usize::from(!self.want.is_empty())))?;
         map.serialize_entry("id", &self.id)?;
         map.serialize_entry("info_hash", &self.info_hash)?;
+        if !self.want.is_empty() {
+            map.serialize_entry("want", &self.want)?;
+        }
         map.end()
     }
 }
@@ -352,6 +384,17 @@ impl KrpcResponseEnvelope {
             v: Some(ByteBuf::from(DEFAULT_KRPC_VERSION.to_vec())),
             ip: None,
         }
+    }
+
+    pub fn with_observed_addr(mut self, addr: SocketAddr) -> Self {
+        self.ip = Some(encode_compact_socket_addr(addr));
+        self
+    }
+
+    pub fn observed_addr(&self) -> Option<SocketAddr> {
+        self.ip
+            .as_ref()
+            .and_then(|bytes| decode_compact_socket_addr(bytes.as_ref()))
     }
 
     pub fn transaction_id(&self) -> Result<TransactionId, FixedLengthError> {
@@ -528,6 +571,32 @@ impl KrpcResponseBody {
             AddressFamily::Ipv6 => decode_compact_nodes(self.nodes6.as_ref(), family),
         }
     }
+
+    pub fn set_closest_nodes(&mut self, family: AddressFamily, nodes: &[CompactNode]) {
+        match family {
+            AddressFamily::Ipv4 => self.nodes = encode_compact_nodes(nodes, family),
+            AddressFamily::Ipv6 => self.nodes6 = encode_compact_nodes(nodes, family),
+        }
+    }
+}
+
+fn encode_want_entries(families: &[AddressFamily]) -> Vec<ByteBuf> {
+    families
+        .iter()
+        .copied()
+        .map(|family| match family {
+            AddressFamily::Ipv4 => ByteBuf::from(WANT_IPV4_NODES.to_vec()),
+            AddressFamily::Ipv6 => ByteBuf::from(WANT_IPV6_NODES.to_vec()),
+        })
+        .collect()
+}
+
+fn wants_family(entries: &[ByteBuf], family: AddressFamily) -> bool {
+    let needle = match family {
+        AddressFamily::Ipv4 => WANT_IPV4_NODES.as_slice(),
+        AddressFamily::Ipv6 => WANT_IPV6_NODES.as_slice(),
+    };
+    entries.iter().any(|entry| entry.as_ref() == needle)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -714,6 +783,40 @@ pub fn encode_compact_nodes(nodes: &[CompactNode], family: AddressFamily) -> Byt
     ByteBuf::from(bytes)
 }
 
+pub fn decode_compact_socket_addr(bytes: &[u8]) -> Option<SocketAddr> {
+    match bytes.len() {
+        6 => {
+            let ip = Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]);
+            let port = u16::from_be_bytes([bytes[4], bytes[5]]);
+            Some(SocketAddr::from((ip, port)))
+        }
+        18 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&bytes[..16]);
+            let port = u16::from_be_bytes([bytes[16], bytes[17]]);
+            Some(SocketAddr::from((Ipv6Addr::from(octets), port)))
+        }
+        _ => None,
+    }
+}
+
+pub fn encode_compact_socket_addr(addr: SocketAddr) -> ByteBuf {
+    match addr {
+        SocketAddr::V4(addr) => {
+            let mut bytes = Vec::with_capacity(6);
+            bytes.extend_from_slice(&addr.ip().octets());
+            bytes.extend_from_slice(&addr.port().to_be_bytes());
+            ByteBuf::from(bytes)
+        }
+        SocketAddr::V6(addr) => {
+            let mut bytes = Vec::with_capacity(18);
+            bytes.extend_from_slice(&addr.ip().octets());
+            bytes.extend_from_slice(&addr.port().to_be_bytes());
+            ByteBuf::from(bytes)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -734,5 +837,50 @@ mod tests {
                 .any(|window| window == b"2:ro"),
             "encoded query must omit BEP 43 read-only flag"
         );
+    }
+
+    #[test]
+    fn get_peers_want_entries_round_trip() {
+        let args = KrpcGetPeersArgs::new(
+            NodeId::from([1; NodeId::LEN]),
+            InfoHash::from([2; InfoHash::LEN]),
+        )
+        .with_want(&[AddressFamily::Ipv4, AddressFamily::Ipv6]);
+        let encoded = serde_bencode::to_bytes(&args).expect("encode get_peers args");
+        let decoded =
+            serde_bencode::from_bytes::<KrpcGetPeersArgs>(&encoded).expect("decode get_peers args");
+
+        assert!(decoded.wants_family(AddressFamily::Ipv4));
+        assert!(decoded.wants_family(AddressFamily::Ipv6));
+    }
+
+    #[test]
+    fn find_node_want_entries_round_trip() {
+        let args = KrpcFindNodeArgs::new(
+            NodeId::from([1; NodeId::LEN]),
+            NodeId::from([2; NodeId::LEN]),
+        )
+        .with_want(&[AddressFamily::Ipv6]);
+        let encoded = serde_bencode::to_bytes(&args).expect("encode find_node args");
+        let decoded =
+            serde_bencode::from_bytes::<KrpcFindNodeArgs>(&encoded).expect("decode find_node args");
+
+        assert!(!decoded.wants_family(AddressFamily::Ipv4));
+        assert!(decoded.wants_family(AddressFamily::Ipv6));
+    }
+
+    #[test]
+    fn response_observed_addr_round_trips_compact_ip() {
+        let observed = SocketAddr::from((Ipv4Addr::new(127, 0, 0, 1), 6881));
+        let response = KrpcResponseEnvelope::new(
+            &[1, 2, 3, 4],
+            KrpcResponseBody::pong(NodeId::from([3; NodeId::LEN])),
+        )
+        .with_observed_addr(observed);
+        let encoded = serde_bencode::to_bytes(&response).expect("encode response");
+        let decoded =
+            serde_bencode::from_bytes::<KrpcResponseEnvelope>(&encoded).expect("decode response");
+
+        assert_eq!(decoded.observed_addr(), Some(observed));
     }
 }
