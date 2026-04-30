@@ -35,6 +35,10 @@ mod reducer_tests;
 #[path = "planner/invariant_tests.rs"]
 mod invariant_tests;
 
+#[cfg(test)]
+#[path = "planner/replay_tests.rs"]
+mod replay_tests;
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct DemandPlannerActionView {
     pub(super) kind: &'static str,
