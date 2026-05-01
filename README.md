@@ -384,6 +384,15 @@ Superseedr is built on the **Tokio** runtime, leveraging asynchronous I/O for ma
 * **Actor-Based Session Management:** Each peer operates as an isolated Actor. Communication between the network socket and the core logic happens exclusively via `mpsc` channels, meaning a slow or misbehaving peer cannot block the main event loop or affect other connections.
 * **Hot-Swappable Listeners:** The application runs an async file watcher (`notify`) on the VPN configuration volume. When **Gluetun** rotates the forwarded port, Superseedr detects the file change and instantly rebinds the TCP listener to the new port without dropping the swarm state or restarting the process.
 
+### DHT Runtime & Demand Planner
+Superseedr ships a first-party Mainline DHT implementation instead of treating DHT as a black-box peer source.
+* **Dual-Stack Runtime:** The internal runtime maintains IPv4 and IPv6 UDP transports, routing tables, peer storage, bootstrap state, and rotating announce tokens while serving inbound `find_node`, `get_peers`, and `announce_peer` traffic.
+* **Client-Aware Demand:** Torrent managers feed demand state and live swarm metrics into the DHT service. The planner prioritizes metadata recovery and peer-starved torrents first, then spends additional query budget on active swarms that are still producing useful peers.
+* **Pause/Resumable Crawls:** Lookup slices can be parked when their wall-time budget expires, preserving traversal state instead of throwing away the crawl frontier. Later planner slices can resume the crawl from the saved state, while the drain path still captures late peers from in-flight queries.
+* **Adaptive Query Pressure:** DHT work is bounded by lookup slots, per-class budgets, late-peer drain handling, and peer-slot pressure. When the client is full, DHT power can ramp down quickly; when capacity returns, it ramps back up gradually.
+* **Protocol Hardening:** The runtime validates response sources, filters unroutable nodes, tracks suspicious identity churn, rate-limits inbound KRPC traffic, and keeps DHT participation disabled entirely in private builds.
+* **Deterministic Verification:** Planner and runtime reducers are covered by deterministic replay tests, invariant checks, and property tests for lookup traversal, scheduling, demand selection, drain behavior, and peer-pressure scaling.
+
 ### 🔒 Security & Privacy Engineering
 * **VPN Isolation (Kill-Switch):** In the Docker Compose setup, Superseedr's network stack is fully routed through **Gluetun**. This guarantees that 100% of BitTorrent traffic traverses the VPN tunnel. If the tunnel drops, connectivity is cut immediately, preventing any IP leakage over the host connection.
 * **Binary-Level Private Mode:** Private tracker compliance is enforced at compile time, not just runtime. By building with `--no-default-features`, the DHT and Peer Exchange (PEX) modules are completely excluded from the binary, guaranteeing zero leakage of private swarms.
