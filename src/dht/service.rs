@@ -116,6 +116,7 @@ pub use self::status::{DhtHealthSnapshot, DhtSizeEstimate, DhtStatus, DhtWaveTel
 use self::subscribers::{DemandSubscriberAction, DemandSubscriberEffect, DemandSubscriberRegistry};
 
 const DHT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+const DHT_REBIND_TRANSPORT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const DHT_ROUTINE_LOOKUP_REFRESH_INTERVAL: Duration = DHT_MAINTENANCE_INTERVAL;
 const DHT_NO_CONNECTED_PEERS_BASE_INTERVAL: Duration = Duration::from_secs(16);
 const DHT_NO_CONNECTED_PEERS_MAX_INTERVAL: Duration = Duration::from_secs(5 * 60);

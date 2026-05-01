@@ -43,8 +43,12 @@ pub(in crate::dht::service) async fn apply_dht_service_effects(
                 let old_port = service_state.service.config().port;
                 let drop_before_bind = active_runtime.is_some() && old_port == config.port;
                 if drop_before_bind {
-                    if let Some(previous) = active_runtime.take() {
+                    if let Some(mut previous) = active_runtime.take() {
                         let _ = previous.runtime.save_state().await;
+                        previous
+                            .runtime
+                            .shutdown_for_rebind(DHT_REBIND_TRANSPORT_DRAIN_TIMEOUT)
+                            .await;
                     }
                 }
 

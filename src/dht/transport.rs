@@ -19,6 +19,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 const DEFAULT_SOCKET_BUFFER: usize = 16 * 1024;
@@ -141,6 +142,7 @@ struct TransportActorInner {
     next_transaction_id: AtomicU32,
     event_tx: mpsc::UnboundedSender<TransportEvent>,
     shutdown_tx: watch::Sender<bool>,
+    receive_task: StdMutex<Option<JoinHandle<()>>>,
 }
 
 impl Drop for TransportActorInner {
@@ -172,10 +174,11 @@ impl TransportActor {
                 next_transaction_id: AtomicU32::new(rand::random::<u32>()),
                 event_tx,
                 shutdown_tx,
+                receive_task: StdMutex::new(None),
             }),
         };
 
-        Self::spawn_receive_loop(
+        let receive_task = Self::spawn_receive_loop(
             actor.inner.socket.clone(),
             actor.inner.inflight_queries.clone(),
             actor.inner.event_tx.clone(),
@@ -183,6 +186,11 @@ impl TransportActor {
             actor.inner.config.socket_buffer,
             shutdown_rx,
         );
+        *actor
+            .inner
+            .receive_task
+            .lock()
+            .expect("transport receive task lock") = Some(receive_task);
 
         Ok((actor, event_rx))
     }
@@ -398,6 +406,31 @@ impl TransportActor {
         removed
     }
 
+    pub fn cancel_all_inflight_queries(&self) {
+        self.inner
+            .inflight_queries
+            .lock()
+            .expect("transport inflight query lock")
+            .clear();
+    }
+
+    pub fn actor_ref_count(&self) -> usize {
+        Arc::strong_count(&self.inner)
+    }
+
+    pub async fn shutdown(&self) {
+        let _ = self.inner.shutdown_tx.send(true);
+        let receive_task = self
+            .inner
+            .receive_task
+            .lock()
+            .expect("transport receive task lock")
+            .take();
+        if let Some(receive_task) = receive_task {
+            let _ = receive_task.await;
+        }
+    }
+
     fn spawn_receive_loop(
         socket: Arc<UdpSocket>,
         inflight_queries: Arc<StdMutex<HashMap<TransactionId, InflightQuery>>>,
@@ -405,7 +438,7 @@ impl TransportActor {
         source_validation: SourceValidationMode,
         socket_buffer: usize,
         mut shutdown_rx: watch::Receiver<bool>,
-    ) {
+    ) -> JoinHandle<()> {
         tokio::spawn(async move {
             let mut buffer = vec![0u8; socket_buffer.max(1)];
             loop {
@@ -470,7 +503,7 @@ impl TransportActor {
             for waiter in waiters {
                 drop(waiter);
             }
-        });
+        })
     }
 }
 

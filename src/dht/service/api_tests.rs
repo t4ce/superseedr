@@ -2,6 +2,36 @@ use super::test_support::*;
 use super::*;
 
 #[tokio::test]
+async fn dht_service_new_falls_back_to_disabled_when_initial_runtime_build_fails() {
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let service = DhtService::new(
+        DhtServiceConfig {
+            port: 0,
+            bootstrap_nodes: Vec::new(),
+            preferred_backend: DhtBackendKind::InternalPrototype,
+            force_internal_failure: true,
+        },
+        shutdown_rx,
+    )
+    .await
+    .expect("DHT service should degrade to disabled startup");
+
+    let status = service.current_status();
+    assert_eq!(status.health.backend, DhtBackendKind::Disabled);
+    assert_eq!(
+        status.health.preferred_backend,
+        Some(DhtBackendKind::InternalPrototype)
+    );
+    assert!(!status.health.enabled);
+    assert_eq!(
+        status.warning.as_deref(),
+        Some("DHT startup failed: forced internal backend failure")
+    );
+
+    let _ = shutdown_tx.send(());
+}
+
+#[tokio::test]
 async fn managed_lookup_receiver_drop_sends_cancel_for_non_empty_lookup_ids() {
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
     let (_peer_tx, peer_rx) = mpsc::unbounded_channel();

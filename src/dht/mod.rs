@@ -419,6 +419,38 @@ impl Runtime {
         manager.save_snapshot(&snapshot)
     }
 
+    pub async fn shutdown_for_rebind(&mut self, wait: Duration) {
+        let lookup_ids = self.active_lookups.keys().copied().collect::<Vec<_>>();
+        for lookup_id in lookup_ids {
+            self.cancel_lookup(lookup_id);
+        }
+
+        let transports = [self.ipv4_transport.take(), self.ipv6_transport.take()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        self.ipv4_events = None;
+        self.ipv6_events = None;
+
+        for transport in &transports {
+            transport.cancel_all_inflight_queries();
+        }
+        for transport in &transports {
+            transport.shutdown().await;
+        }
+
+        let deadline = Instant::now() + wait;
+        while transports
+            .iter()
+            .any(|transport| transport.actor_ref_count() > 1)
+        {
+            if Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     pub async fn bootstrap_startup(&mut self) -> io::Result<()> {
         self.refresh_bootstrap_nodes_if_empty().await;
 

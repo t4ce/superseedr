@@ -188,7 +188,15 @@ impl DhtService {
         shutdown_rx: broadcast::Receiver<()>,
     ) -> Result<Self, String> {
         let local_node_id = configured_or_persisted_local_node_id();
-        let initial = build_runtime(&config, local_node_id).await?;
+        let initial = match build_runtime(&config, local_node_id).await {
+            Ok(initial) => initial,
+            Err(error) => BuiltRuntime {
+                active_runtime: None,
+                backend: DhtBackendKind::Disabled,
+                warning: Some(format!("DHT startup failed: {error}")),
+                bootstrap: literal_bootstrap_summary(&config.bootstrap_nodes),
+            },
+        };
         let initial_status = build_status(
             initial.active_runtime.as_ref(),
             initial.backend,
