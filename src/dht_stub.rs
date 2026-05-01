@@ -203,7 +203,18 @@ pub mod service {
             let _ = config;
         }
 
-        pub fn update_peer_slot_usage(&self, _total_peers: usize, _max_connected_peers: usize) {}
+        pub fn update_peer_slot_usage(&self, total_peers: usize, max_connected_peers: usize) {
+            #[cfg(test)]
+            if let Some(recorder) = &self.handle.recorder {
+                recorder
+                    .peer_slot_usages
+                    .lock()
+                    .expect("test dht peer slot recorder lock")
+                    .push((total_peers, max_connected_peers));
+            }
+            #[cfg(not(test))]
+            let _ = (total_peers, max_connected_peers);
+        }
     }
 
     #[cfg(test)]
@@ -271,10 +282,14 @@ pub mod service {
     type ReconfigureRequests = Arc<StdMutex<Vec<DhtServiceConfig>>>;
 
     #[cfg(test)]
+    type PeerSlotUsages = Arc<StdMutex<Vec<(usize, usize)>>>;
+
+    #[cfg(test)]
     #[derive(Debug, Clone, Default)]
     pub(crate) struct TestDhtRecorder {
         announce_requests: AnnounceRequests,
         reconfigure_requests: ReconfigureRequests,
+        peer_slot_usages: PeerSlotUsages,
     }
 
     #[cfg(test)]
@@ -290,6 +305,13 @@ pub mod service {
             self.reconfigure_requests
                 .lock()
                 .expect("test dht reconfigure recorder lock")
+                .clone()
+        }
+
+        pub(crate) fn recorded_peer_slot_usages(&self) -> Vec<(usize, usize)> {
+            self.peer_slot_usages
+                .lock()
+                .expect("test dht peer slot recorder lock")
                 .clone()
         }
     }
