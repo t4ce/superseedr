@@ -62,7 +62,7 @@ fn build_status_without_runtime_reports_disabled_state_and_bootstrap() {
 }
 #[test]
 fn build_wave_telemetry_without_runtime_preserves_recent_unique_count() {
-    let telemetry = build_wave_telemetry(None, 12, 3);
+    let telemetry = build_wave_telemetry(None, 12, 6);
 
     assert_eq!(telemetry.unique_peers_found_last_10s, 12);
     assert_eq!(telemetry.active_lookups, 0);
@@ -70,4 +70,5 @@ fn build_wave_telemetry_without_runtime_preserves_recent_unique_count() {
     assert_eq!(telemetry.inflight_ipv4_queries, 0);
     assert_eq!(telemetry.inflight_ipv6_queries, 0);
     assert_eq!(telemetry.demand_power_multiplier, 3);
+    assert_eq!(telemetry.demand_power_scale_halves, 6);
 }

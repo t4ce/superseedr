@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
-use super::{ActiveRuntime, BootstrapSummary, DhtBackendKind};
+use super::{ActiveRuntime, BootstrapSummary, DhtBackendKind, DHT_DEMAND_POWER_BASE_SCALE_HALVES};
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -64,6 +64,7 @@ pub struct DhtWaveTelemetry {
     pub inflight_ipv6_queries: usize,
     pub unique_peers_found_last_10s: usize,
     pub demand_power_multiplier: u8,
+    pub demand_power_scale_halves: u8,
 }
 
 #[derive(Debug)]
@@ -188,12 +189,16 @@ pub(super) fn publish_status(
 pub(super) fn build_wave_telemetry(
     active_runtime: Option<&ActiveRuntime>,
     unique_peers_found_last_10s: usize,
-    demand_power_multiplier: u8,
+    demand_power_scale_halves: u8,
 ) -> DhtWaveTelemetry {
+    let demand_power_scale_halves = demand_power_scale_halves.max(1);
+    let demand_power_multiplier =
+        demand_power_scale_halves.div_ceil(DHT_DEMAND_POWER_BASE_SCALE_HALVES);
     let Some(active_runtime) = active_runtime else {
         return DhtWaveTelemetry {
             unique_peers_found_last_10s,
             demand_power_multiplier,
+            demand_power_scale_halves,
             ..DhtWaveTelemetry::default()
         };
     };
@@ -208,6 +213,7 @@ pub(super) fn build_wave_telemetry(
         inflight_ipv6_queries,
         unique_peers_found_last_10s,
         demand_power_multiplier,
+        demand_power_scale_halves,
     }
 }
 
@@ -215,12 +221,12 @@ pub(super) fn publish_wave_telemetry(
     wave_telemetry_tx: &watch::Sender<DhtWaveTelemetry>,
     active_runtime: Option<&ActiveRuntime>,
     recent_unique_peers: &mut RecentUniquePeers,
-    demand_power_multiplier: u8,
+    demand_power_scale_halves: u8,
 ) {
     let telemetry = build_wave_telemetry(
         active_runtime,
         recent_unique_peers.unique_count(Instant::now()),
-        demand_power_multiplier,
+        demand_power_scale_halves,
     );
     if *wave_telemetry_tx.borrow() != telemetry {
         let _ = wave_telemetry_tx.send(telemetry);

@@ -251,6 +251,71 @@ fn demand_lookup_plan_uses_idle_speed_probe_multiplier_for_unserved_demand() {
 }
 
 #[test]
+fn demand_lookup_plan_caps_any_tier_to_half_power_under_peer_pressure() {
+    let now = Instant::now();
+    let candidate = DueDemandCandidate {
+        info_hash: hash_index(260),
+        demand: DhtDemandState {
+            awaiting_metadata: false,
+            connected_peers: 0,
+        },
+        metrics: DhtDemandMetrics {
+            accepting_new_peers: true,
+            ..Default::default()
+        },
+        next_eligible_at: now,
+        subscriber_count: 1,
+    };
+    let idle_probe = DemandPlannerIdleSpeedProbeStatus {
+        active: true,
+        demand_count: 1,
+        multiplier: 4,
+    };
+
+    let plan = DemandLookupPlan::for_candidate_with_peer_cap(
+        candidate,
+        &HashMap::new(),
+        DemandSelectionReason::IdleSpeedProbe,
+        idle_probe,
+        1,
+        now,
+    );
+
+    assert_eq!(plan.power_multiplier, 4);
+    assert_eq!(plan.power_scale_halves, 1);
+    assert_eq!(plan.peer_pressure_cap_halves, 1);
+    assert_eq!(
+        plan.max_wall_time,
+        DHT_NO_CONNECTED_PEERS_SLICE_WALL_TIME
+            .checked_div(2)
+            .expect("half duration")
+    );
+    assert_eq!(
+        plan.unique_peer_cap,
+        DHT_NO_CONNECTED_PEERS_SLICE_UNIQUE_PEER_CAP / 2
+    );
+}
+
+#[test]
+fn peer_pressure_cap_drops_fast_and_recovers_linearly() {
+    let now = Instant::now();
+    let mut cap = DemandPeerPressureCap::default();
+
+    cap.update_usage(95, 100, now);
+    assert_eq!(cap.current_scale_halves(), 1);
+    assert_eq!(cap.advance(now + Duration::from_secs(1)), 1);
+
+    cap.update_usage(50, 100, now + Duration::from_secs(1));
+    assert_eq!(cap.current_scale_halves(), 1);
+    assert_eq!(cap.advance(now + Duration::from_secs(30)), 1);
+    assert_eq!(cap.advance(now + Duration::from_secs(31)), 2);
+    assert_eq!(
+        cap.advance(now + Duration::from_secs(31) + DHT_PEER_PRESSURE_CAP_RAMP_UP_INTERVAL * 6),
+        DHT_DEMAND_POWER_MAX_SCALE_HALVES
+    );
+}
+
+#[test]
 fn idle_speed_probe_escalates_after_global_idle_with_demand() {
     let now = Instant::now();
     let mut probe = DemandPlannerIdleSpeedProbe::default();

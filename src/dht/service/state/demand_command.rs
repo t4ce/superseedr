@@ -119,6 +119,7 @@ impl DhtServiceState {
                 now,
             },
             DhtCommand::Reconfigure(_)
+            | DhtCommand::UpdatePeerSlotUsage { .. }
             | DhtCommand::StartGetPeers { .. }
             | DhtCommand::StartGetPeersFamily { .. }
             | DhtCommand::CancelLookups { .. }

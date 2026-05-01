@@ -848,7 +848,7 @@ fn dht_wave_y_axis_bounds(points: &[(f64, f64)]) -> [f64; 2] {
 
 fn dht_wave_title_spans(
     total_queries: usize,
-    demand_power_multiplier: u8,
+    demand_power_scale_halves: u8,
     ctx: &ThemeContext,
 ) -> Vec<Span<'static>> {
     let query_style = ctx.apply(
@@ -856,14 +856,18 @@ fn dht_wave_title_spans(
             .fg(ctx.peer_discovered())
             .add_modifier(Modifier::BOLD),
     );
-    let multiplier = demand_power_multiplier.max(1);
-    if multiplier <= 1 {
+    let scale_halves = if demand_power_scale_halves == 0 {
+        2
+    } else {
+        demand_power_scale_halves
+    };
+    if scale_halves == 2 {
         return vec![Span::styled(total_queries.to_string(), query_style)];
     }
 
     vec![
         Span::styled(
-            format!("{multiplier}x"),
+            dht_power_scale_label(scale_halves),
             ctx.apply(
                 Style::default()
                     .fg(ctx.accent_peach())
@@ -880,6 +884,14 @@ fn dht_wave_title_spans(
             ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
         ),
     ]
+}
+
+fn dht_power_scale_label(scale_halves: u8) -> String {
+    if scale_halves.is_multiple_of(2) {
+        format!("{}x", scale_halves / 2)
+    } else {
+        format!("{}.5x", scale_halves / 2)
+    }
 }
 
 fn draw_dht_wave_panel(
@@ -960,7 +972,7 @@ fn draw_dht_wave_panel(
                 .title_top(
                     Line::from(dht_wave_title_spans(
                         total_queries,
-                        dht_wave_telemetry.demand_power_multiplier,
+                        dht_wave_telemetry.demand_power_scale_halves,
                         ctx,
                     ))
                     .alignment(Alignment::Right),
@@ -7308,7 +7320,7 @@ mod tests {
     #[test]
     fn dht_wave_title_is_query_count_without_multiplier() {
         let ctx = ThemeContext::new(Theme::builtin(ThemeName::CatppuccinMocha), 0.0);
-        let spans = dht_wave_title_spans(42, 1, &ctx);
+        let spans = dht_wave_title_spans(42, 2, &ctx);
 
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].content, "42");
@@ -7317,7 +7329,7 @@ mod tests {
     #[test]
     fn dht_wave_title_colors_multiplier_prefix() {
         let ctx = ThemeContext::new(Theme::builtin(ThemeName::CatppuccinMocha), 0.0);
-        let spans = dht_wave_title_spans(42, 4, &ctx);
+        let spans = dht_wave_title_spans(42, 8, &ctx);
 
         assert_eq!(spans.len(), 4);
         assert_eq!(spans[0].content, "4x");
@@ -7332,6 +7344,16 @@ mod tests {
                     .add_modifier(Modifier::BOLD)
             )
         );
+    }
+
+    #[test]
+    fn dht_wave_title_can_show_half_power_cap() {
+        let ctx = ThemeContext::new(Theme::builtin(ThemeName::CatppuccinMocha), 0.0);
+        let spans = dht_wave_title_spans(42, 1, &ctx);
+
+        assert_eq!(spans.len(), 4);
+        assert_eq!(spans[0].content, "0.5x");
+        assert_eq!(spans[2].content, "42");
     }
 
     #[test]

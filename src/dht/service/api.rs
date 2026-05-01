@@ -123,6 +123,10 @@ pub(in crate::dht::service) enum DhtCommand {
         info_hash: InfoHash,
         metrics: DhtDemandMetrics,
     },
+    UpdatePeerSlotUsage {
+        total_peers: usize,
+        max_connected_peers: usize,
+    },
     UnregisterDemand {
         info_hash: InfoHash,
         subscriber_id: u64,
@@ -205,7 +209,11 @@ impl DhtService {
             0,
             initial.bootstrap,
         );
-        let initial_wave_telemetry = build_wave_telemetry(initial.active_runtime.as_ref(), 0, 1);
+        let initial_wave_telemetry = build_wave_telemetry(
+            initial.active_runtime.as_ref(),
+            0,
+            DHT_DEMAND_POWER_BASE_SCALE_HALVES,
+        );
 
         let (status_tx, status_rx) = watch::channel(initial_status);
         let (wave_telemetry_tx, wave_telemetry_rx) = watch::channel(initial_wave_telemetry);
@@ -259,6 +267,16 @@ impl DhtService {
 
     pub fn reconfigure(&self, config: DhtServiceConfig) {
         let _ = send_dht_command(&self.command_tx, DhtCommand::Reconfigure(config));
+    }
+
+    pub fn update_peer_slot_usage(&self, total_peers: usize, max_connected_peers: usize) {
+        let _ = send_dht_command(
+            &self.command_tx,
+            DhtCommand::UpdatePeerSlotUsage {
+                total_peers,
+                max_connected_peers,
+            },
+        );
     }
 }
 

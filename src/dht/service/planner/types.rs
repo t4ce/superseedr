@@ -293,6 +293,11 @@ pub(in crate::dht::service) enum DemandPlannerAction<'a> {
     RuntimeReset {
         now: Instant,
     },
+    PeerSlotUsageUpdated {
+        total_peers: usize,
+        max_connected_peers: usize,
+        now: Instant,
+    },
     DemandRegistered {
         info_hash: InfoHash,
         demand: DhtDemandState,
@@ -611,6 +616,7 @@ pub(in crate::dht::service) struct DemandPlannerModel {
     pub(in crate::dht::service) state: HashMap<InfoHash, DemandPlannerState>,
     pub(in crate::dht::service) budget: DemandPlannerBudget,
     pub(in crate::dht::service) idle_speed_probe: DemandPlannerIdleSpeedProbe,
+    pub(in crate::dht::service) peer_pressure_cap: DemandPeerPressureCap,
 }
 
 impl DemandPlannerModel {
@@ -630,6 +636,7 @@ impl DemandPlannerModel {
             state: HashMap::new(),
             budget: DemandPlannerBudget::new(now),
             idle_speed_probe: DemandPlannerIdleSpeedProbe::default(),
+            peer_pressure_cap: DemandPeerPressureCap::default(),
         }
     }
 
@@ -653,6 +660,105 @@ impl DemandPlannerModel {
     ) -> Option<DemandEntrySnapshot> {
         self.scheduler.entry_snapshot(info_hash)
     }
+
+    pub(in crate::dht::service) fn current_power_scale_halves(&mut self, now: Instant) -> u8 {
+        let cap = self.peer_pressure_cap.advance(now);
+        let idle_probe_scale = self
+            .idle_speed_probe
+            .current_multiplier(now)
+            .saturating_mul(DHT_DEMAND_POWER_BASE_SCALE_HALVES);
+        idle_probe_scale.min(cap).max(1)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::dht::service) struct DemandPeerPressureCap {
+    current_scale_halves: u8,
+    target_scale_halves: u8,
+    last_ramp_at: Option<Instant>,
+}
+
+impl Default for DemandPeerPressureCap {
+    fn default() -> Self {
+        Self {
+            current_scale_halves: DHT_DEMAND_POWER_MAX_SCALE_HALVES,
+            target_scale_halves: DHT_DEMAND_POWER_MAX_SCALE_HALVES,
+            last_ramp_at: None,
+        }
+    }
+}
+
+impl DemandPeerPressureCap {
+    pub(in crate::dht::service) fn update_usage(
+        &mut self,
+        total_peers: usize,
+        max_connected_peers: usize,
+        now: Instant,
+    ) {
+        let target = Self::target_scale_halves(total_peers, max_connected_peers);
+        let previous_target = self.target_scale_halves;
+        self.target_scale_halves = target;
+
+        if target < self.current_scale_halves {
+            self.current_scale_halves = target;
+            self.last_ramp_at = Some(now);
+        } else if target > self.current_scale_halves
+            && (target != previous_target || self.last_ramp_at.is_none())
+        {
+            self.last_ramp_at = Some(now);
+        }
+    }
+
+    pub(in crate::dht::service) fn advance(&mut self, now: Instant) -> u8 {
+        if self.current_scale_halves >= self.target_scale_halves {
+            self.last_ramp_at = None;
+            return self.current_scale_halves;
+        }
+
+        let mut ramp_at = *self.last_ramp_at.get_or_insert(now);
+        while self.current_scale_halves < self.target_scale_halves {
+            let Some(next_ramp_at) = ramp_at.checked_add(DHT_PEER_PRESSURE_CAP_RAMP_UP_INTERVAL)
+            else {
+                self.current_scale_halves = self.target_scale_halves;
+                self.last_ramp_at = None;
+                return self.current_scale_halves;
+            };
+            if now < next_ramp_at {
+                break;
+            }
+            self.current_scale_halves = self.current_scale_halves.saturating_add(1);
+            ramp_at = next_ramp_at;
+        }
+
+        self.last_ramp_at =
+            (self.current_scale_halves < self.target_scale_halves).then_some(ramp_at);
+        self.current_scale_halves
+    }
+
+    pub(in crate::dht::service) fn current_scale_halves(&self) -> u8 {
+        self.current_scale_halves
+    }
+
+    fn target_scale_halves(total_peers: usize, max_connected_peers: usize) -> u8 {
+        if max_connected_peers == 0 {
+            return DHT_DEMAND_POWER_MAX_SCALE_HALVES;
+        }
+
+        if peer_pressure_at_least(total_peers, max_connected_peers, 90) {
+            1
+        } else if peer_pressure_at_least(total_peers, max_connected_peers, 80) {
+            2
+        } else if peer_pressure_at_least(total_peers, max_connected_peers, 70) {
+            4
+        } else {
+            DHT_DEMAND_POWER_MAX_SCALE_HALVES
+        }
+    }
+}
+
+fn peer_pressure_at_least(total_peers: usize, max_connected_peers: usize, percent: u128) -> bool {
+    (total_peers as u128).saturating_mul(100)
+        >= (max_connected_peers as u128).saturating_mul(percent)
 }
 
 #[derive(Debug)]
@@ -1178,6 +1284,8 @@ pub(in crate::dht::service) struct DemandLookupPlan {
     pub(in crate::dht::service) stop_after_first_batch: bool,
     pub(in crate::dht::service) unique_peer_cap: usize,
     pub(in crate::dht::service) power_multiplier: u8,
+    pub(in crate::dht::service) power_scale_halves: u8,
+    pub(in crate::dht::service) peer_pressure_cap_halves: u8,
 }
 
 impl DemandLookupPlan {
@@ -1197,6 +1305,8 @@ impl DemandLookupPlan {
                 stop_after_first_batch: false,
                 unique_peer_cap: DHT_AWAITING_METADATA_SLICE_UNIQUE_PEER_CAP,
                 power_multiplier: 1,
+                power_scale_halves: DHT_DEMAND_POWER_BASE_SCALE_HALVES,
+                peer_pressure_cap_halves: DHT_DEMAND_POWER_MAX_SCALE_HALVES,
             },
             DemandSliceClass::NoConnectedPeers => Self {
                 class: DemandSliceClass::NoConnectedPeers,
@@ -1205,6 +1315,8 @@ impl DemandLookupPlan {
                 stop_after_first_batch: false,
                 unique_peer_cap: DHT_NO_CONNECTED_PEERS_SLICE_UNIQUE_PEER_CAP,
                 power_multiplier: 1,
+                power_scale_halves: DHT_DEMAND_POWER_BASE_SCALE_HALVES,
+                peer_pressure_cap_halves: DHT_DEMAND_POWER_MAX_SCALE_HALVES,
             },
             DemandSliceClass::RoutineRefresh if metrics.wants_extended_routine_search() => Self {
                 class: DemandSliceClass::RoutineRefresh,
@@ -1213,6 +1325,8 @@ impl DemandLookupPlan {
                 stop_after_first_batch: false,
                 unique_peer_cap: DHT_ROUTINE_SUPPORT_SLICE_UNIQUE_PEER_CAP,
                 power_multiplier: 1,
+                power_scale_halves: DHT_DEMAND_POWER_BASE_SCALE_HALVES,
+                peer_pressure_cap_halves: DHT_DEMAND_POWER_MAX_SCALE_HALVES,
             },
             DemandSliceClass::RoutineRefresh => Self {
                 class: DemandSliceClass::RoutineRefresh,
@@ -1221,6 +1335,8 @@ impl DemandLookupPlan {
                 stop_after_first_batch: true,
                 unique_peer_cap: DHT_ROUTINE_SLICE_UNIQUE_PEER_CAP,
                 power_multiplier: 1,
+                power_scale_halves: DHT_DEMAND_POWER_BASE_SCALE_HALVES,
+                peer_pressure_cap_halves: DHT_DEMAND_POWER_MAX_SCALE_HALVES,
             },
         }
     }
@@ -1232,6 +1348,24 @@ impl DemandLookupPlan {
         idle_probe: DemandPlannerIdleSpeedProbeStatus,
         now: Instant,
     ) -> Self {
+        Self::for_candidate_with_peer_cap(
+            candidate,
+            planner_state,
+            selection_reason,
+            idle_probe,
+            DHT_DEMAND_POWER_MAX_SCALE_HALVES,
+            now,
+        )
+    }
+
+    pub(in crate::dht::service) fn for_candidate_with_peer_cap(
+        candidate: DueDemandCandidate,
+        planner_state: &HashMap<InfoHash, DemandPlannerState>,
+        selection_reason: DemandSelectionReason,
+        idle_probe: DemandPlannerIdleSpeedProbeStatus,
+        peer_pressure_cap_halves: u8,
+        now: Instant,
+    ) -> Self {
         Self::for_demand_with_metrics(candidate.demand, candidate.metrics).with_power_multiplier(
             demand_lookup_power_multiplier(
                 candidate,
@@ -1240,23 +1374,37 @@ impl DemandLookupPlan {
                 idle_probe,
                 now,
             ),
+            peer_pressure_cap_halves,
         )
     }
 
-    fn with_power_multiplier(mut self, multiplier: u8) -> Self {
+    fn with_power_multiplier(mut self, multiplier: u8, peer_pressure_cap_halves: u8) -> Self {
         let multiplier = multiplier.max(1);
         self.power_multiplier = multiplier;
-        if multiplier > 1 {
-            let multiplier = u32::from(multiplier);
-            self.max_wall_time = multiply_duration(self.max_wall_time, multiplier);
-            self.unique_peer_cap = self.unique_peer_cap.saturating_mul(multiplier as usize);
-        }
+        self.peer_pressure_cap_halves =
+            peer_pressure_cap_halves.clamp(1, DHT_DEMAND_POWER_MAX_SCALE_HALVES);
+        self.power_scale_halves = multiplier
+            .saturating_mul(DHT_DEMAND_POWER_BASE_SCALE_HALVES)
+            .min(self.peer_pressure_cap_halves)
+            .max(1);
+        self.max_wall_time = scale_duration_halves(self.max_wall_time, self.power_scale_halves);
+        self.unique_peer_cap = scale_usize_halves(self.unique_peer_cap, self.power_scale_halves);
         self
     }
 }
 
-fn multiply_duration(duration: Duration, multiplier: u32) -> Duration {
-    duration.checked_mul(multiplier).unwrap_or(Duration::MAX)
+fn scale_duration_halves(duration: Duration, scale_halves: u8) -> Duration {
+    duration
+        .checked_mul(u32::from(scale_halves))
+        .and_then(|duration| duration.checked_div(u32::from(DHT_DEMAND_POWER_BASE_SCALE_HALVES)))
+        .unwrap_or(Duration::MAX)
+}
+
+fn scale_usize_halves(value: usize, scale_halves: u8) -> usize {
+    value
+        .saturating_mul(scale_halves as usize)
+        .saturating_add((DHT_DEMAND_POWER_BASE_SCALE_HALVES - 1) as usize)
+        / DHT_DEMAND_POWER_BASE_SCALE_HALVES as usize
 }
 
 fn demand_lookup_power_multiplier(

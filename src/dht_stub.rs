@@ -100,6 +100,7 @@ pub mod service {
         pub inflight_ipv6_queries: usize,
         pub unique_peers_found_last_10s: usize,
         pub demand_power_multiplier: u8,
+        pub demand_power_scale_halves: u8,
     }
 
     #[derive(Debug, Clone, Default)]
@@ -201,6 +202,8 @@ pub mod service {
             #[cfg(not(test))]
             let _ = config;
         }
+
+        pub fn update_peer_slot_usage(&self, _total_peers: usize, _max_connected_peers: usize) {}
     }
 
     #[cfg(test)]

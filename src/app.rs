@@ -1382,6 +1382,7 @@ pub struct App {
     pub startup_completion_suppressed_hashes: HashSet<Vec<u8>>,
     pub startup_deferred_load_queue: VecDeque<Vec<u8>>,
     pub next_startup_load_at: Option<time::Instant>,
+    pub last_dht_peer_slot_usage: Option<(usize, usize)>,
 }
 
 #[derive(Clone)]
@@ -1901,6 +1902,7 @@ impl App {
             startup_completion_suppressed_hashes: HashSet::new(),
             startup_deferred_load_queue: VecDeque::new(),
             next_startup_load_at: None,
+            last_dht_peer_slot_usage: None,
         };
         app.sync_cluster_role_label();
         app.refresh_system_warning();
@@ -3007,6 +3009,7 @@ impl App {
                 _ = time::sleep_until(next_draw_time.into()) => {
                     next_draw_time = Instant::now() + current_target_framerate;
                     self.drain_latest_torrent_metrics();
+                    self.sync_dht_peer_slot_usage();
                     if Self::should_draw_this_frame(&self.app_state.mode, self.app_state.ui.needs_redraw) {
                         self.tick_ui_effects_clock();
                         let dht_status = self.dht_service.current_status();
@@ -4606,6 +4609,27 @@ impl App {
             // Full recompute is done on structural RSS changes (preview/filter/history/add/remove/search/edit).
             self.app_state.ui.needs_redraw = true;
         }
+    }
+
+    fn total_successfully_connected_peers(&self) -> usize {
+        self.app_state
+            .torrents
+            .values()
+            .map(|torrent| torrent.latest_state.number_of_successfully_connected_peers)
+            .sum()
+    }
+
+    fn sync_dht_peer_slot_usage(&mut self) {
+        let total_peers = self.total_successfully_connected_peers();
+        let max_connected_peers = self.app_state.limits.max_connected_peers;
+        let usage = (total_peers, max_connected_peers);
+        if self.last_dht_peer_slot_usage == Some(usage) {
+            return;
+        }
+
+        self.last_dht_peer_slot_usage = Some(usage);
+        self.dht_service
+            .update_peer_slot_usage(total_peers, max_connected_peers);
     }
 
     async fn tuning_resource_limits(&mut self) {

@@ -127,6 +127,24 @@ pub(in crate::dht::service) async fn run_service(
                 )
                 .await;
             }
+            LoopEvent::Command(DhtCommand::UpdatePeerSlotUsage {
+                total_peers,
+                max_connected_peers,
+            }) => {
+                let reduction = service_state.update_demand_planner_action(
+                    DemandPlannerAction::PeerSlotUsageUpdated {
+                        total_peers,
+                        max_connected_peers,
+                        now: Instant::now(),
+                    },
+                );
+                apply_demand_planner_effects_for_state(
+                    active_runtime.as_mut(),
+                    &command_tx,
+                    &mut service_state,
+                    reduction.effects,
+                );
+            }
             LoopEvent::Command(
                 command @ (DhtCommand::RegisterDemand { .. }
                 | DhtCommand::UpdateDemand { .. }
@@ -247,8 +265,7 @@ pub(in crate::dht::service) async fn run_service(
             &mut service_state.recent_unique_peers,
             service_state
                 .demand_planner
-                .idle_speed_probe
-                .current_multiplier(Instant::now()),
+                .current_power_scale_halves(Instant::now()),
         );
     }
 }
