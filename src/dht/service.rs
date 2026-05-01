@@ -75,6 +75,14 @@ mod driver_tests;
 mod runtime_effect_tests;
 
 #[cfg(test)]
+#[path = "service/replay_tests.rs"]
+mod replay_tests;
+
+#[cfg(test)]
+#[path = "service/runtime_command_replay_tests.rs"]
+mod runtime_command_replay_tests;
+
+#[cfg(test)]
 #[path = "service/api_tests.rs"]
 mod api_tests;
 

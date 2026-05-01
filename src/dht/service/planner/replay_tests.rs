@@ -481,6 +481,14 @@ fn hash_label(info_hash: InfoHash) -> String {
     short_info_hash(info_hash)
 }
 
+fn emit_replay_trace(name: &str, rendered: &str) {
+    if std::env::var_os("SUPERSEEDR_DHT_REPLAY_PRINT").is_some() {
+        println!("SUPERSEEDR_DHT_REPLAY_BEGIN {name}");
+        println!("{rendered}");
+        println!("SUPERSEEDR_DHT_REPLAY_END {name}");
+    }
+}
+
 fn metadata_demand() -> DhtDemandState {
     DhtDemandState {
         awaiting_metadata: true,
@@ -572,6 +580,7 @@ final-state: entries{00000001:AwaitingMetadata:sub1:infalse:next2000:retry0:prob
 "#
     .trim();
     assert_eq!(rendered, expected);
+    emit_replay_trace("planner_fixed_trace", &rendered);
 }
 
 #[test]
@@ -620,4 +629,5 @@ final-state: entries{0000000a:NoConnectedPeers:sub1:intrue:next240000:retry4:pro
 "#
     .trim();
     assert_eq!(rendered, expected);
+    emit_replay_trace("planner_idle_speed_probe", &rendered);
 }
