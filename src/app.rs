@@ -2930,8 +2930,7 @@ impl App {
                 }
                 status_changed = self.dht_status_rx.changed() => {
                     if status_changed.is_ok() {
-                        self.refresh_system_warning();
-                        self.app_state.ui.needs_redraw = true;
+                        self.handle_dht_status_changed();
                     }
                 }
 
@@ -4630,6 +4629,15 @@ impl App {
         self.last_dht_peer_slot_usage = Some(usage);
         self.dht_service
             .update_peer_slot_usage(total_peers, max_connected_peers);
+    }
+
+    fn handle_dht_status_changed(&mut self) {
+        self.refresh_system_warning();
+        // ResetDemandPlanner is followed by a DHT status publish; resend peer pressure
+        // because the planner-side cap may have been reset while usage stayed unchanged.
+        self.last_dht_peer_slot_usage = None;
+        self.sync_dht_peer_slot_usage();
+        self.app_state.ui.needs_redraw = true;
     }
 
     async fn tuning_resource_limits(&mut self) {
@@ -7060,6 +7068,23 @@ mod tests {
         dir
     }
 
+    async fn wait_for_peer_slot_usages(
+        recorder: &TestDhtRecorder,
+        expected_len: usize,
+    ) -> Vec<(usize, usize)> {
+        time::timeout(Duration::from_secs(1), async {
+            loop {
+                let recorded = recorder.recorded_peer_slot_usages();
+                if recorded.len() >= expected_len {
+                    return recorded;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("DHT peer slot usage should be recorded")
+    }
+
     #[test]
     fn format_filesystem_path_error_reports_directory_as_file_mismatch() {
         let dir = tempfile::tempdir().expect("create tempdir");
@@ -8448,6 +8473,43 @@ mod tests {
             .expect("listener should remain bound");
         assert_eq!(app.client_configs.client_port, original_port);
         assert_eq!(rebound_port, original_port);
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn dht_status_change_resends_cached_peer_slot_usage() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        let recorder = TestDhtRecorder::default();
+        app.dht_service = DhtService::from_test_recorder(recorder.clone());
+        app.dht_status_rx = app.dht_service.subscribe_status();
+        app.app_state.limits.max_connected_peers = 10;
+
+        let info_hash = vec![4; 20];
+        let mut display = TorrentDisplayState::default();
+        display.latest_state.info_hash = info_hash.clone();
+        display.latest_state.torrent_name = "peer pressure sample".to_string();
+        display.latest_state.number_of_successfully_connected_peers = 9;
+        app.app_state.torrents.insert(info_hash, display);
+
+        app.sync_dht_peer_slot_usage();
+        assert_eq!(wait_for_peer_slot_usages(&recorder, 1).await, vec![(9, 10)]);
+
+        app.sync_dht_peer_slot_usage();
+        tokio::task::yield_now().await;
+        assert_eq!(recorder.recorded_peer_slot_usages(), vec![(9, 10)]);
+
+        app.handle_dht_status_changed();
+        assert_eq!(
+            wait_for_peer_slot_usages(&recorder, 2).await,
+            vec![(9, 10), (9, 10)]
+        );
 
         let _ = app.shutdown_tx.send(());
     }

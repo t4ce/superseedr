@@ -81,12 +81,15 @@ impl Drop for DhtDemandSubscription {
 type RecordedAnnounces = Arc<StdMutex<Vec<(Vec<u8>, Option<u16>)>>>;
 #[cfg(test)]
 type RecordedReconfigures = Arc<StdMutex<Vec<DhtServiceConfig>>>;
+#[cfg(test)]
+type RecordedPeerSlotUsages = Arc<StdMutex<Vec<(usize, usize)>>>;
 
 #[cfg(test)]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TestDhtRecorder {
     announce_requests: RecordedAnnounces,
     reconfigure_requests: RecordedReconfigures,
+    peer_slot_usages: RecordedPeerSlotUsages,
 }
 
 #[cfg(test)]
@@ -102,6 +105,13 @@ impl TestDhtRecorder {
         self.reconfigure_requests
             .lock()
             .expect("test dht reconfigure recorder lock")
+            .clone()
+    }
+
+    pub(crate) fn recorded_peer_slot_usages(&self) -> Vec<(usize, usize)> {
+        self.peer_slot_usages
+            .lock()
+            .expect("test dht peer slot recorder lock")
             .clone()
     }
 }
@@ -312,12 +322,25 @@ impl DhtService {
         };
         let task = Some(tokio::spawn(async move {
             while let Some(command) = command_rx.recv().await {
-                if let DhtCommand::Reconfigure(config) = command {
-                    recorder
-                        .reconfigure_requests
-                        .lock()
-                        .expect("test dht reconfigure recorder lock")
-                        .push(config);
+                match command {
+                    DhtCommand::Reconfigure(config) => {
+                        recorder
+                            .reconfigure_requests
+                            .lock()
+                            .expect("test dht reconfigure recorder lock")
+                            .push(config);
+                    }
+                    DhtCommand::UpdatePeerSlotUsage {
+                        total_peers,
+                        max_connected_peers,
+                    } => {
+                        recorder
+                            .peer_slot_usages
+                            .lock()
+                            .expect("test dht peer slot recorder lock")
+                            .push((total_peers, max_connected_peers));
+                    }
+                    _ => {}
                 }
             }
         }));
