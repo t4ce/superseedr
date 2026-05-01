@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use super::*;
+use std::env;
 
 #[derive(Debug, Clone, Default)]
 pub struct DhtLookupRun {

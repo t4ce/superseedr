@@ -27,7 +27,7 @@ impl PlannerReplay {
         self.now += duration;
     }
 
-    fn register(&mut self, label: &'static str, key: u32, demand: DhtDemandState) {
+    fn register(&mut self, label: &str, key: u32, demand: DhtDemandState) {
         self.reduce(
             label,
             DemandPlannerAction::DemandRegistered {
@@ -38,7 +38,7 @@ impl PlannerReplay {
         );
     }
 
-    fn update(&mut self, label: &'static str, key: u32, demand: DhtDemandState) {
+    fn update(&mut self, label: &str, key: u32, demand: DhtDemandState) {
         self.reduce(
             label,
             DemandPlannerAction::DemandUpdated {
@@ -49,7 +49,7 @@ impl PlannerReplay {
         );
     }
 
-    fn update_metrics(&mut self, label: &'static str, key: u32, metrics: DhtDemandMetrics) {
+    fn update_metrics(&mut self, label: &str, key: u32, metrics: DhtDemandMetrics) {
         self.reduce(
             label,
             DemandPlannerAction::DemandMetricsUpdated {
@@ -59,7 +59,7 @@ impl PlannerReplay {
         );
     }
 
-    fn plan(&mut self, label: &'static str, runtime_available: bool) {
+    fn plan(&mut self, label: &str, runtime_available: bool) {
         let reduction = self.reduce(
             label,
             DemandPlannerAction::PlanDue {
@@ -84,7 +84,7 @@ impl PlannerReplay {
         }
     }
 
-    fn finish(&mut self, label: &'static str, key: u32, total_peers: usize, unique_peers: usize) {
+    fn finish(&mut self, label: &str, key: u32, total_peers: usize, unique_peers: usize) {
         let info_hash = hash_index(key);
         let slice_class = self
             .planner
@@ -106,7 +106,7 @@ impl PlannerReplay {
 
     fn park_active(
         &mut self,
-        label: &'static str,
+        label: &str,
         key: u32,
         total_peers: usize,
         unique_peers: u8,
@@ -169,7 +169,7 @@ impl PlannerReplay {
         }
     }
 
-    fn add_drain_peers(&mut self, label: &'static str, key: u32, peer_count: u8) {
+    fn add_drain_peers(&mut self, label: &str, key: u32, peer_count: u8) {
         let peers = synthetic_peers((key as u8).wrapping_add(40), peer_count)
             .into_iter()
             .collect::<Vec<_>>();
@@ -182,7 +182,7 @@ impl PlannerReplay {
         );
     }
 
-    fn drain_tick(&mut self, label: &'static str, runtime_ready: bool) {
+    fn drain_tick(&mut self, label: &str, runtime_ready: bool) {
         let runtime_ready = self
             .planner
             .draining_demands
@@ -205,7 +205,7 @@ impl PlannerReplay {
         }
     }
 
-    fn finalize_drained(&mut self, label: &'static str, info_hash: InfoHash) {
+    fn finalize_drained(&mut self, label: &str, info_hash: InfoHash) {
         let drain = self
             .planner
             .draining_demands
@@ -237,15 +237,11 @@ impl PlannerReplay {
         );
     }
 
-    fn runtime_reset(&mut self, label: &'static str) {
+    fn runtime_reset(&mut self, label: &str) {
         self.reduce(label, DemandPlannerAction::RuntimeReset { now: self.now });
     }
 
-    fn reduce(
-        &mut self,
-        label: &'static str,
-        action: DemandPlannerAction<'_>,
-    ) -> DemandPlannerReduction {
+    fn reduce(&mut self, label: &str, action: DemandPlannerAction<'_>) -> DemandPlannerReduction {
         let reduction = self.planner.update(action);
         check_demand_planner_invariants(&self.planner).unwrap_or_else(|violation| {
             panic!("{label} violated planner invariant: {violation:?}")
@@ -481,14 +477,6 @@ fn hash_label(info_hash: InfoHash) -> String {
     short_info_hash(info_hash)
 }
 
-fn emit_replay_trace(name: &str, rendered: &str) {
-    if std::env::var_os("SUPERSEEDR_DHT_REPLAY_PRINT").is_some() {
-        println!("SUPERSEEDR_DHT_REPLAY_BEGIN {name}");
-        println!("{rendered}");
-        println!("SUPERSEEDR_DHT_REPLAY_END {name}");
-    }
-}
-
 fn metadata_demand() -> DhtDemandState {
     DhtDemandState {
         awaiting_metadata: true,
@@ -532,6 +520,141 @@ fn idle_probe_metrics() -> DhtDemandMetrics {
         connected_peers: 0,
         ..Default::default()
     }
+}
+
+fn demand_from_trace_class(class: &str, connected_peers: usize) -> DhtDemandState {
+    match class {
+        "metadata" => metadata_demand(),
+        "no-peer" => no_peer_demand(),
+        "routine" => routine_demand(connected_peers.max(1)),
+        _ => panic!("unknown trace demand class: {class}"),
+    }
+}
+
+fn stop_reason_from_trace(token: &str) -> DemandSliceStopReason {
+    match token {
+        "wall" => DemandSliceStopReason::WallTime,
+        "idle" => DemandSliceStopReason::IdleTimeout,
+        "first-batch" => DemandSliceStopReason::FirstBatch,
+        "cap" => DemandSliceStopReason::UniquePeerCap,
+        _ => panic!("unknown trace stop reason: {token}"),
+    }
+}
+
+fn metrics_from_trace(token: &str, connected_peers: usize) -> DhtDemandMetrics {
+    match token {
+        "idle" => idle_probe_metrics(),
+        "upload" => active_complete_upload_metrics(connected_peers.max(1)),
+        "download-starved" => DhtDemandMetrics {
+            accepting_new_peers: true,
+            complete: false,
+            total_pieces: 100,
+            completed_pieces: 20,
+            connected_peers: connected_peers.max(1),
+            download_speed_bps: 0,
+            ..Default::default()
+        },
+        _ => panic!("unknown trace metrics kind: {token}"),
+    }
+}
+
+fn replay_normalized_trace_fixture(script: &str) -> String {
+    let mut replay = PlannerReplay::new();
+    for raw_line in script.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parts = line.split_whitespace().collect::<Vec<_>>();
+        match parts.as_slice() {
+            ["register", label, key, class] => replay.register(
+                label,
+                key.parse().expect("trace register key"),
+                demand_from_trace_class(class, 0),
+            ),
+            ["register", label, key, class, peers] => replay.register(
+                label,
+                key.parse().expect("trace register key"),
+                demand_from_trace_class(class, peers.parse().expect("trace connected peers")),
+            ),
+            ["update", label, key, class, peers] => replay.update(
+                label,
+                key.parse().expect("trace update key"),
+                demand_from_trace_class(class, peers.parse().expect("trace connected peers")),
+            ),
+            ["metrics", label, key, kind, peers] => replay.update_metrics(
+                label,
+                key.parse().expect("trace metrics key"),
+                metrics_from_trace(kind, peers.parse().expect("trace metrics peers")),
+            ),
+            ["plan", label, runtime_available] => {
+                replay.plan(
+                    label,
+                    runtime_available.parse().expect("trace runtime flag"),
+                );
+            }
+            ["advance-ms", millis] => {
+                replay.advance(Duration::from_millis(
+                    millis.parse().expect("trace advance millis"),
+                ));
+            }
+            ["finish", label, key, total_peers, unique_peers] => replay.finish(
+                label,
+                key.parse().expect("trace finish key"),
+                total_peers.parse().expect("trace total peers"),
+                unique_peers.parse().expect("trace unique peers"),
+            ),
+            ["park", label, key, total_peers, unique_peers, stop_reason] => replay.park_active(
+                label,
+                key.parse().expect("trace park key"),
+                total_peers.parse().expect("trace park total peers"),
+                unique_peers.parse().expect("trace park unique peers"),
+                stop_reason_from_trace(stop_reason),
+            ),
+            ["drain-peers", label, key, peer_count] => replay.add_drain_peers(
+                label,
+                key.parse().expect("trace drain-peers key"),
+                peer_count.parse().expect("trace drain peer count"),
+            ),
+            ["drain-tick", label, runtime_ready] => {
+                replay.drain_tick(
+                    label,
+                    runtime_ready.parse().expect("trace runtime-ready flag"),
+                );
+            }
+            ["runtime-reset", label] => replay.runtime_reset(label),
+            _ => panic!("invalid trace fixture line: {line}"),
+        }
+    }
+    replay.rendered()
+}
+
+#[test]
+fn demand_planner_replays_normalized_trace_fixture() {
+    let rendered = replay_normalized_trace_fixture(
+        r#"
+        # This is the compact form we can derive from captured planner traces.
+        register captured-metadata 21 metadata
+        register captured-no-peer 22 no-peer
+        register captured-routine 23 routine 3
+        metrics captured-routine-metrics 23 upload 3
+        plan captured-plan true
+        "#,
+    );
+    let expected = r#"
+captured-metadata: effects=[] plan=[]
+captured-no-peer: effects=[] plan=[]
+captured-routine: effects=[] plan=[]
+captured-routine-metrics: effects=[] plan=[]
+captured-plan: effects=[start:00000015:AwaitingMetadata:OverdueScarce:2x:cap256,start:00000017:RoutineRefresh:SwarmSupport:2x:cap96,start:00000016:NoConnectedPeers:OverdueScarce:1x:cap48] plan=[budget5:due3:spare0:idle0:0x:active0/0/0:drain0]
+lookup-started: effects=[] plan=[]
+lookup-started: effects=[] plan=[]
+lookup-started: effects=[] plan=[]
+final-state: entries{00000015:AwaitingMetadata:sub1:intrue:next0:retry0:probefalse|00000016:NoConnectedPeers:sub1:intrue:next0:retry0:probefalse|00000017:RoutineRefresh:sub1:intrue:next0:retry0:probetrue};active{00000015:AwaitingMetadata:ids1|00000016:NoConnectedPeers:ids1|00000017:RoutineRefresh:ids1};pending{};drain{};history{00000015:start0:finish-:yield-:unique0|00000016:start0:finish-:yield-:unique0|00000017:start0:finish-:yield-:unique0}
+"#
+    .trim();
+
+    assert_eq!(rendered, expected);
 }
 
 #[test]
@@ -580,7 +703,6 @@ final-state: entries{00000001:AwaitingMetadata:sub1:infalse:next2000:retry0:prob
 "#
     .trim();
     assert_eq!(rendered, expected);
-    emit_replay_trace("planner_fixed_trace", &rendered);
 }
 
 #[test]
@@ -629,5 +751,4 @@ final-state: entries{0000000a:NoConnectedPeers:sub1:intrue:next240000:retry4:pro
 "#
     .trim();
     assert_eq!(rendered, expected);
-    emit_replay_trace("planner_idle_speed_probe", &rendered);
 }

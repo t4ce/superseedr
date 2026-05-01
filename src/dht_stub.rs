@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 pub mod service {
+    #![allow(dead_code)]
+
     use crate::config::Settings;
     use serde::{Deserialize, Serialize};
     use std::net::SocketAddr;
@@ -196,6 +198,8 @@ pub mod service {
                     .expect("test dht reconfigure recorder lock")
                     .push(config);
             }
+            #[cfg(not(test))]
+            let _ = config;
         }
     }
 
@@ -258,10 +262,16 @@ pub mod service {
     }
 
     #[cfg(test)]
+    type AnnounceRequests = Arc<StdMutex<Vec<(Vec<u8>, Option<u16>)>>>;
+
+    #[cfg(test)]
+    type ReconfigureRequests = Arc<StdMutex<Vec<DhtServiceConfig>>>;
+
+    #[cfg(test)]
     #[derive(Debug, Clone, Default)]
     pub(crate) struct TestDhtRecorder {
-        announce_requests: Arc<StdMutex<Vec<(Vec<u8>, Option<u16>)>>>,
-        reconfigure_requests: Arc<StdMutex<Vec<DhtServiceConfig>>>,
+        announce_requests: AnnounceRequests,
+        reconfigure_requests: ReconfigureRequests,
     }
 
     #[cfg(test)]

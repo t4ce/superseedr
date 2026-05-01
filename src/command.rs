@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::fmt;
+#[cfg(feature = "pex")]
 use std::net::SocketAddr;
 
 use crate::torrent_file::Torrent;

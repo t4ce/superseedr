@@ -722,8 +722,10 @@ impl DemandCrawlState {
         if self.is_stale(now) {
             Some(DemandCrawlResetReason::Stale)
         } else if self.class == class
-            && self.consecutive_stalled_low_yield_slices
+            && (self.consecutive_stalled_low_yield_slices
                 >= class.stalled_empty_slice_reset_threshold()
+                || self.consecutive_healthy_zero_yield_slices
+                    >= class.stalled_empty_slice_reset_threshold())
         {
             Some(DemandCrawlResetReason::LowQuality)
         } else {

@@ -51,9 +51,11 @@ fn demand_crawl_state_reuses_across_class_change_and_resets_on_staleness_or_low_
             DemandSliceClass::RoutineRefresh,
             now + Duration::from_secs(1)
         ),
-        None
+        Some(DemandCrawlResetReason::LowQuality)
     );
     assert_eq!(low_quality.consecutive_healthy_zero_yield_slices, 2);
+
+    let mut low_quality = DemandCrawlState::new(now, DemandSliceClass::RoutineRefresh);
     low_quality.observe_parked_slice(
         DemandSliceClass::RoutineRefresh,
         DemandParkedSliceOutcome::WeakLowYield,
@@ -144,6 +146,39 @@ fn demand_crawl_state_reuses_across_class_change_and_resets_on_staleness_or_low_
     assert_eq!(crawl.reset_count, 1);
     assert!(crawl.is_empty());
 }
+
+#[test]
+fn awaiting_metadata_parked_crawl_resets_after_repeated_zero_yield() {
+    let now = Instant::now();
+    let mut crawl = DemandCrawlState::new(now, DemandSliceClass::AwaitingMetadata);
+
+    for _ in 0..DHT_AWAITING_METADATA_STALLED_EMPTY_SLICE_RESET_THRESHOLD.saturating_sub(1) {
+        crawl.observe_parked_slice(
+            DemandSliceClass::AwaitingMetadata,
+            DemandParkedSliceOutcome::HealthyZeroYield,
+        );
+        assert_eq!(
+            crawl.reset_reason_for(
+                DemandSliceClass::AwaitingMetadata,
+                now + Duration::from_secs(1)
+            ),
+            None
+        );
+    }
+
+    crawl.observe_parked_slice(
+        DemandSliceClass::AwaitingMetadata,
+        DemandParkedSliceOutcome::HealthyZeroYield,
+    );
+    assert_eq!(
+        crawl.reset_reason_for(
+            DemandSliceClass::AwaitingMetadata,
+            now + Duration::from_secs(1)
+        ),
+        Some(DemandCrawlResetReason::LowQuality)
+    );
+}
+
 #[test]
 fn parked_quality_thresholds_match_class_expectations() {
     let weak_routine = AggregateLookupQualitySnapshot {

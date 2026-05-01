@@ -111,14 +111,6 @@ fn family_request(
     }
 }
 
-fn emit_replay_trace(name: &str, rendered: &str) {
-    if std::env::var_os("SUPERSEEDR_DHT_REPLAY_PRINT").is_some() {
-        println!("SUPERSEEDR_DHT_REPLAY_BEGIN {name}");
-        println!("{rendered}");
-        println!("SUPERSEEDR_DHT_REPLAY_END {name}");
-    }
-}
-
 #[test]
 fn dht_runtime_command_replays_effect_shape_deterministically() {
     let mut replay = RuntimeCommandReplay::default();
@@ -206,5 +198,4 @@ announce-peer: effects=[announce:0000012d:Some(6881)]
     .trim();
     let rendered = replay.render();
     assert_eq!(rendered, expected);
-    emit_replay_trace("runtime_command_trace", &rendered);
 }

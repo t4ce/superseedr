@@ -225,14 +225,6 @@ fn entry_labels(base: Instant, state: &DhtServiceState) -> Vec<String> {
     labels
 }
 
-fn emit_replay_trace(name: &str, rendered: &str) {
-    if std::env::var_os("SUPERSEEDR_DHT_REPLAY_PRINT").is_some() {
-        println!("SUPERSEEDR_DHT_REPLAY_BEGIN {name}");
-        println!("{rendered}");
-        println!("SUPERSEEDR_DHT_REPLAY_END {name}");
-    }
-}
-
 fn register_action(
     info_hash: InfoHash,
     demand: DhtDemandState,
@@ -372,5 +364,4 @@ register-no-peer: effects=[register-response:Some(2),subscriber[registered:00000
     .trim();
     let rendered = replay.render();
     assert_eq!(rendered, expected);
-    emit_replay_trace("service_state_trace", &rendered);
 }

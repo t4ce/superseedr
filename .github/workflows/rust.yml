@@ -53,6 +53,12 @@ jobs:
       - name: Run Tests
         run: cargo test --all-targets --all-features
 
+      - name: Lint Private Build
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+
+      - name: Run Private Build Tests
+        run: cargo test --all-targets --no-default-features
+
   package_linux:
     timeout-minutes: 120
     name: Build Linux Artifacts (${{ matrix.suffix }})

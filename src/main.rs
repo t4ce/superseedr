@@ -681,6 +681,7 @@ fn already_running_message() -> &'static str {
     "superseedr is already running."
 }
 
+#[cfg(all(feature = "dht", feature = "pex"))]
 fn private_client_leak_guard_message(config_path: &str) -> String {
     format!(
         "\n!!!ERROR: POTENTIAL LEAK!!!\n---------------------------------\nYou are running the normal build of superseedr (with DHT/PEX enabled),\nbut your configuration file indicates you last used a private build.\n\nThis safety check prevents accidental use of forbidden features on private trackers.\n\nChoose an option:\n  1. If you want to use the PRIVATE build (for private trackers):\n     Install and run it:\n       cargo install superseedr --no-default-features\n       superseedr\n\n  2. If you want to switch back to the NORMAL build (for public trackers):\n     Manually edit your configuration file:\n       {config_path}\n     Change the line `private_client = true` to `private_client = false`\n     Then, run this normal build again.\n\nExiting to prevent potential tracker issues."
@@ -3339,6 +3340,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "dht", feature = "pex"))]
     fn private_client_leak_guard_message_includes_recovery_steps() {
         let message = private_client_leak_guard_message("/tmp/config.toml");
 

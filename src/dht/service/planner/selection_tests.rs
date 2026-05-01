@@ -983,6 +983,76 @@ fn select_due_demand_launches_prefers_reusable_parked_crawls_within_class() {
     assert_eq!(selected.len(), 1);
     assert_eq!(selected[0].info_hash, hash(2));
 }
+
+#[test]
+fn select_due_demand_launches_does_not_reuse_low_quality_parked_crawl() {
+    let hash = |byte: u8| InfoHash::from([byte; InfoHash::LEN]);
+    let now = Instant::now();
+    let older_due = hash(1);
+    let low_quality_parked = hash(2);
+    let due = vec![
+        DueDemandCandidate {
+            info_hash: older_due,
+            demand: DhtDemandState {
+                awaiting_metadata: false,
+                connected_peers: 0,
+            },
+            metrics: DhtDemandMetrics::default(),
+            next_eligible_at: now - Duration::from_secs(30),
+            subscriber_count: 1,
+        },
+        DueDemandCandidate {
+            info_hash: low_quality_parked,
+            demand: DhtDemandState {
+                awaiting_metadata: false,
+                connected_peers: 0,
+            },
+            metrics: DhtDemandMetrics::default(),
+            next_eligible_at: now - Duration::from_secs(10),
+            subscriber_count: 1,
+        },
+    ];
+
+    let mut crawl = DemandCrawlState::new(now, DemandSliceClass::NoConnectedPeers);
+    crawl.ipv4 = Some(lookup_state_for_family(
+        LookupId(1),
+        AddressFamily::Ipv4,
+        2,
+        now,
+    ));
+    for _ in 0..DHT_NO_CONNECTED_PEERS_STALLED_EMPTY_SLICE_RESET_THRESHOLD {
+        crawl.observe_parked_slice(
+            DemandSliceClass::NoConnectedPeers,
+            DemandParkedSliceOutcome::HealthyZeroYield,
+        );
+    }
+    let parked_crawls = HashMap::from([(low_quality_parked, crawl)]);
+
+    assert!(!due_candidate_has_reusable_parked_crawl(
+        &parked_crawls,
+        due[1],
+        now
+    ));
+    assert_ne!(
+        candidate_selection_reason(due[1], &parked_crawls, &HashMap::new(), now),
+        DemandSelectionReason::ReusableParked
+    );
+
+    let mut planner_budget = DemandPlannerBudget::new(now);
+    let selected = select_due_demand_launches(
+        &due,
+        DemandSlotCounts::default(),
+        &parked_crawls,
+        &HashMap::new(),
+        &mut planner_budget,
+        now,
+        1,
+    );
+
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].info_hash, older_due);
+}
+
 #[test]
 fn select_due_demand_launches_prefers_recently_productive_crawls_within_class() {
     let hash = |byte: u8| InfoHash::from([byte; InfoHash::LEN]);

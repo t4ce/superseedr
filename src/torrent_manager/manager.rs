@@ -98,16 +98,6 @@ const ACTIVITY_MESSAGE_MAX_LEN: usize = 28;
 const BASE_BACKOFF_MS: u64 = 1000;
 const JITTER_MS: u64 = 100;
 
-#[cfg(feature = "dht")]
-fn dht_demand_log_enabled() -> bool {
-    std::env::var_os("SUPERSEEDR_DHT_DEMAND_LOG").is_some()
-}
-
-#[cfg(feature = "dht")]
-fn short_info_hash_hex(info_hash: &[u8]) -> String {
-    hex::encode(&info_hash[..info_hash.len().min(4)])
-}
-
 struct PreparedFileProbeEntry {
     relative_path: std::path::PathBuf,
     absolute_path: std::path::PathBuf,
@@ -169,8 +159,10 @@ pub struct TorrentManager {
     dht_task_handle: (),
 
     #[cfg(not(feature = "dht"))]
+    #[allow(dead_code)]
     dht_demand_state: (),
     #[cfg(not(feature = "dht"))]
+    #[allow(dead_code)]
     dht_demand_metrics: (),
 
     #[allow(dead_code)]
@@ -270,17 +262,8 @@ impl TorrentManager {
             let update_sent = self
                 .dht_handle
                 .update_demand(self.state.info_hash.clone(), desired_demand);
-            if dht_demand_log_enabled() {
-                tracing::info!(
-                    target: "superseedr::dht_demand",
-                    info_hash = %short_info_hash_hex(&self.state.info_hash),
-                    previous = ?previous_demand,
-                    desired = ?desired_demand,
-                    torrent_status = ?self.state.torrent_status,
-                    dht_update_sent = update_sent,
-                    "torrent manager dht demand sync"
-                );
-            }
+            let _ = previous_demand;
+            let _ = update_sent;
             self.dht_demand_state = Some(desired_demand);
         }
 
@@ -289,15 +272,7 @@ impl TorrentManager {
             let update_sent = self
                 .dht_handle
                 .update_demand_metrics(self.state.info_hash.clone(), desired_metrics);
-            if dht_demand_log_enabled() {
-                tracing::debug!(
-                    target: "superseedr::dht_demand",
-                    info_hash = %short_info_hash_hex(&self.state.info_hash),
-                    metrics = ?desired_metrics,
-                    dht_update_sent = update_sent,
-                    "torrent manager dht demand metrics sync"
-                );
-            }
+            let _ = update_sent;
             self.dht_demand_metrics = Some(desired_metrics);
         }
     }
@@ -1818,15 +1793,6 @@ impl TorrentManager {
             self.dht_task_handle = Some(handle);
             self.dht_demand_state = Some(demand_state);
             self.dht_demand_metrics = Some(demand_metrics);
-            if dht_demand_log_enabled() {
-                tracing::info!(
-                    target: "superseedr::dht_demand",
-                    info_hash = %short_info_hash_hex(&self.state.info_hash),
-                    demand = ?demand_state,
-                    torrent_status = ?self.state.torrent_status,
-                    "torrent manager dht demand registered"
-                );
-            }
         }
     }
 

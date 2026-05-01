@@ -11,7 +11,6 @@ use super::types::{
 use std::cmp::{Ordering, Reverse};
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::OnceLock;
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -482,9 +481,6 @@ impl LookupState {
 
     fn absorb_discovered_nodes(&mut self, nodes: Vec<CompactNode>) -> Vec<CompactNode> {
         let mut accepted = Vec::new();
-        let mut skipped_visited_or_inflight = 0usize;
-        let mut skipped_prefix = 0usize;
-        let mut skipped_conflict = 0usize;
         for node in nodes {
             if !is_routable_dht_addr(node.addr) {
                 continue;
@@ -495,12 +491,10 @@ impl LookupState {
                     .values()
                     .any(|query| query.candidate.addr == node.addr)
             {
-                skipped_visited_or_inflight += 1;
                 continue;
             }
 
             if self.prefix_count(node.addr) >= self.config.per_prefix_limit {
-                skipped_prefix += 1;
                 continue;
             }
 
@@ -517,7 +511,6 @@ impl LookupState {
             };
 
             if self.conflicts_with_existing_public_identity(&candidate) {
-                skipped_conflict += 1;
                 continue;
             }
 
@@ -525,21 +518,6 @@ impl LookupState {
                 accepted.push(node);
             }
         }
-        trace_lookup_admission(
-            self.request.target.as_node_id(),
-            format!(
-                "admission family={:?} offered={} accepted={} skipped_visited_or_inflight={} skipped_prefix={} skipped_conflict={} frontier={} inflight={} visited={}",
-                self.family,
-                accepted.len() + skipped_visited_or_inflight + skipped_prefix + skipped_conflict,
-                accepted.len(),
-                skipped_visited_or_inflight,
-                skipped_prefix,
-                skipped_conflict,
-                self.frontier.len(),
-                self.inflight.len(),
-                self.visited.len(),
-            ),
-        );
         accepted
     }
 
@@ -808,35 +786,6 @@ fn prefix_key(addr: SocketAddr) -> PrefixKey {
             ])
         }
     }
-}
-
-fn trace_lookup_admission(target: NodeId, message: String) {
-    static TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
-    static TRACE_TARGET: OnceLock<Option<String>> = OnceLock::new();
-
-    let enabled =
-        *TRACE_ENABLED.get_or_init(|| std::env::var_os("SUPERSEEDR_INTERNAL_TRACE").is_some());
-    if !enabled {
-        return;
-    }
-
-    let target_filter = TRACE_TARGET.get_or_init(|| {
-        std::env::var("SUPERSEEDR_INTERNAL_TRACE_TARGET")
-            .ok()
-            .map(|value| value.to_ascii_lowercase())
-    });
-
-    if let Some(target_filter) = target_filter {
-        if hex::encode(target.as_ref()).to_ascii_lowercase() != *target_filter {
-            return;
-        }
-    }
-
-    eprintln!(
-        "[internal-trace target={}] {}",
-        hex::encode(target.as_ref()),
-        message
-    );
 }
 
 #[cfg(test)]

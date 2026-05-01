@@ -165,12 +165,162 @@ impl PersistedRoutingNode {
 
     fn to_record(&self, now: Instant) -> NodeRecord {
         let mut record = NodeRecord::new(self.addr, self.node_id, now);
-        record.trust = self.trust;
+        record.trust = normalize_persisted_trust(self.trust);
         record.bep42_state = self.bep42_state;
         record.consecutive_failures = self.consecutive_failures;
         record.dead_referral_count = self.dead_referral_count;
         record.live_referral_count = self.live_referral_count;
         record.id_churn_count = self.id_churn_count;
         record
+    }
+}
+
+fn normalize_persisted_trust(trust: NodeTrust) -> NodeTrust {
+    match trust {
+        NodeTrust::Suspicious => NodeTrust::Neutral,
+        trust => trust,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    fn persisted_node(
+        octet: u8,
+        trust: NodeTrust,
+        bep42_state: Bep42State,
+        id_churn_count: u16,
+    ) -> PersistedRoutingNode {
+        PersistedRoutingNode {
+            addr: SocketAddr::from((Ipv4Addr::new(203, 0, 113, octet), 6881)),
+            node_id: Some(NodeId::from([8; NodeId::LEN])),
+            trust,
+            bep42_state,
+            consecutive_failures: 0,
+            dead_referral_count: 0,
+            live_referral_count: 1,
+            id_churn_count,
+        }
+    }
+
+    #[test]
+    fn restore_nodes_neutralizes_stale_suspicious_trust() {
+        let node = persisted_node(10, NodeTrust::Suspicious, Bep42State::NonCompliant, 1);
+        let restored = node.to_record(Instant::now());
+
+        assert_eq!(restored.trust, NodeTrust::Neutral);
+        assert_eq!(restored.bep42_state, Bep42State::NonCompliant);
+        assert_eq!(restored.id_churn_count, 1);
+    }
+
+    #[test]
+    fn restore_nodes_preserves_trusted_routes() {
+        let node = persisted_node(11, NodeTrust::Trusted, Bep42State::Compliant, 0);
+        let restored = node.to_record(Instant::now());
+
+        assert_eq!(restored.trust, NodeTrust::Trusted);
+    }
+
+    #[test]
+    fn restore_nodes_normalizes_mixed_legacy_route_trust() {
+        let manager = PersistenceManager::new(PersistenceConfig {
+            path: PathBuf::from("unused-dht-state.json"),
+            max_age: Duration::from_secs(60),
+        });
+        let routes = PersistedRoutingTable {
+            family: AddressFamily::Ipv4,
+            nodes: vec![
+                persisted_node(20, NodeTrust::Suspicious, Bep42State::NonCompliant, 0),
+                persisted_node(21, NodeTrust::Suspicious, Bep42State::Unknown, 2),
+                persisted_node(22, NodeTrust::Neutral, Bep42State::Compliant, 0),
+                persisted_node(23, NodeTrust::Trusted, Bep42State::Compliant, 0),
+            ],
+            replacements: vec![persisted_node(
+                24,
+                NodeTrust::Suspicious,
+                Bep42State::NonCompliant,
+                4,
+            )],
+        };
+
+        let restored = manager.restore_nodes(&routes, Instant::now());
+
+        assert_eq!(
+            restored
+                .iter()
+                .map(|record| record.trust)
+                .collect::<Vec<_>>(),
+            vec![
+                NodeTrust::Neutral,
+                NodeTrust::Neutral,
+                NodeTrust::Neutral,
+                NodeTrust::Trusted
+            ]
+        );
+        assert_eq!(restored[0].bep42_state, Bep42State::NonCompliant);
+        assert_eq!(restored[1].id_churn_count, 2);
+    }
+
+    #[test]
+    fn load_snapshot_ignores_invalid_stale_and_unsupported_files() {
+        let temp_dir = tempfile::tempdir().expect("temp dht persistence dir");
+        let path = temp_dir.path().join("dht_state.json");
+        let manager = PersistenceManager::new(PersistenceConfig {
+            path: path.clone(),
+            max_age: Duration::from_secs(60),
+        });
+
+        fs::write(&path, b"{not json").expect("write invalid state");
+        assert!(manager
+            .load_snapshot(SystemTime::now())
+            .expect("load invalid")
+            .is_none());
+
+        let mut snapshot = PersistedStateEnvelope {
+            version: PERSISTENCE_VERSION + 1,
+            created_at_unix_secs: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            node_id: NodeId::from([1; NodeId::LEN]),
+            ipv4_routes: PersistedRoutingTable {
+                family: AddressFamily::Ipv4,
+                nodes: vec![persisted_node(
+                    30,
+                    NodeTrust::Neutral,
+                    Bep42State::Unknown,
+                    0,
+                )],
+                replacements: Vec::new(),
+            },
+            ipv6_routes: PersistedRoutingTable {
+                family: AddressFamily::Ipv6,
+                nodes: Vec::new(),
+                replacements: Vec::new(),
+            },
+        };
+        fs::write(
+            &path,
+            serde_json::to_vec(&snapshot).expect("serialize unsupported snapshot"),
+        )
+        .expect("write unsupported snapshot");
+        assert!(manager
+            .load_snapshot(SystemTime::now())
+            .expect("load unsupported")
+            .is_none());
+
+        snapshot.version = PERSISTENCE_VERSION;
+        snapshot.created_at_unix_secs = 1;
+        fs::write(
+            &path,
+            serde_json::to_vec(&snapshot).expect("serialize stale snapshot"),
+        )
+        .expect("write stale snapshot");
+        assert!(manager
+            .load_snapshot(UNIX_EPOCH + Duration::from_secs(10_000))
+            .expect("load stale")
+            .is_none());
     }
 }

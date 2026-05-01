@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 pub const GOOD_NODE_WINDOW: Duration = Duration::from_secs(15 * 60);
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 pub const BAD_NODE_FAILURE_THRESHOLD: u16 = 2;
-const SUSPICIOUS_ID_CHURN_THRESHOLD: u16 = 1;
 
 #[derive(Debug, Clone)]
 pub struct RoutingConfig {
@@ -246,7 +245,6 @@ impl RoutingTable {
         }
 
         candidate.bep42_state = classify_node(candidate.addr, Some(node_id));
-        apply_routing_trust_policy(&mut candidate);
         candidate.last_changed_at = now;
 
         loop {
@@ -309,7 +307,6 @@ impl RoutingTable {
         self.with_record_mut(addr, |bucket, record| {
             record.note_query_response(node_id, now);
             record.bep42_state = classify_node(record.addr, record.node_id);
-            apply_routing_trust_policy(record);
             bucket.last_changed_at = now;
         })
     }
@@ -331,7 +328,6 @@ impl RoutingTable {
             }
             record.note_inbound_query(now);
             record.bep42_state = classify_node(record.addr, record.node_id);
-            apply_routing_trust_policy(record);
             bucket.last_changed_at = now;
         })
     }
@@ -736,16 +732,7 @@ fn merge_record(target: &mut NodeRecord, candidate: &NodeRecord, now: Instant) {
         target.bep42_state = candidate.bep42_state;
     }
     target.bep42_state = classify_node(target.addr, target.node_id);
-    apply_routing_trust_policy(target);
     target.last_changed_at = now;
-}
-
-fn apply_routing_trust_policy(record: &mut NodeRecord) {
-    if record.id_churn_count >= SUSPICIOUS_ID_CHURN_THRESHOLD
-        || record.bep42_state == Bep42State::NonCompliant
-    {
-        record.trust = NodeTrust::Suspicious;
-    }
 }
 
 fn merge_trust(current: NodeTrust, candidate: NodeTrust) -> NodeTrust {
@@ -822,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn record_response_marks_node_id_churn_suspicious() {
+    fn record_response_records_node_id_churn_without_distrusting() {
         let now = Instant::now();
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 40_001));
         let mut table = RoutingTable::new(node_id(1), RoutingConfig::default(), now);
@@ -834,11 +821,11 @@ mod tests {
 
         let nodes = table.all_nodes();
         assert_eq!(nodes[0].id_churn_count, 1);
-        assert_eq!(nodes[0].trust, NodeTrust::Suspicious);
+        assert_eq!(nodes[0].trust, NodeTrust::Neutral);
     }
 
     #[test]
-    fn non_compliant_bep42_node_is_marked_suspicious() {
+    fn non_compliant_bep42_node_keeps_neutral_trust() {
         let now = Instant::now();
         let addr = SocketAddr::from((Ipv4Addr::new(8, 8, 8, 8), 40_001));
         let mut table = RoutingTable::new(node_id(1), RoutingConfig::default(), now);
@@ -849,19 +836,19 @@ mod tests {
 
         let nodes = table.all_nodes();
         assert_eq!(nodes[0].bep42_state, Bep42State::NonCompliant);
-        assert_eq!(nodes[0].trust, NodeTrust::Suspicious);
+        assert_eq!(nodes[0].trust, NodeTrust::Neutral);
     }
 
     #[test]
-    fn better_public_identity_candidate_replaces_suspicious_duplicate() {
+    fn better_public_identity_candidate_replaces_non_compliant_duplicate() {
         let now = Instant::now();
         let public_ip = Ipv4Addr::new(124, 31, 75, 21);
         let mut table = RoutingTable::new(node_id(1), RoutingConfig::default(), now);
-        let suspicious_addr = SocketAddr::from((public_ip, 40_001));
+        let non_compliant_addr = SocketAddr::from((public_ip, 40_001));
         let secure_addr = SocketAddr::from((public_ip, 40_002));
 
         assert_eq!(
-            table.insert(responded_record(suspicious_addr, node_id(2), now), now),
+            table.insert(responded_record(non_compliant_addr, node_id(2), now), now),
             InsertOutcome::Inserted
         );
         assert_eq!(
@@ -889,7 +876,7 @@ mod tests {
         let public_ip = Ipv4Addr::new(124, 31, 75, 21);
         let mut table = RoutingTable::new(node_id(1), RoutingConfig::default(), now);
         let secure_addr = SocketAddr::from((public_ip, 40_001));
-        let suspicious_addr = SocketAddr::from((public_ip, 40_002));
+        let non_compliant_addr = SocketAddr::from((public_ip, 40_002));
 
         assert_eq!(
             table.insert(
@@ -900,7 +887,7 @@ mod tests {
         );
         assert_eq!(
             table.insert(
-                responded_record(suspicious_addr, node_id(2), now + Duration::from_secs(1)),
+                responded_record(non_compliant_addr, node_id(2), now + Duration::from_secs(1)),
                 now + Duration::from_secs(1),
             ),
             InsertOutcome::Discarded

@@ -44,6 +44,8 @@ pub(super) struct DemandPlannerActionView {
     pub(super) kind: &'static str,
     pub(super) info_hash: Option<InfoHash>,
     pub(super) demand_class: Option<DemandSliceClass>,
+    pub(super) demand_awaiting_metadata: Option<bool>,
+    pub(super) demand_connected_peers: Option<usize>,
     pub(super) slice_class: Option<DemandSliceClass>,
     pub(super) peer_count: Option<usize>,
     pub(super) total_peers: Option<usize>,
@@ -51,6 +53,24 @@ pub(super) struct DemandPlannerActionView {
     pub(super) runtime_available: Option<bool>,
     pub(super) runtime_ready_count: Option<usize>,
     pub(super) stop_reason: Option<DemandSliceStopReason>,
+    pub(super) metrics_paused: Option<bool>,
+    pub(super) metrics_accepting_new_peers: Option<bool>,
+    pub(super) metrics_complete: Option<bool>,
+    pub(super) metrics_total_pieces: Option<u32>,
+    pub(super) metrics_completed_pieces: Option<u32>,
+    pub(super) metrics_connected_peers: Option<usize>,
+    pub(super) metrics_interested_peers: Option<usize>,
+    pub(super) metrics_peers_interested_in_us: Option<usize>,
+    pub(super) metrics_unchoked_download_peers: Option<usize>,
+    pub(super) metrics_unchoked_upload_peers: Option<usize>,
+    pub(super) metrics_downloading_peers: Option<usize>,
+    pub(super) metrics_uploading_peers: Option<usize>,
+    pub(super) metrics_download_speed_bps: Option<u64>,
+    pub(super) metrics_upload_speed_bps: Option<u64>,
+    pub(super) metrics_bytes_downloaded_this_tick: Option<u64>,
+    pub(super) metrics_bytes_uploaded_this_tick: Option<u64>,
+    pub(super) metrics_activity: Option<u64>,
+    pub(super) metrics_wants_extended_routine: Option<bool>,
 }
 
 impl DemandPlannerActionView {
@@ -65,22 +85,23 @@ impl DemandPlannerActionView {
             } => Self {
                 kind: "demand_registered",
                 info_hash: Some(*info_hash),
-                demand_class: Some(DemandSliceClass::from_demand(*demand)),
                 ..Self::default()
-            },
+            }
+            .with_demand(*demand),
             DemandPlannerAction::DemandUpdated {
                 info_hash, demand, ..
             } => Self {
                 kind: "demand_updated",
                 info_hash: Some(*info_hash),
-                demand_class: Some(DemandSliceClass::from_demand(*demand)),
                 ..Self::default()
-            },
-            DemandPlannerAction::DemandMetricsUpdated { info_hash, .. } => Self {
+            }
+            .with_demand(*demand),
+            DemandPlannerAction::DemandMetricsUpdated { info_hash, metrics } => Self {
                 kind: "demand_metrics_updated",
                 info_hash: Some(*info_hash),
                 ..Self::default()
-            },
+            }
+            .with_metrics(*metrics),
             DemandPlannerAction::DemandSubscriberRemoved { info_hash } => Self {
                 kind: "demand_subscriber_removed",
                 info_hash: Some(*info_hash),
@@ -183,6 +204,35 @@ impl DemandPlannerActionView {
             },
         }
     }
+
+    fn with_demand(mut self, demand: DhtDemandState) -> Self {
+        self.demand_class = Some(DemandSliceClass::from_demand(demand));
+        self.demand_awaiting_metadata = Some(demand.awaiting_metadata);
+        self.demand_connected_peers = Some(demand.connected_peers);
+        self
+    }
+
+    fn with_metrics(mut self, metrics: DhtDemandMetrics) -> Self {
+        self.metrics_paused = Some(metrics.paused);
+        self.metrics_accepting_new_peers = Some(metrics.accepting_new_peers);
+        self.metrics_complete = Some(metrics.complete);
+        self.metrics_total_pieces = Some(metrics.total_pieces);
+        self.metrics_completed_pieces = Some(metrics.completed_pieces);
+        self.metrics_connected_peers = Some(metrics.connected_peers);
+        self.metrics_interested_peers = Some(metrics.interested_peers);
+        self.metrics_peers_interested_in_us = Some(metrics.peers_interested_in_us);
+        self.metrics_unchoked_download_peers = Some(metrics.unchoked_download_peers);
+        self.metrics_unchoked_upload_peers = Some(metrics.unchoked_upload_peers);
+        self.metrics_downloading_peers = Some(metrics.downloading_peers);
+        self.metrics_uploading_peers = Some(metrics.uploading_peers);
+        self.metrics_download_speed_bps = Some(metrics.download_speed_bps);
+        self.metrics_upload_speed_bps = Some(metrics.upload_speed_bps);
+        self.metrics_bytes_downloaded_this_tick = Some(metrics.bytes_downloaded_this_tick);
+        self.metrics_bytes_uploaded_this_tick = Some(metrics.bytes_uploaded_this_tick);
+        self.metrics_activity = Some(metrics.activity_bps_or_bytes());
+        self.metrics_wants_extended_routine = Some(metrics.wants_extended_routine_search());
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -190,6 +240,8 @@ pub(super) struct DemandPlannerEffectView {
     pub(super) kind: &'static str,
     pub(super) info_hash: Option<InfoHash>,
     pub(super) demand_class: Option<DemandSliceClass>,
+    pub(super) demand_awaiting_metadata: Option<bool>,
+    pub(super) demand_connected_peers: Option<usize>,
     pub(super) slice_class: Option<DemandSliceClass>,
     pub(super) selection_reason: Option<DemandSelectionReason>,
     pub(super) stop_reason: Option<DemandSliceStopReason>,
@@ -201,6 +253,31 @@ pub(super) struct DemandPlannerEffectView {
     pub(super) force: Option<bool>,
     pub(super) parked: Option<bool>,
     pub(super) finish_mode: Option<DemandFinishMode>,
+    pub(super) subscriber_count: Option<usize>,
+    pub(super) plan_idle_timeout_ms: Option<u64>,
+    pub(super) plan_max_wall_time_ms: Option<u64>,
+    pub(super) plan_stop_after_first_batch: Option<bool>,
+    pub(super) plan_unique_peer_cap: Option<usize>,
+    pub(super) plan_power_multiplier: Option<u8>,
+    pub(super) metrics_paused: Option<bool>,
+    pub(super) metrics_accepting_new_peers: Option<bool>,
+    pub(super) metrics_complete: Option<bool>,
+    pub(super) metrics_total_pieces: Option<u32>,
+    pub(super) metrics_completed_pieces: Option<u32>,
+    pub(super) metrics_connected_peers: Option<usize>,
+    pub(super) metrics_interested_peers: Option<usize>,
+    pub(super) metrics_peers_interested_in_us: Option<usize>,
+    pub(super) metrics_unchoked_download_peers: Option<usize>,
+    pub(super) metrics_unchoked_upload_peers: Option<usize>,
+    pub(super) metrics_downloading_peers: Option<usize>,
+    pub(super) metrics_uploading_peers: Option<usize>,
+    pub(super) metrics_download_speed_bps: Option<u64>,
+    pub(super) metrics_upload_speed_bps: Option<u64>,
+    pub(super) metrics_bytes_downloaded_this_tick: Option<u64>,
+    pub(super) metrics_bytes_uploaded_this_tick: Option<u64>,
+    pub(super) metrics_activity: Option<u64>,
+    pub(super) metrics_wants_extended_routine: Option<bool>,
+    pub(super) metrics_wants_idle_probe: Option<bool>,
 }
 
 impl DemandPlannerEffectView {
@@ -209,11 +286,18 @@ impl DemandPlannerEffectView {
             DemandPlannerEffect::StartLookup(start) => Self {
                 kind: "start_lookup",
                 info_hash: Some(start.candidate.info_hash),
-                demand_class: Some(DemandSliceClass::from_demand(start.candidate.demand)),
                 slice_class: Some(start.plan.class),
                 selection_reason: Some(start.selection_reason),
+                subscriber_count: Some(start.candidate.subscriber_count),
+                plan_idle_timeout_ms: Some(duration_ms(start.plan.idle_timeout)),
+                plan_max_wall_time_ms: Some(duration_ms(start.plan.max_wall_time)),
+                plan_stop_after_first_batch: Some(start.plan.stop_after_first_batch),
+                plan_unique_peer_cap: Some(start.plan.unique_peer_cap),
+                plan_power_multiplier: Some(start.plan.power_multiplier),
                 ..Self::default()
-            },
+            }
+            .with_demand(start.candidate.demand)
+            .with_metrics(start.candidate.metrics, Some(start.candidate.demand)),
             DemandPlannerEffect::LookupFinished(finished) => Self {
                 kind: "lookup_finished",
                 info_hash: Some(finished.info_hash),
@@ -280,38 +364,49 @@ impl DemandPlannerEffectView {
             },
         }
     }
-}
 
-pub(super) fn trace_env_enabled(env_names: &[&str]) -> bool {
-    trace_env_names_enabled(env_names, |name| env::var_os(name).is_some())
-}
+    fn with_demand(mut self, demand: DhtDemandState) -> Self {
+        self.demand_class = Some(DemandSliceClass::from_demand(demand));
+        self.demand_awaiting_metadata = Some(demand.awaiting_metadata);
+        self.demand_connected_peers = Some(demand.connected_peers);
+        self
+    }
 
-pub(super) fn trace_env_names_enabled(
-    env_names: &[&str],
-    mut is_set: impl FnMut(&str) -> bool,
-) -> bool {
-    env_names.iter().any(|name| is_set(name))
+    fn with_metrics(mut self, metrics: DhtDemandMetrics, demand: Option<DhtDemandState>) -> Self {
+        self.metrics_paused = Some(metrics.paused);
+        self.metrics_accepting_new_peers = Some(metrics.accepting_new_peers);
+        self.metrics_complete = Some(metrics.complete);
+        self.metrics_total_pieces = Some(metrics.total_pieces);
+        self.metrics_completed_pieces = Some(metrics.completed_pieces);
+        self.metrics_connected_peers = Some(metrics.connected_peers);
+        self.metrics_interested_peers = Some(metrics.interested_peers);
+        self.metrics_peers_interested_in_us = Some(metrics.peers_interested_in_us);
+        self.metrics_unchoked_download_peers = Some(metrics.unchoked_download_peers);
+        self.metrics_unchoked_upload_peers = Some(metrics.unchoked_upload_peers);
+        self.metrics_downloading_peers = Some(metrics.downloading_peers);
+        self.metrics_uploading_peers = Some(metrics.uploading_peers);
+        self.metrics_download_speed_bps = Some(metrics.download_speed_bps);
+        self.metrics_upload_speed_bps = Some(metrics.upload_speed_bps);
+        self.metrics_bytes_downloaded_this_tick = Some(metrics.bytes_downloaded_this_tick);
+        self.metrics_bytes_uploaded_this_tick = Some(metrics.bytes_uploaded_this_tick);
+        self.metrics_activity = Some(metrics.activity_bps_or_bytes());
+        self.metrics_wants_extended_routine = Some(metrics.wants_extended_routine_search());
+        self.metrics_wants_idle_probe =
+            demand.map(|demand| metrics.wants_idle_speed_probe_for(demand));
+        self
+    }
 }
 
 pub(super) fn dht_actor_monitor_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        trace_env_enabled(&[
-            DHT_TRACE_ENV,
-            DHT_ACTOR_MONITOR_ENV,
-            DHT_PLANNER_MONITOR_ENV,
-        ])
-    })
+    false
 }
 
 pub(super) fn demand_planner_monitor_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| trace_env_enabled(&[DHT_TRACE_ENV, DHT_PLANNER_MONITOR_ENV]))
+    false
 }
 
 pub(super) fn dht_invariant_checks_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| trace_env_enabled(&[DHT_INVARIANT_CHECK_ENV]))
+    false
 }
 
 pub(super) fn short_info_hash(info_hash: InfoHash) -> String {
@@ -344,6 +439,8 @@ pub(super) fn trace_demand_planner_reduction(
         action = action.kind,
         info_hash = %optional_info_hash_label(action.info_hash),
         demand_class = ?action.demand_class,
+        demand_awaiting_metadata = ?action.demand_awaiting_metadata,
+        demand_connected_peers = ?action.demand_connected_peers,
         slice_class = ?action.slice_class,
         peer_count = ?action.peer_count,
         total_peers = ?action.total_peers,
@@ -351,6 +448,24 @@ pub(super) fn trace_demand_planner_reduction(
         runtime_available = ?action.runtime_available,
         runtime_ready_count = ?action.runtime_ready_count,
         stop_reason = ?action.stop_reason,
+        metrics_paused = ?action.metrics_paused,
+        metrics_accepting_new_peers = ?action.metrics_accepting_new_peers,
+        metrics_complete = ?action.metrics_complete,
+        metrics_total_pieces = ?action.metrics_total_pieces,
+        metrics_completed_pieces = ?action.metrics_completed_pieces,
+        metrics_connected_peers = ?action.metrics_connected_peers,
+        metrics_interested_peers = ?action.metrics_interested_peers,
+        metrics_peers_interested_in_us = ?action.metrics_peers_interested_in_us,
+        metrics_unchoked_download_peers = ?action.metrics_unchoked_download_peers,
+        metrics_unchoked_upload_peers = ?action.metrics_unchoked_upload_peers,
+        metrics_downloading_peers = ?action.metrics_downloading_peers,
+        metrics_uploading_peers = ?action.metrics_uploading_peers,
+        metrics_download_speed_bps = ?action.metrics_download_speed_bps,
+        metrics_upload_speed_bps = ?action.metrics_upload_speed_bps,
+        metrics_bytes_downloaded_this_tick = ?action.metrics_bytes_downloaded_this_tick,
+        metrics_bytes_uploaded_this_tick = ?action.metrics_bytes_uploaded_this_tick,
+        metrics_activity = ?action.metrics_activity,
+        metrics_wants_extended_routine = ?action.metrics_wants_extended_routine,
         effect_count = reduction.effects.len(),
         effects = %effect_names,
         plan_launch_budget = ?plan.map(|plan| plan.launch_budget),
@@ -365,16 +480,26 @@ pub(super) fn trace_demand_planner_reduction(
         plan_budget_awaiting = ?plan.map(|plan| plan.budget_awaiting),
         plan_budget_no_peers = ?plan.map(|plan| plan.budget_no_peers),
         plan_budget_routine = ?plan.map(|plan| plan.budget_routine),
+        plan_active_awaiting = ?plan.map(|plan| plan.active_counts.awaiting_metadata),
+        plan_active_no_peers = ?plan.map(|plan| plan.active_counts.no_connected_peers),
+        plan_active_routine = ?plan.map(|plan| plan.active_counts.routine_refresh),
         plan_offered_awaiting = ?plan.map(|plan| plan.selection_stats.offered.awaiting_metadata),
         plan_offered_no_peers = ?plan.map(|plan| plan.selection_stats.offered.no_connected_peers),
         plan_offered_routine = ?plan.map(|plan| plan.selection_stats.offered.routine_refresh),
         plan_launched_awaiting = ?plan.map(|plan| plan.selection_stats.launched.awaiting_metadata),
         plan_launched_no_peers = ?plan.map(|plan| plan.selection_stats.launched.no_connected_peers),
         plan_launched_routine = ?plan.map(|plan| plan.selection_stats.launched.routine_refresh),
+        plan_throttled_awaiting = ?plan.map(|plan| plan.selection_stats.throttled.awaiting_metadata),
+        plan_throttled_no_peers = ?plan.map(|plan| plan.selection_stats.throttled.no_connected_peers),
+        plan_throttled_routine = ?plan.map(|plan| plan.selection_stats.throttled.routine_refresh),
+        plan_oldest_throttled_awaiting_ms = ?plan.map(|plan| plan.selection_stats.oldest_throttled_awaiting_ms),
+        plan_oldest_throttled_no_peers_ms = ?plan.map(|plan| plan.selection_stats.oldest_throttled_no_peers_ms),
+        plan_oldest_throttled_routine_ms = ?plan.map(|plan| plan.selection_stats.oldest_throttled_routine_ms),
         planner_active = model.active.len(),
         planner_draining = model.draining_demands.len(),
         planner_parked = model.parked_crawls.len(),
         planner_scheduler_entries = model.scheduler.entry_snapshots().len(),
+        planner_idle_probe_multiplier = ?Some(model.idle_speed_probe.current_multiplier(Instant::now())),
         "DHT planner action reduced",
     );
 
@@ -396,6 +521,8 @@ pub(super) fn trace_demand_planner_effect(stage: &'static str, effect: &DemandPl
         effect = view.kind,
         info_hash = %optional_info_hash_label(view.info_hash),
         demand_class = ?view.demand_class,
+        demand_awaiting_metadata = ?view.demand_awaiting_metadata,
+        demand_connected_peers = ?view.demand_connected_peers,
         slice_class = ?view.slice_class,
         selection_reason = ?view.selection_reason,
         stop_reason = ?view.stop_reason,
@@ -407,6 +534,31 @@ pub(super) fn trace_demand_planner_effect(stage: &'static str, effect: &DemandPl
         force = ?view.force,
         parked = ?view.parked,
         finish_mode = ?view.finish_mode,
+        subscriber_count = ?view.subscriber_count,
+        plan_idle_timeout_ms = ?view.plan_idle_timeout_ms,
+        plan_max_wall_time_ms = ?view.plan_max_wall_time_ms,
+        plan_stop_after_first_batch = ?view.plan_stop_after_first_batch,
+        plan_unique_peer_cap = ?view.plan_unique_peer_cap,
+        plan_power_multiplier = ?view.plan_power_multiplier,
+        metrics_paused = ?view.metrics_paused,
+        metrics_accepting_new_peers = ?view.metrics_accepting_new_peers,
+        metrics_complete = ?view.metrics_complete,
+        metrics_total_pieces = ?view.metrics_total_pieces,
+        metrics_completed_pieces = ?view.metrics_completed_pieces,
+        metrics_connected_peers = ?view.metrics_connected_peers,
+        metrics_interested_peers = ?view.metrics_interested_peers,
+        metrics_peers_interested_in_us = ?view.metrics_peers_interested_in_us,
+        metrics_unchoked_download_peers = ?view.metrics_unchoked_download_peers,
+        metrics_unchoked_upload_peers = ?view.metrics_unchoked_upload_peers,
+        metrics_downloading_peers = ?view.metrics_downloading_peers,
+        metrics_uploading_peers = ?view.metrics_uploading_peers,
+        metrics_download_speed_bps = ?view.metrics_download_speed_bps,
+        metrics_upload_speed_bps = ?view.metrics_upload_speed_bps,
+        metrics_bytes_downloaded_this_tick = ?view.metrics_bytes_downloaded_this_tick,
+        metrics_bytes_uploaded_this_tick = ?view.metrics_bytes_uploaded_this_tick,
+        metrics_activity = ?view.metrics_activity,
+        metrics_wants_extended_routine = ?view.metrics_wants_extended_routine,
+        metrics_wants_idle_probe = ?view.metrics_wants_idle_probe,
         "DHT planner effect observed",
     );
 }

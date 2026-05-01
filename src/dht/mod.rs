@@ -25,7 +25,6 @@ use std::collections::{HashMap, HashSet};
 use std::future::pending;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime};
 
 use tokio::net::lookup_host;
@@ -505,20 +504,6 @@ impl Runtime {
             .get(&(family, target_node_id))
             .cloned()
             .unwrap_or_default();
-        trace_lookup_target(
-            target_node_id,
-            format!(
-                "start family={:?} routing_nodes={} cached_responders={} bootstrap_nodes={}",
-                family,
-                routing_snapshot.nodes.len(),
-                cached_responders.len(),
-                self.config
-                    .bootstrap_nodes
-                    .iter()
-                    .filter(|addr| AddressFamily::for_addr(**addr) == family)
-                    .count(),
-            ),
-        );
         let state = self.lookup_manager.start(
             request,
             family,
@@ -838,9 +823,6 @@ impl Runtime {
     ) -> io::Result<()> {
         match event {
             TransportEvent::Query { source, query } => {
-                if drop_inbound_queries_enabled() {
-                    return Ok(());
-                }
                 self.inbound_query_count = self.inbound_query_count.saturating_add(1);
                 let now = Instant::now();
                 let wall_clock = SystemTime::now();
@@ -902,7 +884,6 @@ impl Runtime {
     }
 
     async fn handle_lookup_result(&mut self, result: LookupTaskResult) -> io::Result<()> {
-        trace_lookup_result(result.transaction_id, "runtime_handle");
         let now = Instant::now();
         let mut completed_addr = None;
         let mut completed_node_id = None;
@@ -919,7 +900,6 @@ impl Runtime {
             draining = active.mode.is_draining();
             receiver_closed = active.peer_tx.is_closed();
             peer_tx = Some(active.peer_tx.clone());
-            let target_node_id = active.state.target_id();
             match result.outcome {
                 LookupTaskOutcome::Reply(reply) => match reply {
                     TransportReply::Response(response) => {
@@ -929,26 +909,6 @@ impl Runtime {
                             result.transaction_id,
                             &response_body,
                             now,
-                        );
-                        trace_lookup_target(
-                            target_node_id,
-                            format!(
-                                "response family={:?} tx={:?} from={} node_id={} nodes={} peers={} token={}",
-                                result.family,
-                                result.transaction_id,
-                                update
-                                    .completed_query
-                                    .as_ref()
-                                    .map(|query| query.candidate.addr.to_string())
-                                    .unwrap_or_else(|| "<unknown>".to_string()),
-                                response_body
-                                    .node_id()
-                                    .map(node_id_hex)
-                                    .unwrap_or_else(|| "<none>".to_string()),
-                                update.discovered_nodes.len(),
-                                update.emitted_peers.len(),
-                                response_body.token.len(),
-                            ),
                         );
                         if let Some(query) = update.completed_query {
                             completed_addr = Some(query.candidate.addr);
@@ -977,27 +937,12 @@ impl Runtime {
                     }
                 },
                 LookupTaskOutcome::SoftTimeout => {
-                    if let Some(query) = active.state.mark_soft_timeout(result.transaction_id) {
-                        trace_lookup_target(
-                            target_node_id,
-                            format!(
-                                "soft-timeout family={:?} tx={:?} from={}",
-                                result.family, result.transaction_id, query.candidate.addr
-                            ),
-                        );
-                    }
+                    let _ = active.state.mark_soft_timeout(result.transaction_id);
                     finished = active.state.is_finished();
                 }
                 LookupTaskOutcome::Timeout => {
                     let update = active.state.handle_timeout(result.transaction_id);
                     if let Some(query) = update.completed_query {
-                        trace_lookup_target(
-                            target_node_id,
-                            format!(
-                                "timeout family={:?} tx={:?} from={}",
-                                result.family, result.transaction_id, query.candidate.addr
-                            ),
-                        );
                         completed_addr = Some(query.candidate.addr);
                     }
                     finished = update.finished;
@@ -1065,20 +1010,6 @@ impl Runtime {
         }
 
         if finished || receiver_closed {
-            if let Some(active) = self.active_lookups.get(&result.lookup_id) {
-                trace_lookup_target(
-                    active.state.target_id(),
-                    format!(
-                        "finish family={:?} responders_cached={} receiver_closed={}",
-                        active.family,
-                        active
-                            .state
-                            .cacheable_responders(MAX_CACHED_RESPONDERS_PER_TARGET)
-                            .len(),
-                        receiver_closed,
-                    ),
-                );
-            }
             if !draining {
                 self.cancel_lookup(result.lookup_id);
             }
@@ -1148,48 +1079,10 @@ impl Runtime {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "transport unavailable"))?;
 
         for candidate in candidates {
-            let target_node_id = request.target.as_node_id();
-            trace_lookup_target(
-                target_node_id,
-                format!(
-                    "send family={:?} kind={:?} addr={} node_id={} bep42={:?}",
-                    family,
-                    request.kind,
-                    candidate.addr,
-                    candidate
-                        .node_id
-                        .map(node_id_hex)
-                        .unwrap_or_else(|| "<none>".to_string()),
-                    candidate.bep42,
-                ),
-            );
             let sent_at = Instant::now();
             let _ = self
                 .routing_for_family_mut(family)
                 .record_query_sent(candidate.addr, sent_at);
-
-            if ping_visit_enabled() {
-                let ping_transport = transport.clone();
-                let ping_addr = candidate.addr;
-                let ping_family = family;
-                let ping_target = target_node_id;
-                let local_node_id = self.config.local_node_id;
-                tokio::spawn(async move {
-                    let outcome = match ping_transport.ping(ping_addr, local_node_id).await {
-                        Ok(Some(TransportReply::Response(_))) => "pong",
-                        Ok(Some(TransportReply::Error(_))) => "error",
-                        Ok(None) => "timeout",
-                        Err(_) => "send_error",
-                    };
-                    trace_lookup_target(
-                        ping_target,
-                        format!(
-                            "visit-ping family={:?} addr={} outcome={}",
-                            ping_family, ping_addr, outcome
-                        ),
-                    );
-                });
-            }
 
             let deferred = match request.kind {
                 LookupKind::FindNode => {
@@ -1258,50 +1151,38 @@ impl Runtime {
                                 Ok(reply) => LookupTaskOutcome::Reply(reply),
                                 Err(_) => LookupTaskOutcome::Timeout,
                             };
-                            trace_lookup_result(transaction_id, "task_ready");
                             let send_result = outcome_tx.send(LookupTaskResult {
                                 lookup_id,
                                 family,
                                 transaction_id,
                                 outcome,
                             });
-                            if send_result.is_ok() {
-                                trace_lookup_result(transaction_id, "task_sent");
-                            } else {
-                                trace_lookup_result(transaction_id, "task_dropped");
+                            if send_result.is_err() {
+                                break;
                             }
                             break;
                         }
                         _ = &mut soft_timeout_sleep, if soft_timeout_enabled && !soft_timeout_sent => {
                             soft_timeout_sent = true;
-                            trace_lookup_result(transaction_id, "task_ready");
                             let send_result = outcome_tx.send(LookupTaskResult {
                                 lookup_id,
                                 family,
                                 transaction_id,
                                 outcome: LookupTaskOutcome::SoftTimeout,
                             });
-                            if send_result.is_ok() {
-                                trace_lookup_result(transaction_id, "task_sent");
-                            } else {
-                                trace_lookup_result(transaction_id, "task_dropped");
+                            if send_result.is_err() {
                                 break;
                             }
                         }
                         _ = &mut hard_timeout_sleep => {
                             timeout_transport.cancel_inflight_query(transaction_id);
-                            trace_lookup_result(transaction_id, "task_ready");
                             let send_result = outcome_tx.send(LookupTaskResult {
                                 lookup_id,
                                 family,
                                 transaction_id,
                                 outcome: LookupTaskOutcome::Timeout,
                             });
-                            if send_result.is_ok() {
-                                trace_lookup_result(transaction_id, "task_sent");
-                            } else {
-                                trace_lookup_result(transaction_id, "task_dropped");
-                            }
+                            let _ = send_result;
                             break;
                         }
                     }
@@ -1534,35 +1415,6 @@ impl Runtime {
     }
 }
 
-fn trace_lookup_target(target: NodeId, message: impl AsRef<str>) {
-    static TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
-    static TRACE_TARGET: OnceLock<Option<String>> = OnceLock::new();
-
-    let enabled =
-        *TRACE_ENABLED.get_or_init(|| std::env::var_os("SUPERSEEDR_INTERNAL_TRACE").is_some());
-    if !enabled {
-        return;
-    }
-
-    let target_filter = TRACE_TARGET.get_or_init(|| {
-        std::env::var("SUPERSEEDR_INTERNAL_TRACE_TARGET")
-            .ok()
-            .map(|value| value.to_ascii_lowercase())
-    });
-
-    if let Some(target_filter) = target_filter {
-        if node_id_hex(target).to_ascii_lowercase() != *target_filter {
-            return;
-        }
-    }
-
-    eprintln!(
-        "[internal-trace target={}] {}",
-        node_id_hex(target),
-        message.as_ref()
-    );
-}
-
 fn node_id_hex(node_id: NodeId) -> String {
     hex::encode(node_id.as_ref())
 }
@@ -1572,32 +1424,6 @@ fn opposite_family(family: AddressFamily) -> AddressFamily {
         AddressFamily::Ipv4 => AddressFamily::Ipv6,
         AddressFamily::Ipv6 => AddressFamily::Ipv4,
     }
-}
-
-fn ping_visit_enabled() -> bool {
-    static PING_VISIT_ENABLED: OnceLock<bool> = OnceLock::new();
-    *PING_VISIT_ENABLED.get_or_init(|| std::env::var_os("SUPERSEEDR_INTERNAL_TRACE_PING").is_some())
-}
-
-fn drop_inbound_queries_enabled() -> bool {
-    static DROP_INBOUND: OnceLock<bool> = OnceLock::new();
-    *DROP_INBOUND
-        .get_or_init(|| std::env::var_os("SUPERSEEDR_INTERNAL_DROP_INBOUND_QUERIES").is_some())
-}
-
-fn trace_lookup_result(transaction_id: TransactionId, stage: &str) {
-    static TRACE_RESULTS: OnceLock<bool> = OnceLock::new();
-    let enabled = *TRACE_RESULTS
-        .get_or_init(|| std::env::var_os("SUPERSEEDR_INTERNAL_TRACE_RESULTS").is_some());
-    if !enabled {
-        return;
-    }
-
-    eprintln!(
-        "[internal-trace-result tx={} stage={}]",
-        hex::encode(transaction_id.as_ref()),
-        stage
-    );
 }
 
 async fn resolve_bootstrap_sources(bootstrap_sources: &[String]) -> Vec<SocketAddr> {
@@ -2215,6 +2041,25 @@ mod tests {
                 .any(|entry| entry.responder == terminal_addr
                     && entry.kind == KrpcQueryKind::GetPeers),
             "runtime never reached terminal peer responder"
+        );
+        let get_peers_targets = log
+            .iter()
+            .filter(|entry| entry.kind == KrpcQueryKind::GetPeers)
+            .map(|entry| entry.responder)
+            .collect::<HashSet<_>>();
+        let get_peers_query_count = log
+            .iter()
+            .filter(|entry| entry.kind == KrpcQueryKind::GetPeers)
+            .count();
+        assert_eq!(
+            get_peers_targets.len(),
+            get_peers_query_count,
+            "scripted traversal should not issue duplicate get_peers queries"
+        );
+        assert!(
+            get_peers_query_count <= 5,
+            "scripted traversal used {get_peers_query_count} queries for {} peers",
+            expected_peers.len()
         );
 
         for handle in handles {

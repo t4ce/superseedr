@@ -729,6 +729,7 @@ impl PeerSession {
         }
     }
 
+    #[cfg(feature = "pex")]
     fn peer_advertised_extension_id(&self, extension: ClientExtendedId) -> Option<u8> {
         self.peer_extended_id_mappings
             .get(extension.as_str())

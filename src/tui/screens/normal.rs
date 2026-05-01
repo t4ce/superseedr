@@ -1237,7 +1237,9 @@ pub fn draw_footer(
     let status_chunk = footer_layout[2];
 
     if show_branding {
+        #[cfg(all(feature = "dht", feature = "pex"))]
         let current_dl_speed = *app_state.avg_download_history.last().unwrap_or(&0);
+        #[cfg(all(feature = "dht", feature = "pex"))]
         let current_ul_speed = *app_state.avg_upload_history.last().unwrap_or(&0);
         let fx_enabled = ctx.theme.effects.enabled();
         let theme_name = ctx.theme.name.to_string();
