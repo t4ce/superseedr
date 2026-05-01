@@ -404,6 +404,21 @@ fn draw_help_table(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &ThemeC
                     )),
                     Cell::from("Cycle UI theme"),
                 ]),
+                Row::new(vec![
+                    Cell::from(Span::styled(
+                        "DHT panel",
+                        ctx.apply(Style::default().fg(ctx.peer_discovered())),
+                    )),
+                    Cell::from(Line::from(vec![
+                        Span::styled("4x", ctx.apply(Style::default().fg(ctx.accent_peach()))),
+                        Span::styled("(", ctx.apply(Style::default().fg(ctx.accent_peach()))),
+                        Span::styled("42", ctx.apply(Style::default().fg(ctx.peer_discovered()))),
+                        Span::raw(" "),
+                        Span::styled("184", ctx.apply(Style::default().fg(ctx.peer_connected()))),
+                        Span::styled(")", ctx.apply(Style::default().fg(ctx.accent_peach()))),
+                        Span::raw(" = power, active queries, unique peers found in last 10s"),
+                    ])),
+                ]),
                 Row::new(vec![Cell::from(""), Cell::from("")]).height(1),
                 // --- Peer Flags Legend ---
                 Row::new(vec![
