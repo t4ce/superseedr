@@ -81,12 +81,15 @@ impl Drop for DhtDemandSubscription {
 type RecordedAnnounces = Arc<StdMutex<Vec<(Vec<u8>, Option<u16>)>>>;
 #[cfg(test)]
 type RecordedReconfigures = Arc<StdMutex<Vec<DhtServiceConfig>>>;
+#[cfg(test)]
+type RecordedPeerSlotUsages = Arc<StdMutex<Vec<(usize, usize)>>>;
 
 #[cfg(test)]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TestDhtRecorder {
     announce_requests: RecordedAnnounces,
     reconfigure_requests: RecordedReconfigures,
+    peer_slot_usages: RecordedPeerSlotUsages,
 }
 
 #[cfg(test)]
@@ -102,6 +105,13 @@ impl TestDhtRecorder {
         self.reconfigure_requests
             .lock()
             .expect("test dht reconfigure recorder lock")
+            .clone()
+    }
+
+    pub(crate) fn recorded_peer_slot_usages(&self) -> Vec<(usize, usize)> {
+        self.peer_slot_usages
+            .lock()
+            .expect("test dht peer slot recorder lock")
             .clone()
     }
 }
@@ -122,6 +132,10 @@ pub(in crate::dht::service) enum DhtCommand {
     UpdateDemandMetrics {
         info_hash: InfoHash,
         metrics: DhtDemandMetrics,
+    },
+    UpdatePeerSlotUsage {
+        total_peers: usize,
+        max_connected_peers: usize,
     },
     UnregisterDemand {
         info_hash: InfoHash,
@@ -205,7 +219,11 @@ impl DhtService {
             0,
             initial.bootstrap,
         );
-        let initial_wave_telemetry = build_wave_telemetry(initial.active_runtime.as_ref(), 0, 1);
+        let initial_wave_telemetry = build_wave_telemetry(
+            initial.active_runtime.as_ref(),
+            0,
+            DHT_DEMAND_POWER_BASE_SCALE_HALVES,
+        );
 
         let (status_tx, status_rx) = watch::channel(initial_status);
         let (wave_telemetry_tx, wave_telemetry_rx) = watch::channel(initial_wave_telemetry);
@@ -260,6 +278,16 @@ impl DhtService {
     pub fn reconfigure(&self, config: DhtServiceConfig) {
         let _ = send_dht_command(&self.command_tx, DhtCommand::Reconfigure(config));
     }
+
+    pub fn update_peer_slot_usage(&self, total_peers: usize, max_connected_peers: usize) {
+        let _ = send_dht_command(
+            &self.command_tx,
+            DhtCommand::UpdatePeerSlotUsage {
+                total_peers,
+                max_connected_peers,
+            },
+        );
+    }
 }
 
 fn configured_or_persisted_local_node_id() -> NodeId {
@@ -294,12 +322,25 @@ impl DhtService {
         };
         let task = Some(tokio::spawn(async move {
             while let Some(command) = command_rx.recv().await {
-                if let DhtCommand::Reconfigure(config) = command {
-                    recorder
-                        .reconfigure_requests
-                        .lock()
-                        .expect("test dht reconfigure recorder lock")
-                        .push(config);
+                match command {
+                    DhtCommand::Reconfigure(config) => {
+                        recorder
+                            .reconfigure_requests
+                            .lock()
+                            .expect("test dht reconfigure recorder lock")
+                            .push(config);
+                    }
+                    DhtCommand::UpdatePeerSlotUsage {
+                        total_peers,
+                        max_connected_peers,
+                    } => {
+                        recorder
+                            .peer_slot_usages
+                            .lock()
+                            .expect("test dht peer slot recorder lock")
+                            .push((total_peers, max_connected_peers));
+                    }
+                    _ => {}
                 }
             }
         }));

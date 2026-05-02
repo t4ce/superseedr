@@ -2129,7 +2129,7 @@ impl TorrentState {
                 container_name,
             } => {
                 event!(
-                    Level::INFO,
+                    Level::DEBUG,
                     "Received User config {:?} - {} Priorities",
                     torrent_data_path,
                     file_priorities.len()
@@ -2480,7 +2480,7 @@ impl TorrentState {
         }).ok();
 
         if self.multi_file_info.is_some() {
-            event!(Level::INFO,
+            event!(Level::DEBUG,
                 torrent_name = %torrent.info.name,
                 "rebuild_multi_file_info: Storage successfully initialized in state."
             );

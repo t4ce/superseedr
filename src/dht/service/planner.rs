@@ -80,6 +80,10 @@ impl DemandPlannerActionView {
                 kind: "runtime_reset",
                 ..Self::default()
             },
+            DemandPlannerAction::PeerSlotUsageUpdated { .. } => Self {
+                kind: "peer_slot_usage_updated",
+                ..Self::default()
+            },
             DemandPlannerAction::DemandRegistered {
                 info_hash, demand, ..
             } => Self {
@@ -259,6 +263,8 @@ pub(super) struct DemandPlannerEffectView {
     pub(super) plan_stop_after_first_batch: Option<bool>,
     pub(super) plan_unique_peer_cap: Option<usize>,
     pub(super) plan_power_multiplier: Option<u8>,
+    pub(super) plan_power_scale_halves: Option<u8>,
+    pub(super) plan_peer_pressure_cap_halves: Option<u8>,
     pub(super) metrics_paused: Option<bool>,
     pub(super) metrics_accepting_new_peers: Option<bool>,
     pub(super) metrics_complete: Option<bool>,
@@ -294,6 +300,8 @@ impl DemandPlannerEffectView {
                 plan_stop_after_first_batch: Some(start.plan.stop_after_first_batch),
                 plan_unique_peer_cap: Some(start.plan.unique_peer_cap),
                 plan_power_multiplier: Some(start.plan.power_multiplier),
+                plan_power_scale_halves: Some(start.plan.power_scale_halves),
+                plan_peer_pressure_cap_halves: Some(start.plan.peer_pressure_cap_halves),
                 ..Self::default()
             }
             .with_demand(start.candidate.demand)
@@ -540,6 +548,8 @@ pub(super) fn trace_demand_planner_effect(stage: &'static str, effect: &DemandPl
         plan_stop_after_first_batch = ?view.plan_stop_after_first_batch,
         plan_unique_peer_cap = ?view.plan_unique_peer_cap,
         plan_power_multiplier = ?view.plan_power_multiplier,
+        plan_power_scale_halves = ?view.plan_power_scale_halves,
+        plan_peer_pressure_cap_halves = ?view.plan_peer_pressure_cap_halves,
         metrics_paused = ?view.metrics_paused,
         metrics_accepting_new_peers = ?view.metrics_accepting_new_peers,
         metrics_complete = ?view.metrics_complete,
@@ -576,6 +586,7 @@ impl DemandPlannerModel {
             let planner_state = &mut self.state;
             let planner_budget = &mut self.budget;
             let idle_speed_probe = &mut self.idle_speed_probe;
+            let peer_pressure_cap = &mut self.peer_pressure_cap;
 
             match action {
                 DemandPlannerAction::RuntimeReset { now } => {
@@ -588,6 +599,15 @@ impl DemandPlannerModel {
                     planner_state.clear();
                     *planner_budget = DemandPlannerBudget::new(now);
                     *idle_speed_probe = DemandPlannerIdleSpeedProbe::default();
+                    *peer_pressure_cap = DemandPeerPressureCap::default();
+                    DemandPlannerReduction::default()
+                }
+                DemandPlannerAction::PeerSlotUsageUpdated {
+                    total_peers,
+                    max_connected_peers,
+                    now,
+                } => {
+                    peer_pressure_cap.update_usage(total_peers, max_connected_peers, now);
                     DemandPlannerReduction::default()
                 }
                 DemandPlannerAction::DemandRegistered {
@@ -806,13 +826,15 @@ impl DemandPlannerModel {
                                     *reason == DemandSelectionReason::SpareCapacity
                                 })
                                 .count();
+                            let peer_pressure_cap_halves = peer_pressure_cap.advance(now);
                             let mut effects = Vec::new();
                             for (candidate, selection_reason) in planned_launches {
-                                let plan = DemandLookupPlan::for_candidate(
+                                let plan = DemandLookupPlan::for_candidate_with_peer_cap(
                                     candidate,
                                     planner_state,
                                     selection_reason,
                                     idle_probe,
+                                    peer_pressure_cap_halves,
                                     now,
                                 );
                                 if !demand_scheduler.mark_in_progress(candidate.info_hash) {

@@ -111,7 +111,7 @@ pub async fn create_and_allocate_files(
         if exists {
             is_fresh_download = false;
         }
-        if file_info.is_skipped && !exists {
+        if file_info.is_skipped {
             continue;
         }
 
@@ -675,6 +675,31 @@ mod tests {
             !tokio::fs::try_exists(&mfi.files[1].path).await.unwrap(),
             "Skipped file should NOT exist"
         );
+    }
+
+    #[tokio::test]
+    async fn test_create_and_allocate_does_not_resize_existing_skipped_files() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let torrent_name = "skip_resize_test";
+        let files = vec![InfoFile {
+            path: vec!["skipped.txt".to_string()],
+            length: 50,
+            md5sum: None,
+            attr: None,
+        }];
+        let mut priorities = HashMap::new();
+        priorities.insert(0, FilePriority::Skip);
+        let mfi = MultiFileInfo::new(root, torrent_name, Some(&files), None, &priorities).unwrap();
+        tokio::fs::write(&mfi.files[0].path, b"keep").await.unwrap();
+
+        let is_fresh = create_and_allocate_files(&mfi).await.unwrap();
+
+        assert!(!is_fresh);
+        let metadata = tokio::fs::metadata(&mfi.files[0].path).await.unwrap();
+        assert_eq!(metadata.len(), 4);
+        let bytes = tokio::fs::read(&mfi.files[0].path).await.unwrap();
+        assert_eq!(bytes, b"keep");
     }
 
     #[tokio::test]

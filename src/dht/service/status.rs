@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
-use super::{ActiveRuntime, BootstrapSummary, DhtBackendKind};
+use super::{ActiveRuntime, BootstrapSummary, DhtBackendKind, DHT_DEMAND_POWER_BASE_SCALE_HALVES};
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -64,6 +64,7 @@ pub struct DhtWaveTelemetry {
     pub inflight_ipv6_queries: usize,
     pub unique_peers_found_last_10s: usize,
     pub demand_power_multiplier: u8,
+    pub demand_power_scale_halves: u8,
 }
 
 #[derive(Debug)]
@@ -146,13 +147,12 @@ pub(super) fn build_status(
             .or(runtime_health.confirmed_public_addr_ipv6);
         health.server_mode = Some(health.bound_family_count > 0);
 
-        let responsive = runtime_health.bootstrap_responsive_count;
-        let responsive_ipv4 = responsive.min(active_runtime.bootstrap.ipv4);
-        let responsive_ipv6 = responsive
-            .saturating_sub(responsive_ipv4)
+        health.responsive_ipv4_bootstrap_nodes = runtime_health
+            .bootstrap_responsive_ipv4_count
+            .min(active_runtime.bootstrap.ipv4);
+        health.responsive_ipv6_bootstrap_nodes = runtime_health
+            .bootstrap_responsive_ipv6_count
             .min(active_runtime.bootstrap.ipv6);
-        health.responsive_ipv4_bootstrap_nodes = responsive_ipv4;
-        health.responsive_ipv6_bootstrap_nodes = responsive_ipv6;
     }
 
     DhtStatus {
@@ -168,13 +168,14 @@ pub(super) fn publish_status(
     warning: Option<String>,
     generation: u64,
     preferred_backend: DhtBackendKind,
+    configured_bootstrap: BootstrapSummary,
 ) {
     let backend = active_runtime
         .map(|active| active.backend)
         .unwrap_or(DhtBackendKind::Disabled);
     let bootstrap = active_runtime
         .map(|active| active.bootstrap)
-        .unwrap_or_default();
+        .unwrap_or(configured_bootstrap);
     let _ = status_tx.send(build_status(
         active_runtime,
         backend,
@@ -188,12 +189,16 @@ pub(super) fn publish_status(
 pub(super) fn build_wave_telemetry(
     active_runtime: Option<&ActiveRuntime>,
     unique_peers_found_last_10s: usize,
-    demand_power_multiplier: u8,
+    demand_power_scale_halves: u8,
 ) -> DhtWaveTelemetry {
+    let demand_power_scale_halves = demand_power_scale_halves.max(1);
+    let demand_power_multiplier =
+        demand_power_scale_halves.div_ceil(DHT_DEMAND_POWER_BASE_SCALE_HALVES);
     let Some(active_runtime) = active_runtime else {
         return DhtWaveTelemetry {
             unique_peers_found_last_10s,
             demand_power_multiplier,
+            demand_power_scale_halves,
             ..DhtWaveTelemetry::default()
         };
     };
@@ -208,6 +213,7 @@ pub(super) fn build_wave_telemetry(
         inflight_ipv6_queries,
         unique_peers_found_last_10s,
         demand_power_multiplier,
+        demand_power_scale_halves,
     }
 }
 
@@ -215,12 +221,12 @@ pub(super) fn publish_wave_telemetry(
     wave_telemetry_tx: &watch::Sender<DhtWaveTelemetry>,
     active_runtime: Option<&ActiveRuntime>,
     recent_unique_peers: &mut RecentUniquePeers,
-    demand_power_multiplier: u8,
+    demand_power_scale_halves: u8,
 ) {
     let telemetry = build_wave_telemetry(
         active_runtime,
         recent_unique_peers.unique_count(Instant::now()),
-        demand_power_multiplier,
+        demand_power_scale_halves,
     );
     if *wave_telemetry_tx.borrow() != telemetry {
         let _ = wave_telemetry_tx.send(telemetry);

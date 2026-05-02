@@ -29,6 +29,8 @@ pub struct DhtHealthSnapshot {
     pub refresh_due_buckets_ipv6: usize,
     pub peer_store_size: usize,
     pub bootstrap_responsive_count: usize,
+    pub bootstrap_responsive_ipv4_count: usize,
+    pub bootstrap_responsive_ipv6_count: usize,
     pub inbound_query_rate: usize,
     pub recent_lookup_success_rate: usize,
     pub confirmed_public_addr_ipv4: Option<SocketAddr>,
@@ -80,6 +82,8 @@ impl DhtHealthSnapshot {
                 .map(PeerStore::total_peer_count)
                 .unwrap_or_default(),
             bootstrap_responsive_count: 0,
+            bootstrap_responsive_ipv4_count: 0,
+            bootstrap_responsive_ipv6_count: 0,
             inbound_query_rate: 0,
             recent_lookup_success_rate: 0,
             confirmed_public_addr_ipv4: None,

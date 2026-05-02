@@ -41,8 +41,8 @@ pub(in crate::dht::service) async fn apply_dht_service_effects(
             DhtServiceEffect::BuildRuntime { config } => {
                 let old_config = service_state.service.config().clone();
                 let old_port = service_state.service.config().port;
-                let drop_before_bind = active_runtime.is_some() && old_port == config.port;
-                if drop_before_bind {
+                let same_port_rebind = active_runtime.is_some() && old_port == config.port;
+                if same_port_rebind {
                     if let Some(mut previous) = active_runtime.take() {
                         let _ = previous.runtime.save_state().await;
                         previous
@@ -54,9 +54,13 @@ pub(in crate::dht::service) async fn apply_dht_service_effects(
 
                 let reduction = match build_runtime(&config, local_node_id).await {
                     Ok(built) => {
-                        if !drop_before_bind {
-                            if let Some(previous) = active_runtime.as_ref() {
+                        if !same_port_rebind {
+                            if let Some(mut previous) = active_runtime.take() {
                                 let _ = previous.runtime.save_state().await;
+                                previous
+                                    .runtime
+                                    .shutdown_for_rebind(DHT_REBIND_TRANSPORT_DRAIN_TIMEOUT)
+                                    .await;
                             }
                         }
                         *active_runtime = built.active_runtime;
@@ -69,7 +73,7 @@ pub(in crate::dht::service) async fn apply_dht_service_effects(
                     }
                     Err(error) => {
                         let mut warning = error;
-                        if drop_before_bind {
+                        if same_port_rebind {
                             match build_runtime(&old_config, local_node_id).await {
                                 Ok(restored) => {
                                     *active_runtime = restored.active_runtime;
@@ -86,7 +90,7 @@ pub(in crate::dht::service) async fn apply_dht_service_effects(
                         }
                         service_state.update_service_action(DhtServiceAction::ReconfigureFailed {
                             warning,
-                            runtime_reset: drop_before_bind,
+                            runtime_reset: same_port_rebind,
                         })
                     }
                 };
@@ -111,6 +115,7 @@ pub(in crate::dht::service) async fn apply_dht_service_effects(
                     service_state.service.warning_owned(),
                     service_state.service.generation(),
                     service_state.service.config().preferred_backend,
+                    literal_bootstrap_summary(&service_state.service.config().bootstrap_nodes),
                 );
             }
             DhtServiceEffect::StartDueDemands => {
@@ -231,6 +236,7 @@ pub(in crate::dht::service) async fn apply_dht_lifecycle_effects(
                     service_state.service.warning_owned(),
                     service_state.service.generation(),
                     service_state.service.config().preferred_backend,
+                    literal_bootstrap_summary(&service_state.service.config().bootstrap_nodes),
                 );
             }
             DhtLifecycleEffect::ExpireRecentUniquePeers => {

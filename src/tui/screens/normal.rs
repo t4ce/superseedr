@@ -809,13 +809,13 @@ struct DhtWaveProfile {
 }
 
 impl DhtWaveProfile {
-    fn from_inputs(_status: &DhtStatus, telemetry: &DhtWaveTelemetry) -> Self {
-        let query_signal = dht_wave_query_signal(telemetry);
-        let amplitude = (0.01 + query_signal * 0.24).clamp(0.0, 0.52);
-        let harmonic_amplitude = (0.004 + query_signal * 0.13).clamp(0.0, 0.20);
-        let frequency = (0.08 + query_signal * 0.18).clamp(0.06, 0.38);
-        let phase_speed = (0.03 + query_signal * (0.85 + query_signal * 0.75)).clamp(0.0, 2.0);
-        let crest_bias = ((query_signal - 0.5) * 0.06).clamp(-0.22, 0.22);
+    fn from_signal(signal: f64) -> Self {
+        let signal = signal.clamp(0.0, 1.0);
+        let amplitude = (0.01 + signal * 0.24).clamp(0.0, 0.52);
+        let harmonic_amplitude = (0.004 + signal * 0.13).clamp(0.0, 0.20);
+        let frequency = (0.08 + signal * 0.18).clamp(0.06, 0.38);
+        let phase_speed = (0.03 + signal * (0.85 + signal * 0.75)).clamp(0.0, 2.0);
+        let crest_bias = ((signal - 0.5) * 0.06).clamp(-0.22, 0.22);
 
         Self {
             amplitude,
@@ -824,6 +824,10 @@ impl DhtWaveProfile {
             phase_speed,
             crest_bias,
         }
+    }
+
+    fn from_inputs(_status: &DhtStatus, telemetry: &DhtWaveTelemetry) -> Self {
+        Self::from_signal(dht_wave_query_signal(telemetry))
     }
 }
 
@@ -848,7 +852,8 @@ fn dht_wave_y_axis_bounds(points: &[(f64, f64)]) -> [f64; 2] {
 
 fn dht_wave_title_spans(
     total_queries: usize,
-    demand_power_multiplier: u8,
+    unique_peers_found_last_10s: usize,
+    demand_power_scale_halves: u8,
     ctx: &ThemeContext,
 ) -> Vec<Span<'static>> {
     let query_style = ctx.apply(
@@ -856,30 +861,103 @@ fn dht_wave_title_spans(
             .fg(ctx.peer_discovered())
             .add_modifier(Modifier::BOLD),
     );
-    let multiplier = demand_power_multiplier.max(1);
-    if multiplier <= 1 {
-        return vec![Span::styled(total_queries.to_string(), query_style)];
+    let peer_yield_style = ctx.apply(
+        Style::default()
+            .fg(ctx.peer_connected())
+            .add_modifier(Modifier::BOLD),
+    );
+    let multiplier_style = ctx.apply(
+        Style::default()
+            .fg(ctx.accent_peach())
+            .add_modifier(Modifier::BOLD),
+    );
+    let mut spans = Vec::new();
+    let scale_halves = if demand_power_scale_halves == 0 {
+        2
+    } else {
+        demand_power_scale_halves
+    };
+    if scale_halves != 2 {
+        spans.extend([
+            Span::styled(dht_power_scale_label(scale_halves), multiplier_style),
+            Span::styled("(", multiplier_style),
+        ]);
     }
-
-    vec![
-        Span::styled(
-            format!("{multiplier}x"),
-            ctx.apply(
-                Style::default()
-                    .fg(ctx.accent_peach())
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ),
-        Span::styled(
-            "(",
-            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
-        ),
+    spans.extend([
         Span::styled(total_queries.to_string(), query_style),
         Span::styled(
-            ")",
+            " ",
             ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
         ),
-    ]
+        Span::styled(unique_peers_found_last_10s.to_string(), peer_yield_style),
+    ]);
+    if scale_halves != 2 {
+        spans.push(Span::styled(")", multiplier_style));
+    }
+    spans
+}
+
+fn dht_wave_title_width(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|span| span.content.chars().count()).sum()
+}
+
+fn dht_wave_should_show_left_title(area_width: u16, right_title_width: usize) -> bool {
+    const LEFT_TITLE_WIDTH: usize = 3;
+    const MIN_TITLE_GAP: usize = 1;
+
+    let top_border_width = usize::from(area_width).saturating_sub(2);
+    top_border_width >= LEFT_TITLE_WIDTH + MIN_TITLE_GAP + right_title_width
+}
+
+fn dht_power_scale_label(scale_halves: u8) -> String {
+    if scale_halves.is_multiple_of(2) {
+        format!("{}x", scale_halves / 2)
+    } else {
+        format!("{}.5x", scale_halves / 2)
+    }
+}
+
+const DHT_PEER_YIELD_SIGNAL_SCALE: f64 = 256.0;
+
+fn dht_peer_yield_signal(unique_peers_found_last_10s: usize) -> f64 {
+    let peers = unique_peers_found_last_10s as f64;
+    if peers <= 0.0 {
+        0.0
+    } else {
+        (peers / (peers + DHT_PEER_YIELD_SIGNAL_SCALE)).clamp(0.0, 1.0)
+    }
+}
+
+fn dht_peer_yield_wave_points(
+    phase: f64,
+    unique_peers_found_last_10s: usize,
+    sample_count: usize,
+    x_step: f64,
+) -> Vec<(f64, f64)> {
+    let yield_signal = dht_peer_yield_signal(unique_peers_found_last_10s);
+    if yield_signal <= 0.0 {
+        return Vec::new();
+    }
+
+    let peer_profile = DhtWaveProfile::from_signal(yield_signal);
+    let peer_phase = phase + std::f64::consts::TAU * 0.31;
+    let mut points = Vec::with_capacity(sample_count + 1);
+
+    for i in 0..=sample_count {
+        let x = i as f64 * x_step;
+        let theta = x * peer_profile.frequency;
+        let envelope = 0.84 + 0.16 * (theta * 0.33 + peer_phase * 0.28).sin();
+        let carrier = peer_profile.crest_bias * 0.35
+            + envelope * peer_profile.amplitude.clamp(0.05, 0.82) * (theta + peer_phase).sin()
+            + peer_profile.harmonic_amplitude * ((theta * 2.35) - peer_phase * 0.72).sin();
+        points.push((x, carrier.clamp(-1.04, 1.04)));
+    }
+
+    points
+}
+
+fn dht_peer_yield_draws_on_top(query_signal: f64, peer_yield_signal: f64) -> bool {
+    peer_yield_signal >= query_signal
 }
 
 fn draw_dht_wave_panel(
@@ -933,9 +1011,23 @@ fn draw_dht_wave_panel(
             + profile.harmonic_amplitude * ((theta * 2.35) - phase * 0.72).sin();
         dht_points.push((x, carrier.clamp(-1.04, 1.04)));
     }
-    let y_axis_bounds = dht_wave_y_axis_bounds(&dht_points);
+    let peer_yield_points = dht_peer_yield_wave_points(
+        phase,
+        dht_wave_telemetry.unique_peers_found_last_10s,
+        sample_count,
+        x_step,
+    );
+    let query_signal = if app_state.ui.dht_wave.initialized {
+        app_state.ui.dht_wave.query_load
+    } else {
+        dht_wave_query_signal(dht_wave_telemetry)
+    };
+    let peer_yield_signal = dht_peer_yield_signal(dht_wave_telemetry.unique_peers_found_last_10s);
+    let mut y_axis_points = dht_points.clone();
+    y_axis_points.extend(peer_yield_points.iter().copied());
+    let y_axis_bounds = dht_wave_y_axis_bounds(&y_axis_points);
 
-    let datasets = vec![ratatui::widgets::Dataset::default()
+    let dht_dataset = ratatui::widgets::Dataset::default()
         .marker(ratatui::symbols::Marker::Braille)
         .graph_type(ratatui::widgets::GraphType::Line)
         .style(
@@ -945,29 +1037,49 @@ fn draw_dht_wave_panel(
                     .add_modifier(Modifier::BOLD),
             ),
         )
-        .data(&dht_points)];
+        .data(&dht_points);
+    let peer_yield_dataset = ratatui::widgets::Dataset::default()
+        .marker(ratatui::symbols::Marker::Braille)
+        .graph_type(ratatui::widgets::GraphType::Line)
+        .style(
+            ctx.apply(
+                Style::default()
+                    .fg(ctx.peer_connected())
+                    .add_modifier(Modifier::BOLD),
+            ),
+        )
+        .data(&peer_yield_points);
+    let datasets = if peer_yield_points.is_empty() {
+        vec![dht_dataset]
+    } else if dht_peer_yield_draws_on_top(query_signal, peer_yield_signal) {
+        vec![dht_dataset, peer_yield_dataset]
+    } else {
+        vec![peer_yield_dataset, dht_dataset]
+    };
+
+    let title_spans = dht_wave_title_spans(
+        total_queries,
+        dht_wave_telemetry.unique_peers_found_last_10s,
+        dht_wave_telemetry.demand_power_scale_halves,
+        ctx,
+    );
+    let mut block = Block::default();
+    if dht_wave_should_show_left_title(area.width, dht_wave_title_width(&title_spans)) {
+        block = block.title_top(
+            Line::from(Span::styled(
+                "DHT",
+                ctx.apply(Style::default().fg(ctx.peer_discovered())),
+            ))
+            .alignment(Alignment::Left),
+        );
+    }
+    block = block
+        .title_top(Line::from(title_spans).alignment(Alignment::Right))
+        .borders(Borders::ALL)
+        .border_style(ctx.apply(Style::default().fg(ctx.theme.semantic.border)));
 
     let chart = ratatui::widgets::Chart::new(datasets)
-        .block(
-            Block::default()
-                .title_top(
-                    Line::from(Span::styled(
-                        "DHT",
-                        ctx.apply(Style::default().fg(ctx.peer_discovered())),
-                    ))
-                    .alignment(Alignment::Left),
-                )
-                .title_top(
-                    Line::from(dht_wave_title_spans(
-                        total_queries,
-                        dht_wave_telemetry.demand_power_multiplier,
-                        ctx,
-                    ))
-                    .alignment(Alignment::Right),
-                )
-                .borders(Borders::ALL)
-                .border_style(ctx.apply(Style::default().fg(ctx.theme.semantic.border))),
-        )
+        .block(block)
         .x_axis(ratatui::widgets::Axis::default().bounds([0.0, x_bound as f64]))
         .y_axis(ratatui::widgets::Axis::default().bounds(y_axis_bounds));
 
@@ -7308,22 +7420,26 @@ mod tests {
     #[test]
     fn dht_wave_title_is_query_count_without_multiplier() {
         let ctx = ThemeContext::new(Theme::builtin(ThemeName::CatppuccinMocha), 0.0);
-        let spans = dht_wave_title_spans(42, 1, &ctx);
+        let spans = dht_wave_title_spans(42, 184, 2, &ctx);
 
-        assert_eq!(spans.len(), 1);
+        assert_eq!(spans.len(), 3);
         assert_eq!(spans[0].content, "42");
+        assert_eq!(spans[1].content, " ");
+        assert_eq!(spans[2].content, "184");
     }
 
     #[test]
     fn dht_wave_title_colors_multiplier_prefix() {
         let ctx = ThemeContext::new(Theme::builtin(ThemeName::CatppuccinMocha), 0.0);
-        let spans = dht_wave_title_spans(42, 4, &ctx);
+        let spans = dht_wave_title_spans(42, 184, 8, &ctx);
 
-        assert_eq!(spans.len(), 4);
+        assert_eq!(spans.len(), 6);
         assert_eq!(spans[0].content, "4x");
         assert_eq!(spans[1].content, "(");
         assert_eq!(spans[2].content, "42");
-        assert_eq!(spans[3].content, ")");
+        assert_eq!(spans[3].content, " ");
+        assert_eq!(spans[4].content, "184");
+        assert_eq!(spans[5].content, ")");
         assert_eq!(
             spans[0].style,
             ctx.apply(
@@ -7332,6 +7448,62 @@ mod tests {
                     .add_modifier(Modifier::BOLD)
             )
         );
+        assert_eq!(spans[1].style, spans[0].style);
+        assert_eq!(spans[5].style, spans[0].style);
+        assert_eq!(
+            spans[4].style,
+            ctx.apply(
+                Style::default()
+                    .fg(ctx.peer_connected())
+                    .add_modifier(Modifier::BOLD)
+            )
+        );
+    }
+
+    #[test]
+    fn dht_wave_title_can_show_half_power_cap() {
+        let ctx = ThemeContext::new(Theme::builtin(ThemeName::CatppuccinMocha), 0.0);
+        let spans = dht_wave_title_spans(42, 7, 1, &ctx);
+
+        assert_eq!(spans.len(), 6);
+        assert_eq!(spans[0].content, "0.5x");
+        assert_eq!(spans[2].content, "42");
+        assert_eq!(spans[4].content, "7");
+    }
+
+    #[test]
+    fn dht_wave_title_hides_left_label_when_width_is_tight() {
+        let ctx = ThemeContext::new(Theme::builtin(ThemeName::CatppuccinMocha), 0.0);
+        let spans = dht_wave_title_spans(123, 1234, 4, &ctx);
+        let right_title_width = dht_wave_title_width(&spans);
+
+        assert_eq!(right_title_width, "2x(123 1234)".len());
+        assert!(!dht_wave_should_show_left_title(17, right_title_width));
+        assert!(dht_wave_should_show_left_title(18, right_title_width));
+    }
+
+    #[test]
+    fn dht_peer_yield_wave_points_mirror_dht_wave_shape() {
+        let empty = dht_peer_yield_wave_points(0.4, 0, 20, 1.0);
+        let low = dht_peer_yield_wave_points(0.4, 12, 20, 1.0);
+        let high = dht_peer_yield_wave_points(0.4, 384, 20, 1.0);
+
+        assert!(empty.is_empty());
+        assert_eq!(low.len(), 21);
+        assert_eq!(high.len(), 21);
+        assert_eq!(low[0].0, 0.0);
+        assert_eq!(high[20].0, 20.0);
+        let low_span = low.iter().map(|(_, y)| y.abs()).fold(0.0_f64, f64::max);
+        let high_span = high.iter().map(|(_, y)| y.abs()).fold(0.0_f64, f64::max);
+        assert!(high_span > low_span);
+        assert!(high_span < 0.40);
+    }
+
+    #[test]
+    fn dht_peer_yield_draw_order_uses_stronger_signal_on_top() {
+        assert!(dht_peer_yield_draws_on_top(0.35, 0.60));
+        assert!(!dht_peer_yield_draws_on_top(0.70, 0.30));
+        assert!(dht_peer_yield_draws_on_top(0.50, 0.50));
     }
 
     #[test]

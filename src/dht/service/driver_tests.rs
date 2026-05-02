@@ -459,6 +459,85 @@ async fn active_service_same_port_reconfigure_waits_for_inflight_transport_users
 }
 
 #[tokio::test]
+async fn active_service_different_port_reconfigure_releases_old_runtime_after_success() {
+    let mut active_runtime =
+        local_ipv4_active_runtime_with_bootstrap(vec![peer("127.0.0.1:9")]).await;
+    let old_addr = active_runtime
+        .runtime
+        .ipv4_local_addr()
+        .expect("active runtime IPv4 addr");
+    let (_lookup_id, _peer_rx) = active_runtime
+        .runtime
+        .start_get_peers(AddressFamily::Ipv4, hash_index(100))
+        .await
+        .expect("start inflight lookup");
+    assert!(active_runtime.runtime.inflight_query_counts().0 > 0);
+
+    let config = DhtServiceConfig {
+        port: old_addr.port(),
+        bootstrap_nodes: vec!["127.0.0.1:9".to_string()],
+        preferred_backend: DhtBackendKind::InternalPrototype,
+        force_internal_failure: false,
+    };
+    let initial_status = build_status(
+        Some(&active_runtime),
+        DhtBackendKind::InternalPrototype,
+        config.preferred_backend,
+        None,
+        0,
+        active_runtime.bootstrap,
+    );
+    let (status_tx, mut status_rx) = watch::channel(initial_status);
+    let (wave_tx, _wave_rx) = watch::channel(DhtWaveTelemetry::default());
+    let (command_tx, command_rx) = mpsc::unbounded_channel();
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let task = tokio::spawn(run_service(
+        config,
+        NodeId::from([11u8; NodeId::LEN]),
+        Some(active_runtime),
+        None,
+        status_tx,
+        wave_tx,
+        command_tx.clone(),
+        command_rx,
+        shutdown_rx,
+    ));
+
+    send_dht_command(
+        &command_tx,
+        DhtCommand::Reconfigure(DhtServiceConfig {
+            port: 0,
+            bootstrap_nodes: vec!["127.0.0.1:10".to_string()],
+            preferred_backend: DhtBackendKind::InternalPrototype,
+            force_internal_failure: false,
+        }),
+    )
+    .expect("send different-port reconfigure");
+
+    let status = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            status_rx.changed().await.expect("status channel open");
+            let status = status_rx.borrow().clone();
+            if status.generation == 1 {
+                break status;
+            }
+        }
+    })
+    .await
+    .expect("different-port reconfigure status update");
+    assert_eq!(status.health.backend, DhtBackendKind::InternalPrototype);
+    assert_eq!(status.warning, None);
+
+    let rebound = tokio::net::UdpSocket::bind(old_addr)
+        .await
+        .expect("old DHT port should be released after successful different-port reconfigure");
+    drop(rebound);
+
+    let _ = shutdown_tx.send(());
+    task.await.expect("service task join");
+}
+
+#[tokio::test]
 async fn active_service_same_port_reconfigure_failure_restores_previous_runtime() {
     let active_runtime = local_ipv4_active_runtime_without_bootstrap().await;
     let port = active_runtime

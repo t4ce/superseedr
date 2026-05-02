@@ -178,7 +178,7 @@ pub struct Runtime {
     lookup_result_tx: mpsc::UnboundedSender<LookupTaskResult>,
     lookup_result_rx: mpsc::UnboundedReceiver<LookupTaskResult>,
     persistence_manager: Option<PersistenceManager>,
-    bootstrap_responsive_count: usize,
+    responsive_bootstrap_nodes: HashSet<SocketAddr>,
     inbound_query_count: usize,
     recent_lookup_success_count: usize,
 }
@@ -291,7 +291,7 @@ impl Runtime {
             lookup_result_tx,
             lookup_result_rx,
             persistence_manager,
-            bootstrap_responsive_count: 0,
+            responsive_bootstrap_nodes: HashSet::new(),
             inbound_query_count: 0,
             recent_lookup_success_count: 0,
         })
@@ -392,7 +392,11 @@ impl Runtime {
             Some(&ipv6_snapshot),
             Some(&self.peer_store),
         );
-        health.bootstrap_responsive_count = self.bootstrap_responsive_count;
+        let (responsive_total, responsive_ipv4, responsive_ipv6) =
+            self.responsive_bootstrap_counts();
+        health.bootstrap_responsive_count = responsive_total;
+        health.bootstrap_responsive_ipv4_count = responsive_ipv4;
+        health.bootstrap_responsive_ipv6_count = responsive_ipv6;
         health.inbound_query_rate = self.inbound_query_count;
         health.recent_lookup_success_rate = self.recent_lookup_success_count;
         health.confirmed_public_addr_ipv4 =
@@ -400,6 +404,32 @@ impl Runtime {
         health.confirmed_public_addr_ipv6 =
             self.public_addresses.confirmed_for(AddressFamily::Ipv6);
         health
+    }
+
+    fn record_responsive_bootstrap(&mut self, addr: SocketAddr) {
+        if self.config.bootstrap_nodes.contains(&addr) {
+            self.responsive_bootstrap_nodes.insert(addr);
+        }
+    }
+
+    fn responsive_bootstrap_counts(&self) -> (usize, usize, usize) {
+        let mut total = 0usize;
+        let mut ipv4 = 0usize;
+        let mut ipv6 = 0usize;
+
+        for addr in &self.responsive_bootstrap_nodes {
+            if !self.config.bootstrap_nodes.contains(addr) {
+                continue;
+            }
+            total = total.saturating_add(1);
+            if addr.is_ipv4() {
+                ipv4 = ipv4.saturating_add(1);
+            } else {
+                ipv6 = ipv6.saturating_add(1);
+            }
+        }
+
+        (total, ipv4, ipv6)
     }
 
     pub async fn save_state(&self) -> io::Result<()> {
@@ -905,10 +935,7 @@ impl Runtime {
                 }
             }
             TransportEvent::UnexpectedReply { source, .. } => {
-                if self.config.bootstrap_nodes.contains(&source) {
-                    self.bootstrap_responsive_count =
-                        self.bootstrap_responsive_count.saturating_add(1);
-                }
+                self.record_responsive_bootstrap(source);
             }
             TransportEvent::Timeout { .. } => {}
         }
@@ -1008,10 +1035,7 @@ impl Runtime {
                     record.note_query_response(Some(node_id), now);
                     let _ = routing.insert(record, now);
                 }
-                if self.config.bootstrap_nodes.contains(&addr) {
-                    self.bootstrap_responsive_count =
-                        self.bootstrap_responsive_count.saturating_add(1);
-                }
+                self.record_responsive_bootstrap(addr);
                 self.recent_lookup_success_count =
                     self.recent_lookup_success_count.saturating_add(1);
             } else {
@@ -1399,10 +1423,7 @@ impl Runtime {
                         record.note_query_response(node_id, now);
                         let _ = routing.insert(record, now);
                     }
-                    if self.config.bootstrap_nodes.contains(&addr) {
-                        self.bootstrap_responsive_count =
-                            self.bootstrap_responsive_count.saturating_add(1);
-                    }
+                    self.record_responsive_bootstrap(addr);
                 }
                 Ok(Some(TransportReply::Error(_))) | Ok(None) => {
                     let _ = self
@@ -1771,6 +1792,34 @@ mod tests {
         assert_eq!(runtime.active_lookup_count(), 0);
         assert!(runtime.lookup_quality_snapshot(lookup_id).is_none());
         assert!(peer_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_tracks_unique_responsive_bootstrap_nodes_by_family() {
+        let bootstrap_ipv4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6881);
+        let bootstrap_ipv6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 6881);
+        let non_bootstrap = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6882);
+        let mut runtime = Runtime::bind(RuntimeConfig {
+            local_node_id: seeded_node_id(0x13),
+            allow_public_ipv4_identity: false,
+            bootstrap_nodes: vec![bootstrap_ipv4, bootstrap_ipv6],
+            bootstrap_sources: Vec::new(),
+            ipv4_bind_addr: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
+            ipv6_bind_addr: None,
+            persistence: None,
+        })
+        .await
+        .expect("bind runtime");
+
+        runtime.record_responsive_bootstrap(bootstrap_ipv4);
+        runtime.record_responsive_bootstrap(bootstrap_ipv4);
+        runtime.record_responsive_bootstrap(bootstrap_ipv6);
+        runtime.record_responsive_bootstrap(non_bootstrap);
+
+        let health = runtime.health_snapshot();
+        assert_eq!(health.bootstrap_responsive_count, 2);
+        assert_eq!(health.bootstrap_responsive_ipv4_count, 1);
+        assert_eq!(health.bootstrap_responsive_ipv6_count, 1);
     }
 
     #[tokio::test]
