@@ -12,12 +12,12 @@ const PERMIT_GRANT_BATCH_SIZE: usize = 64;
 #[derive(Debug)]
 pub struct PermitGuard {
     pub resource_type: ResourceType,
-    control_tx: mpsc::Sender<ControlCommand>,
+    control_tx: mpsc::UnboundedSender<ControlCommand>,
 }
 
 impl Drop for PermitGuard {
     fn drop(&mut self) {
-        let _ = self.control_tx.try_send(ControlCommand::Release {
+        let _ = self.control_tx.send(ControlCommand::Release {
             resource: self.resource_type,
         });
     }
@@ -42,7 +42,7 @@ pub enum ResourceManagerError {
 #[derive(Clone, Debug)]
 pub struct ResourceManagerClient {
     acquire_txs: HashMap<ResourceType, mpsc::Sender<AcquireCommand>>,
-    control_tx: mpsc::Sender<ControlCommand>,
+    control_tx: mpsc::UnboundedSender<ControlCommand>,
 }
 
 #[cfg(feature = "synthetic-load")]
@@ -78,7 +78,6 @@ impl ResourceManagerClient {
         let command = ControlCommand::UpdateLimits { limits: new_limits };
         self.control_tx
             .send(command)
-            .await
             .map_err(|_| ResourceManagerError::ManagerShutdown)
     }
 
@@ -88,7 +87,6 @@ impl ResourceManagerClient {
         let command = ControlCommand::Snapshot { respond_to };
         self.control_tx
             .send(command)
-            .await
             .map_err(|_| ResourceManagerError::ManagerShutdown)?;
         rx.await.map_err(|_| ResourceManagerError::ManagerShutdown)
     }
@@ -133,8 +131,8 @@ pub enum ControlCommand {
 
 pub struct ResourceManager {
     acquire_rxs: HashMap<ResourceType, mpsc::Receiver<AcquireCommand>>,
-    control_rx: mpsc::Receiver<ControlCommand>,
-    control_tx: mpsc::Sender<ControlCommand>,
+    control_rx: mpsc::UnboundedReceiver<ControlCommand>,
+    control_tx: mpsc::UnboundedSender<ControlCommand>,
     resources: HashMap<ResourceType, ResourceState>,
     shutdown_tx: broadcast::Sender<()>,
 }
@@ -151,7 +149,7 @@ impl ResourceManager {
         limits: HashMap<ResourceType, (usize, usize)>,
         shutdown_tx: broadcast::Sender<()>,
     ) -> (Self, ResourceManagerClient) {
-        let (control_tx, control_rx) = mpsc::channel(256);
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
         let mut acquire_txs = HashMap::new();
         let mut acquire_rxs = HashMap::new();
         let mut resources = HashMap::new();
@@ -269,7 +267,7 @@ impl ResourceManager {
         state.in_use = state.in_use.saturating_sub(1);
         let _ = self
             .control_tx
-            .try_send(ControlCommand::ProcessQueue { resource });
+            .send(ControlCommand::ProcessQueue { resource });
     }
 
     fn handle_update_limits(&mut self, limits: HashMap<ResourceType, usize>) {
@@ -278,7 +276,7 @@ impl ResourceManager {
                 state.limit = new_limit;
                 let _ = self
                     .control_tx
-                    .try_send(ControlCommand::ProcessQueue { resource });
+                    .send(ControlCommand::ProcessQueue { resource });
             }
         }
     }
@@ -307,7 +305,7 @@ impl ResourceManager {
         if state.in_use < state.limit && !state.wait_queue.is_empty() {
             let _ = self
                 .control_tx
-                .try_send(ControlCommand::ProcessQueue { resource });
+                .send(ControlCommand::ProcessQueue { resource });
         }
     }
 }
@@ -732,6 +730,31 @@ mod tests {
             "Permit leaked! The aborted waiter consumed a slot."
         );
         assert!(result.unwrap().is_ok());
+    }
+
+    #[cfg(feature = "synthetic-load")]
+    #[tokio::test]
+    async fn test_release_storm_does_not_drop_permits() {
+        let limit = 512;
+        let limits = create_limits((limit, 0), (0, 0), (0, 0));
+        let (client, _handle) = setup_manager(limits);
+
+        let mut guards = Vec::with_capacity(limit);
+        for _ in 0..limit {
+            guards.push(client.acquire_peer_connection().await.unwrap());
+        }
+
+        drop(guards);
+
+        let snapshot = timeout(Duration::from_secs(1), client.snapshot())
+            .await
+            .expect("snapshot timed out")
+            .expect("snapshot failed");
+        let peer_usage = snapshot
+            .resources
+            .get(&ResourceType::PeerConnection)
+            .expect("missing peer resource snapshot");
+        assert_eq!(peer_usage.in_use, 0, "release storm leaked permits");
     }
 
     #[tokio::test(start_paused = true)]

@@ -18,7 +18,7 @@ use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, ErrorKind, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,6 +34,7 @@ const SYNTHETIC_BYTE: u8 = 0;
 const MANAGER_CHANNEL_SIZE: usize = 10_000;
 const EVENT_CHANNEL_SIZE: usize = 100_000;
 const CLIENT_ID: &str = "SL000000000000000000";
+const LEECHER_REQUEST_BURST: usize = 16;
 
 type DynError = Box<dyn Error + Send + Sync>;
 
@@ -733,8 +734,10 @@ async fn spawn_synthetic_seeder(
                             let spec = spec.clone();
                             let mut child_shutdown = shutdown_tx.subscribe();
                             tokio::spawn(async move {
-                                if run_seeder_connection(stream, &spec, peer_id, counters.clone(), &mut child_shutdown).await.is_err() {
-                                    counters.protocol_errors.fetch_add(1, Ordering::Relaxed);
+                                if let Err(error) = run_seeder_connection(stream, &spec, peer_id, counters.clone(), &mut child_shutdown).await {
+                                    if !is_expected_connection_close(error.as_ref()) {
+                                        counters.protocol_errors.fetch_add(1, Ordering::Relaxed);
+                                    }
                                 }
                                 counters.disconnects.fetch_add(1, Ordering::Relaxed);
                             });
@@ -746,6 +749,19 @@ async fn spawn_synthetic_seeder(
         }
     });
     Ok((addr, handle))
+}
+
+fn is_expected_connection_close(error: &(dyn Error + Send + Sync + 'static)) -> bool {
+    let Some(error) = error.downcast_ref::<std::io::Error>() else {
+        return false;
+    };
+    matches!(
+        error.kind(),
+        ErrorKind::BrokenPipe
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionReset
+            | ErrorKind::UnexpectedEof
+    )
 }
 
 async fn run_seeder_connection(
@@ -886,12 +902,14 @@ async fn run_synthetic_leecher(
 
         loop {
             if unchoked {
-                while in_flight < pipeline_depth {
+                let mut issued = 0usize;
+                while in_flight < pipeline_depth && issued < LEECHER_REQUEST_BURST {
                     let (piece, begin, len) =
                         block_request_for(spec.total_size, spec.piece_size, next_block);
                     write_request_frame(&mut writer, piece, begin, len).await?;
                     counters.leecher_requests.fetch_add(1, Ordering::Relaxed);
                     in_flight += 1;
+                    issued += 1;
                     next_block = (next_block + 1) % total_blocks;
                 }
             }
@@ -906,6 +924,10 @@ async fn run_synthetic_leecher(
                     parse_buf.extend_from_slice(&socket_buf[..n]);
                     while let Some(frame) = take_frame(&mut parse_buf) {
                         match frame_message_id(&frame) {
+                            Some(0) => {
+                                unchoked = false;
+                                in_flight = 0;
+                            }
                             Some(1) => {
                                 unchoked = true;
                             }
@@ -926,8 +948,10 @@ async fn run_synthetic_leecher(
     }
     .await;
 
-    if result.is_err() {
-        counters.protocol_errors.fetch_add(1, Ordering::Relaxed);
+    if let Err(error) = result {
+        if !is_expected_connection_close(error.as_ref()) {
+            counters.protocol_errors.fetch_add(1, Ordering::Relaxed);
+        }
     }
     counters.disconnects.fetch_add(1, Ordering::Relaxed);
 }
@@ -1577,5 +1601,21 @@ mod tests {
             .collect();
 
         assert_eq!(partitions, vec![vec![0, 3, 6], vec![1, 4, 7], vec![2, 5]]);
+    }
+
+    #[test]
+    fn expected_connection_close_filters_transport_teardown() {
+        let closed: DynError = Box::new(std::io::Error::new(ErrorKind::BrokenPipe, "closed"));
+        assert!(is_expected_connection_close(closed.as_ref()));
+
+        let reset: DynError = Box::new(std::io::Error::new(ErrorKind::ConnectionReset, "reset"));
+        assert!(is_expected_connection_close(reset.as_ref()));
+
+        let malformed: DynError =
+            Box::new(std::io::Error::new(ErrorKind::InvalidData, "bad frame"));
+        assert!(!is_expected_connection_close(malformed.as_ref()));
+
+        let semantic_error: DynError = "mismatched synthetic info hash".into();
+        assert!(!is_expected_connection_close(semantic_error.as_ref()));
     }
 }
