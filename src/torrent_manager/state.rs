@@ -349,6 +349,7 @@ pub struct TorrentState {
     pub v2_pending_data: HashMap<u32, (u32, Vec<u8>)>,
     pub piece_to_roots: HashMap<u32, Vec<V2RootInfo>>,
     pub verifying_pieces: HashSet<u32>,
+    pub writing_pieces: HashSet<u32>,
     pub torrent_data_path: Option<PathBuf>,
     pub container_name: Option<String>,
     pub multi_file_info: Option<MultiFileInfo>,
@@ -392,6 +393,7 @@ impl Default for TorrentState {
             v2_pending_data: HashMap::new(),
             piece_to_roots: HashMap::new(),
             verifying_pieces: HashSet::new(),
+            writing_pieces: HashSet::new(),
             torrent_data_path: None,
             container_name: None,
             multi_file_info: None,
@@ -872,7 +874,9 @@ impl TorrentState {
                     if available_slots == 0 {
                         break;
                     }
-                    if self.verifying_pieces.contains(&piece_index) {
+                    if self.verifying_pieces.contains(&piece_index)
+                        || self.writing_pieces.contains(&piece_index)
+                    {
                         continue;
                     }
                     let block_addrs = self
@@ -933,6 +937,9 @@ impl TorrentState {
                         }
                         // Don't duplicate work currently verifying
                         if self.verifying_pieces.contains(&p_idx) {
+                            return false;
+                        }
+                        if self.writing_pieces.contains(&p_idx) {
                             return false;
                         }
                         // Don't request what we already asked this specific peer for
@@ -1165,9 +1172,28 @@ impl TorrentState {
             }
 
             Action::PeerInterested { peer_id } => {
+                let open_upload_slot = self.data_available
+                    && self
+                        .peers
+                        .values()
+                        .filter(|peer| peer.am_choking == ChokeStatus::Unchoke)
+                        .count()
+                        < UPLOAD_SLOTS_DEFAULT;
+
                 if let Some(peer) = self.peers.get_mut(&peer_id) {
+                    let newly_interested = !peer.peer_is_interested_in_us;
                     peer.peer_is_interested_in_us = true;
+
+                    if newly_interested && open_upload_slot && peer.am_choking == ChokeStatus::Choke
+                    {
+                        peer.am_choking = ChokeStatus::Unchoke;
+                        return vec![Effect::SendToPeer {
+                            peer_id,
+                            cmd: Box::new(TorrentCommand::PeerUnchoke),
+                        }];
+                    }
                 }
+
                 vec![Effect::DoNothing]
             }
 
@@ -1201,8 +1227,10 @@ impl TorrentState {
                 // We perform accounting only for useful blocks to prevent metric inflation.
                 let is_piece_done = self.piece_manager.bitfield.get(piece_index as usize)
                     == Some(&PieceStatus::Done);
+                let is_piece_writing = self.writing_pieces.contains(&piece_index);
+                let is_piece_unneeded = is_piece_done || is_piece_writing;
 
-                if !is_piece_done {
+                if !is_piece_unneeded {
                     self.bytes_downloaded_in_interval =
                         self.bytes_downloaded_in_interval.saturating_add(len);
                     self.session_total_downloaded =
@@ -1219,7 +1247,7 @@ impl TorrentState {
                         .remove(&(piece_index, block_offset, block_len));
 
                     // Only credit the peer if the block was useful
-                    if !is_piece_done {
+                    if !is_piece_unneeded {
                         peer.bytes_downloaded_from_peer += len;
                         peer.bytes_downloaded_in_tick += len;
                         peer.total_bytes_downloaded += len;
@@ -1229,14 +1257,16 @@ impl TorrentState {
                 effects.push(Effect::EmitManagerEvent(ManagerEvent::BlockReceived {
                     info_hash: self.info_hash.clone(),
                 }));
-                self.record_pending_file_activity(
-                    piece_index,
-                    block_offset,
-                    data.len() as u32,
-                    FileActivityDirection::Download,
-                );
+                if !is_piece_unneeded {
+                    self.record_pending_file_activity(
+                        piece_index,
+                        block_offset,
+                        data.len() as u32,
+                        FileActivityDirection::Download,
+                    );
+                }
 
-                if is_piece_done {
+                if is_piece_unneeded {
                     return effects;
                 }
 
@@ -1479,6 +1509,7 @@ impl TorrentState {
                 if valid {
                     if self.piece_manager.bitfield.get(piece_index as usize)
                         == Some(&PieceStatus::Done)
+                        || self.writing_pieces.contains(&piece_index)
                     {
                         if let Some(peer) = self.peers.get_mut(&peer_id) {
                             peer.pending_requests.remove(&piece_index);
@@ -1489,6 +1520,7 @@ impl TorrentState {
                     } else {
                         // Valid and needed piece. Request write to disk.
                         // The data payload is now properly passed from the Action.
+                        self.writing_pieces.insert(piece_index);
                         effects.push(Effect::WriteToDisk {
                             peer_id: peer_id.clone(),
                             piece_index,
@@ -1496,6 +1528,7 @@ impl TorrentState {
                         });
                     }
                 } else {
+                    self.writing_pieces.remove(&piece_index);
                     self.piece_manager.reset_piece_assembly(piece_index);
                     effects.push(Effect::DisconnectPeer { peer_id });
                 }
@@ -1520,6 +1553,7 @@ impl TorrentState {
 
                 if self.piece_manager.bitfield.get(piece_index as usize) == Some(&PieceStatus::Done)
                 {
+                    self.writing_pieces.remove(&piece_index);
                     if let Some(peer) = self.peers.get_mut(&peer_id) {
                         peer.pending_requests.remove(&piece_index);
                     }
@@ -1529,8 +1563,7 @@ impl TorrentState {
 
                 // ACTUAL STATE CHANGE
                 let peers_to_cancel = self.piece_manager.mark_as_complete(piece_index);
-
-                effects.push(Effect::EmitManagerEvent(ManagerEvent::DiskWriteFinished));
+                self.writing_pieces.remove(&piece_index);
 
                 if let Some(peer) = self.peers.get_mut(&peer_id) {
                     peer.pending_requests.remove(&piece_index);
@@ -1574,6 +1607,7 @@ impl TorrentState {
                 if piece_index as usize >= self.piece_manager.bitfield.len() {
                     return vec![Effect::DoNothing];
                 }
+                self.writing_pieces.remove(&piece_index);
                 self.piece_manager.requeue_pending_to_need(piece_index);
                 vec![Effect::EmitManagerEvent(ManagerEvent::DiskWriteFinished)]
             }
@@ -1723,6 +1757,8 @@ impl TorrentState {
                 };
 
                 self.piece_manager = PieceManager::new();
+                self.verifying_pieces.clear();
+                self.writing_pieces.clear();
                 self.piece_manager
                     .set_initial_fields(num_pieces, self.torrent_validation_status);
 
@@ -1791,6 +1827,8 @@ impl TorrentState {
                 self.torrent_status = TorrentStatus::Standard;
 
                 self.piece_manager.pending_queue.clear();
+                self.verifying_pieces.clear();
+                self.writing_pieces.clear();
                 for peer in self.peers.values_mut() {
                     peer.pending_requests.clear();
                 }
@@ -2054,6 +2092,7 @@ impl TorrentState {
                 self.v2_pending_data.clear();
                 self.piece_to_roots.clear();
                 self.verifying_pieces.clear();
+                self.writing_pieces.clear();
 
                 let num_pieces = self.piece_manager.bitfield.len();
                 self.piece_manager = PieceManager::new();
@@ -3606,6 +3645,107 @@ mod tests {
             result.is_ok(),
             "Regression: Double PieceWrittenToDisk caused a panic!"
         );
+    }
+
+    #[test]
+    fn peer_interested_fills_available_upload_slot_without_recalculation() {
+        let mut state = create_empty_state();
+        state.torrent_status = TorrentStatus::Done;
+        state.piece_manager.set_initial_fields(1, true);
+
+        let peer_id = "waiting_leecher".to_string();
+        add_peer(&mut state, &peer_id);
+        state
+            .peers
+            .get_mut(&peer_id)
+            .unwrap()
+            .bytes_uploaded_to_peer = 1234;
+
+        let effects = state.update(Action::PeerInterested {
+            peer_id: peer_id.clone(),
+        });
+
+        assert_eq!(
+            state.peers[&peer_id].am_choking,
+            ChokeStatus::Unchoke,
+            "interested peers should fill an empty upload slot"
+        );
+        assert_eq!(
+            state.peers[&peer_id].bytes_uploaded_to_peer, 1234,
+            "filling an empty slot must not reset rolling choke counters"
+        );
+        assert!(effects.iter().any(|effect| {
+            matches!(effect, Effect::SendToPeer { cmd, .. }
+                if matches!(**cmd, TorrentCommand::PeerUnchoke))
+        }));
+    }
+
+    #[test]
+    fn assign_work_skips_verified_piece_while_disk_write_is_pending() {
+        let mut state = create_empty_state();
+        let piece_len = 16_384_u32 * 4;
+        let mut torrent = create_dummy_torrent(1);
+        torrent.info.piece_length = piece_len as i64;
+        torrent.info.length = piece_len as i64;
+        state.torrent = Some(torrent);
+        state.piece_manager.set_initial_fields(1, false);
+        state.piece_manager.block_manager.set_geometry(
+            piece_len,
+            piece_len as u64,
+            vec![],
+            vec![],
+            HashMap::new(),
+            false,
+        );
+        state.torrent_status = TorrentStatus::Standard;
+        state.piece_manager.need_queue = vec![0];
+
+        let peer_id = "writer_peer".to_string();
+        add_peer(&mut state, &peer_id);
+        let peer = state.peers.get_mut(&peer_id).unwrap();
+        peer.peer_choking = ChokeStatus::Unchoke;
+        peer.bitfield = vec![true];
+
+        state.update(Action::AssignWork {
+            peer_id: peer_id.clone(),
+        });
+        assert!(state.peers[&peer_id].pending_requests.contains(&0));
+
+        let effects = state.update(Action::PieceVerified {
+            peer_id: peer_id.clone(),
+            piece_index: 0,
+            valid: true,
+            data: vec![0u8; piece_len as usize],
+        });
+        assert!(state.writing_pieces.contains(&0));
+        assert!(effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::WriteToDisk { piece_index: 0, .. })));
+
+        let peer = state.peers.get_mut(&peer_id).unwrap();
+        peer.inflight_requests = 0;
+        peer.active_blocks.clear();
+
+        let effects = state.update(Action::AssignWork {
+            peer_id: peer_id.clone(),
+        });
+        let duplicate_request = effects.iter().any(|effect| {
+            matches!(effect, Effect::SendToPeer { cmd, .. }
+                if matches!(**cmd, TorrentCommand::BulkRequest(_)))
+        });
+
+        assert!(
+            !duplicate_request,
+            "verified pieces waiting for disk write must not be requested again"
+        );
+        assert_eq!(state.piece_manager.bitfield[0], PieceStatus::Need);
+
+        state.update(Action::PieceWrittenToDisk {
+            peer_id,
+            piece_index: 0,
+        });
+        assert!(!state.writing_pieces.contains(&0));
+        assert_eq!(state.piece_manager.bitfield[0], PieceStatus::Done);
     }
 
     #[test]
