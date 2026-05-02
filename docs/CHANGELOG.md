@@ -1,5 +1,23 @@
 # Changelog
 
+## Release v1.0.6
+### 🚀 New Features
+- **Internal DHT Peer Discovery**: Added an internal DHT backend with routing-cache support, peer announce support, dual-stack discovery hints, and health data in status snapshots.
+- **DHT Activity Visibility**: Added DHT wave and peer-yield visibility in the TUI so discovery behavior is easier to monitor while torrents are running.
+- **Configuration Path Reporting**: Added effective config path reporting to make standalone and shared runtime locations easier to verify.
+
+### ✨ Improvements
+- **Smarter Peer Discovery Scheduling**: Improved DHT demand planning, fairness, no-peer backoff, crawl reuse, and peer-slot pressure handling so discovery work stays useful without overpowering active peer traffic.
+- **More Reliable DHT Startup and Reconfiguration**: DHT startup now falls back more safely when a runtime cannot bind, and port reconfigure/rebind paths release old sockets more predictably.
+- **Quieter Runtime Logs**: Reduced repeated startup and shared-config logging, removed noisy metrics journaling logs, and kept concise startup/revision signals for operators.
+- **TUI Usability Polish**: Restored vim-style right navigation, fixed dynamic table sorting, refined autosort pin behavior, and simplified the footer FPS display.
+
+### 🐛 Bug Fixes
+- **Skipped File Safety**: Existing skipped files are no longer resized during allocation, protecting user-skipped data from unwanted truncation or expansion.
+- **DHT Recovery Correctness**: Fixed stale empty lookups, failed rebind handling, reset peer-slot pressure resend, finished lookup handles, and metadata edge cases.
+- **DHT Status Accuracy**: Disabled or no-runtime DHT status now preserves configured bootstrap counts and reports responsive bootstrap nodes uniquely by address family.
+- **Protocol and Catalog Hardening**: Hardened DHT KRPC decoding, public identity selection, announce-token behavior under pressure, and catalog recovery from torrent contents.
+
 ## Release v1.0.5
 ### 🚀 New Features
 - **Torrent Files Panel**: Added a dedicated files view so you can inspect a torrent’s file tree, follow cleaner relative paths, and watch live per-file activity as downloads and uploads run.
