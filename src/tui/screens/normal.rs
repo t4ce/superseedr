@@ -74,6 +74,10 @@ const FOOTER_STATUS_GUTTER: u16 = 2;
 const ASCII_TREE_DIR_ICON: &str = "> ";
 const ASCII_TREE_FILE_ICON: &str = "  ";
 const FILE_ACTIVITY_HIGHLIGHT_WINDOW: Duration = Duration::from_millis(1800);
+const DISK_HEALTH_ORB_SIZE_SCALE: f64 = 1.35;
+const DISK_HEALTH_ORB_CELL_Y_ASPECT: f64 = 2.0;
+const DISK_HEALTH_ORB_BRAILLE_BITS: [[u8; 2]; 4] =
+    [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
 
 fn build_time_aligned_window(
     points: &[NetworkHistoryPoint],
@@ -1268,12 +1272,18 @@ fn format_measured_fps(fps: f64) -> String {
 }
 
 pub(crate) fn footer_fps_label(app_state: &AppState) -> String {
-    let target_fps = app_state.data_rate.fps_label();
+    let target_fps = app_state.data_rate.target_fps();
+    let target_label = app_state.data_rate.fps_label();
     match app_state.ui.measured_fps {
         Some(measured_fps) if measured_fps.is_finite() => {
-            format!("{}/{} fps", format_measured_fps(measured_fps), target_fps)
+            let measured_label = format_measured_fps(measured_fps);
+            if measured_fps >= target_fps || measured_label == target_label {
+                format!("{target_label} fps")
+            } else {
+                format!("{measured_label}/{target_label} fps")
+            }
         }
-        _ => format!("{target_fps} fps"),
+        _ => format!("{target_label} fps"),
     }
 }
 
@@ -4021,64 +4031,105 @@ fn compute_throughput_gap(app_state: &AppState) -> f64 {
     (net_total_bps.saturating_sub(disk_total_bps) as f64 / net_total_bps as f64).clamp(0.0, 1.0)
 }
 
-fn draw_disk_health_orb(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &ThemeContext) {
-    if area.width < 2 || area.height < 2 {
-        return;
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DiskHealthOrbLayout {
+    area: Rect,
+    visual_radius: f64,
+    center_y_offset_rows: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DiskHealthOrbGeometry {
+    visual_width: f64,
+    visual_height: f64,
+    visual_radius: f64,
+    visual_center_x: f64,
+    visual_center_y: f64,
+}
+
+fn disk_health_orb_layout(area: Rect) -> Option<DiskHealthOrbLayout> {
+    if area.width < 3 || area.height < 3 {
+        return None;
     }
 
-    let health = app_state
-        .disk_health_ema
-        .max(app_state.disk_health_peak_hold)
-        .clamp(0.0, 1.0);
-    let deform_profile = disk_health_deform_profile(app_state.disk_health_state_level);
-    let gap = compute_throughput_gap(app_state);
-    let phase = app_state.disk_health_phase;
-
-    let orb_color = disk_health_status_color(ctx, app_state.disk_health_state_level);
-    let has_disk_speed_activity =
-        app_state.avg_disk_read_bps > 0 || app_state.avg_disk_write_bps > 0;
-    let orb_style = if has_disk_speed_activity {
-        ctx.apply(Style::default().fg(orb_color))
-    } else {
-        ctx.apply(Style::default().fg(orb_color).dim())
-    };
-
-    let max_square = area.width.min(area.height);
-    if max_square < 3 {
-        return;
+    let visual_diameter = (area.width.min(area.height) as f64 * DISK_HEALTH_ORB_SIZE_SCALE)
+        .min(area.width as f64)
+        .min(area.height as f64 * DISK_HEALTH_ORB_CELL_Y_ASPECT);
+    let base_width = (visual_diameter.ceil() as u16).clamp(3, area.width);
+    let base_height =
+        ((visual_diameter / DISK_HEALTH_ORB_CELL_Y_ASPECT).ceil() as u16).clamp(3, area.height);
+    let base_x_slack = area.width.saturating_sub(base_width);
+    let base_y_slack = area.height.saturating_sub(base_height);
+    let mut width = base_width
+        .saturating_add(2.min(base_x_slack))
+        .min(area.width);
+    if width % 2 != area.width % 2 && width < area.width {
+        width += 1;
     }
-    let side = ((max_square as f32) * 1.0).round() as u16;
-    let side = side.clamp(3, max_square);
-    let orb_area = Rect::new(
-        area.x + (area.width.saturating_sub(side)) / 2,
-        area.y + (area.height.saturating_sub(side)) / 2,
-        side,
-        side,
-    );
+    let height = base_height
+        .saturating_add(base_y_slack % 2)
+        .min(area.height);
 
-    let cells_w = orb_area.width as usize;
-    let cells_h = orb_area.height as usize;
-    let mut lines: Vec<Line> = Vec::with_capacity(cells_h);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y_slack = area.height.saturating_sub(height);
+    let ideal_y_padding = f64::from(y_slack) / 2.0;
+    let y_padding = ideal_y_padding.floor() as u16;
+    let center_y_offset_rows = ideal_y_padding - f64::from(y_padding);
+    let y = area.y + y_padding;
 
-    const BRAILLE_BITS: [[u8; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
+    Some(DiskHealthOrbLayout {
+        area: Rect::new(x, y, width, height),
+        visual_radius: (visual_diameter * 0.5).max(1.0),
+        center_y_offset_rows,
+    })
+}
+
+fn disk_health_orb_geometry(layout: DiskHealthOrbLayout) -> DiskHealthOrbGeometry {
+    let visual_width = layout.area.width as f64;
+    let visual_height = layout.area.height as f64 * DISK_HEALTH_ORB_CELL_Y_ASPECT;
+    let visual_radius = layout.visual_radius;
+    let visual_center_x = visual_width * 0.5;
+    let visual_center_y =
+        visual_height * 0.5 + layout.center_y_offset_rows * DISK_HEALTH_ORB_CELL_Y_ASPECT;
+
+    DiskHealthOrbGeometry {
+        visual_width,
+        visual_height,
+        visual_radius,
+        visual_center_x,
+        visual_center_y,
+    }
+}
+
+fn build_disk_health_orb_rows(
+    layout: DiskHealthOrbLayout,
+    health: f64,
+    deform_profile: DiskDeformProfile,
+    gap: f64,
+    phase: f64,
+) -> Vec<String> {
+    let cells_w = layout.area.width as usize;
+    let cells_h = layout.area.height as usize;
+    let mut rows: Vec<String> = Vec::with_capacity(cells_h);
+    let geometry = disk_health_orb_geometry(layout);
 
     for cy in 0..cells_h {
         let mut row = String::with_capacity(cells_w);
         for cx in 0..cells_w {
             let mut bits: u8 = 0;
-            for (sy, braille_row) in BRAILLE_BITS.iter().enumerate() {
+            for (sy, braille_row) in DISK_HEALTH_ORB_BRAILLE_BITS.iter().enumerate() {
                 for (sx, &bit) in braille_row.iter().enumerate() {
                     let px = cx as f64 + (sx as f64 + 0.5) / 2.0;
                     let py = cy as f64 + (sy as f64 + 0.5) / 4.0;
 
-                    let nx = ((px / cells_w as f64) - 0.5) * 2.0;
-                    let ny = ((py / cells_h as f64) - 0.5) * 2.0;
+                    let nx = (px - geometry.visual_center_x) / geometry.visual_radius;
+                    let ny = ((py * DISK_HEALTH_ORB_CELL_Y_ASPECT) - geometry.visual_center_y)
+                        / geometry.visual_radius;
 
                     // Keep gap-driven deformation centered by applying horizontal squeeze symmetrically.
                     let squeeze = (1.0 - (0.22 * gap)).max(0.35);
                     let x = nx / squeeze;
-                    // Terminal cells are usually taller than they are wide; compensate to keep a round shape.
-                    let y = ny * (cells_w as f64 / cells_h as f64).clamp(0.6, 1.8) * 2.0;
+                    let y = ny;
                     let theta = y.atan2(x);
                     let dist = (x * x + y * y).sqrt();
 
@@ -4110,8 +4161,43 @@ fn draw_disk_health_orb(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &T
                 char::from_u32(0x2800 + bits as u32).unwrap_or(' ')
             });
         }
-        lines.push(Line::from(Span::styled(row, orb_style)));
+        rows.push(row);
     }
+
+    rows
+}
+
+fn draw_disk_health_orb(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &ThemeContext) {
+    if area.width < 2 || area.height < 2 {
+        return;
+    }
+
+    let health = app_state
+        .disk_health_ema
+        .max(app_state.disk_health_peak_hold)
+        .clamp(0.0, 1.0);
+    let deform_profile = disk_health_deform_profile(app_state.disk_health_state_level);
+    let gap = compute_throughput_gap(app_state);
+    let phase = app_state.disk_health_phase;
+
+    let orb_color = disk_health_status_color(ctx, app_state.disk_health_state_level);
+    let has_disk_speed_activity =
+        app_state.avg_disk_read_bps > 0 || app_state.avg_disk_write_bps > 0;
+    let orb_style = if has_disk_speed_activity {
+        ctx.apply(Style::default().fg(orb_color))
+    } else {
+        ctx.apply(Style::default().fg(orb_color).dim())
+    };
+
+    let Some(orb_layout) = disk_health_orb_layout(area) else {
+        return;
+    };
+    let orb_area = orb_layout.area;
+
+    let lines = build_disk_health_orb_rows(orb_layout, health, deform_profile, gap, phase)
+        .into_iter()
+        .map(|row| Line::from(Span::styled(row, orb_style)))
+        .collect::<Vec<_>>();
 
     f.render_widget(Paragraph::new(lines), orb_area);
 }
@@ -7872,6 +7958,107 @@ mod tests {
         assert_eq!(disk_health_state_word(2), "Strain");
         assert_eq!(disk_health_state_word(3), "Chaos");
         assert_eq!(disk_health_state_word(9), "Chaos");
+    }
+
+    #[test]
+    fn disk_health_orb_layout_scales_box_without_exceeding_panel() {
+        let layout =
+            disk_health_orb_layout(Rect::new(10, 20, 28, 12)).expect("panel should fit the orb");
+
+        assert_eq!(layout.area, Rect::new(14, 21, 20, 10));
+        assert!((layout.visual_radius - 8.1).abs() < 0.000_001);
+        assert_eq!(layout.center_y_offset_rows, 0.0);
+    }
+
+    #[test]
+    fn disk_health_orb_layout_skips_tiny_panels() {
+        assert_eq!(disk_health_orb_layout(Rect::new(0, 0, 2, 8)), None);
+        assert_eq!(disk_health_orb_layout(Rect::new(0, 0, 8, 2)), None);
+    }
+
+    fn disk_health_orb_dot_points(rows: &[String]) -> Vec<(usize, usize)> {
+        let mut points = Vec::new();
+
+        for (cell_y, row) in rows.iter().enumerate() {
+            for (cell_x, ch) in row.chars().enumerate() {
+                let code = ch as u32;
+                if !(0x2801..=0x28ff).contains(&code) {
+                    continue;
+                }
+
+                let cell_bits = (code - 0x2800) as u8;
+                for (dot_y, braille_row) in DISK_HEALTH_ORB_BRAILLE_BITS.iter().enumerate() {
+                    for (dot_x, &bit) in braille_row.iter().enumerate() {
+                        if cell_bits & bit != 0 {
+                            points.push((cell_x * 2 + dot_x, cell_y * 4 + dot_y));
+                        }
+                    }
+                }
+            }
+        }
+
+        points
+    }
+
+    fn disk_health_orb_dot_bounds(points: &[(usize, usize)]) -> (usize, usize, usize, usize) {
+        points.iter().fold(
+            (usize::MAX, 0usize, usize::MAX, 0usize),
+            |(min_x, max_x, min_y, max_y), &(x, y)| {
+                (min_x.min(x), max_x.max(x), min_y.min(y), max_y.max(y))
+            },
+        )
+    }
+
+    #[test]
+    fn disk_health_orb_layout_center_matches_panel_center() {
+        let panel = Rect::new(10, 20, 28, 12);
+        let layout = disk_health_orb_layout(panel).expect("panel should fit the orb");
+        let geometry = disk_health_orb_geometry(layout);
+
+        let absolute_center_x = f64::from(layout.area.x - panel.x) + geometry.visual_center_x;
+        let absolute_center_y = f64::from(layout.area.y - panel.y) * DISK_HEALTH_ORB_CELL_Y_ASPECT
+            + geometry.visual_center_y;
+
+        assert_eq!(absolute_center_x, f64::from(panel.width) * 0.5);
+        assert_eq!(
+            absolute_center_y,
+            f64::from(panel.height) * DISK_HEALTH_ORB_CELL_Y_ASPECT * 0.5
+        );
+    }
+
+    #[test]
+    fn disk_health_orb_stable_points_are_centered_and_not_clipped() {
+        let panel = Rect::new(10, 20, 28, 12);
+        let layout = disk_health_orb_layout(panel).expect("panel should fit the orb");
+        let rows = build_disk_health_orb_rows(layout, 0.0, disk_health_deform_profile(0), 0.0, 0.0);
+        let points = disk_health_orb_dot_points(&rows);
+        assert!(!points.is_empty(), "stable orb should render dots");
+
+        let (min_x, max_x, min_y, max_y) = disk_health_orb_dot_bounds(&points);
+        assert!(min_x > 0, "left edge should have breathing room");
+        assert!(min_y > 0, "top edge should have breathing room");
+        assert!(
+            max_x < layout.area.width as usize * 2 - 1,
+            "right edge should not be clipped"
+        );
+        assert!(
+            max_y < layout.area.height as usize * 4 - 1,
+            "bottom edge should not be clipped"
+        );
+
+        let absolute_center_x_twice = (layout.area.x - panel.x) as usize * 4 + min_x + max_x + 1;
+        let target_center_x_twice = panel.width as usize * 2;
+        let absolute_center_y_twice = (layout.area.y - panel.y) as usize * 8 + min_y + max_y + 1;
+        let target_center_y_twice = panel.height as usize * 4;
+
+        assert!(
+            absolute_center_x_twice.abs_diff(target_center_x_twice) <= 1,
+            "horizontal dot bounds should center on calculated panel center"
+        );
+        assert!(
+            absolute_center_y_twice.abs_diff(target_center_y_twice) <= 1,
+            "vertical dot bounds should center on calculated panel center"
+        );
     }
 
     #[test]

@@ -448,6 +448,10 @@ fn prune_stale_recent_file_activity(
 }
 
 fn compute_disk_health_raw(app_state: &AppState) -> f64 {
+    if !has_current_disk_health_signal(app_state) {
+        return 0.0;
+    }
+
     let net_total_bps = app_state.avg_download_history.last().copied().unwrap_or(0)
         + app_state.avg_upload_history.last().copied().unwrap_or(0);
     let disk_total_bps = app_state.avg_disk_read_bps + app_state.avg_disk_write_bps;
@@ -474,6 +478,10 @@ fn compute_disk_health_raw(app_state: &AppState) -> f64 {
 }
 
 fn compute_disk_state_score(app_state: &AppState) -> f64 {
+    if !has_current_disk_health_signal(app_state) {
+        return 0.0;
+    }
+
     let net_total_bps = app_state.avg_download_history.last().copied().unwrap_or(0)
         + app_state.avg_upload_history.last().copied().unwrap_or(0);
     let disk_total_bps = app_state.avg_disk_read_bps + app_state.avg_disk_write_bps;
@@ -505,6 +513,14 @@ fn compute_disk_state_score(app_state: &AppState) -> f64 {
         score = score.max(0.80);
     }
     score
+}
+
+fn has_current_disk_health_signal(app_state: &AppState) -> bool {
+    app_state.avg_disk_read_bps > 0
+        || app_state.avg_disk_write_bps > 0
+        || app_state.read_iops > 0
+        || app_state.write_iops > 0
+        || app_state.max_disk_backoff_this_tick_ms > 0
 }
 
 fn update_disk_health_state_level(app_state: &mut AppState) {
@@ -923,6 +939,30 @@ mod tests {
             app_state.disk_health_ema
         );
         assert!(app_state.disk_health_peak_hold >= app_state.disk_health_ema);
+    }
+
+    #[test]
+    fn disk_health_state_ignores_stale_pressure_when_disk_is_idle() {
+        let mut app_state = AppState {
+            disk_health_state_level: 1,
+            disk_health_ema: 0.55,
+            disk_health_peak_hold: 0.70,
+            avg_download_history: vec![100_000_000],
+            avg_upload_history: vec![20_000_000],
+            avg_disk_read_bps: 0,
+            avg_disk_write_bps: 0,
+            global_disk_thrash_score: 18.0,
+            adaptive_max_scpb: 10.0,
+            avg_disk_write_latency: Duration::from_millis(20),
+            max_disk_backoff_this_tick_ms: 0,
+            ..Default::default()
+        };
+
+        assert_eq!(compute_disk_health_raw(&app_state), 0.0);
+        update_disk_health_state(&mut app_state);
+
+        assert_eq!(app_state.disk_health_state_level, 0);
+        assert!(app_state.disk_health_ema < 0.55);
     }
 
     #[test]

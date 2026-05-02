@@ -163,6 +163,9 @@ const NORMAL_IDLE_FRAME_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 const NORMAL_ANIMATION_RECENT_BLOCK_ROWS: usize = 64;
 const NORMAL_ANIMATION_RECENT_PEER_EVENTS: usize = 120;
 const NORMAL_ANIMATION_FILE_ACTIVITY_WINDOW: Duration = Duration::from_secs(4);
+const DISK_IDLE_WOBBLE_PHASE_SPEED: f64 = 0.45;
+const DISK_MIN_TRANSFER_PHASE_SPEED: f64 = 0.80;
+const DISK_MAX_TRANSFER_PHASE_SPEED: f64 = 5.20;
 const BITTORRENT_PROTOCOL_STR: &[u8] = b"BitTorrent protocol";
 
 pub struct ListenerSet {
@@ -384,8 +387,8 @@ impl DataRate {
         }
     }
 
-    pub fn frame_interval(self) -> Duration {
-        let target_fps = match self {
+    pub fn target_fps(self) -> f64 {
+        match self {
             DataRate::RateQuarter => 0.25,
             DataRate::RateHalf => 0.5,
             DataRate::Rate1s => 1.0,
@@ -395,8 +398,11 @@ impl DataRate {
             DataRate::Rate20s => 20.0,
             DataRate::Rate30s => 30.0,
             DataRate::Rate60s => 60.0,
-        };
-        Duration::from_secs_f64(1.0 / target_fps)
+        }
+    }
+
+    pub fn frame_interval(self) -> Duration {
+        Duration::from_secs_f64(1.0 / self.target_fps())
     }
 
     /// Cycles to the next (slower) data rate (lower FPS).
@@ -3163,10 +3169,7 @@ impl App {
             return true;
         }
 
-        if app_state.disk_health_state_level > 0
-            || app_state.disk_health_ema > 0.01
-            || app_state.disk_health_peak_hold > 0.01
-        {
+        if Self::disk_health_has_current_signal(app_state) {
             return true;
         }
 
@@ -3179,6 +3182,40 @@ impl App {
             .get(app_state.ui.selected_torrent_index)
             .and_then(|info_hash| app_state.torrents.get(info_hash))
             .is_some_and(|torrent| Self::selected_torrent_animation_active(torrent, now))
+    }
+
+    fn disk_health_has_current_signal(app_state: &AppState) -> bool {
+        app_state.avg_disk_read_bps > 0
+            || app_state.avg_disk_write_bps > 0
+            || app_state.read_iops > 0
+            || app_state.write_iops > 0
+            || app_state.max_disk_backoff_this_tick_ms > 0
+    }
+
+    fn disk_health_phase_speed(app_state: &AppState) -> f64 {
+        let download_bps = app_state.avg_download_history.last().copied().unwrap_or(0) as f64;
+        let upload_bps = app_state.avg_upload_history.last().copied().unwrap_or(0) as f64;
+        let total_bps = download_bps + upload_bps;
+
+        if total_bps <= 0.0 {
+            return DISK_IDLE_WOBBLE_PHASE_SPEED;
+        }
+
+        let transfer_signal = (total_bps / 50_000_000.0).clamp(0.0, 1.0).sqrt();
+        let balance = ((download_bps - upload_bps) / total_bps).clamp(-1.0, 1.0);
+        let direction = if balance < -0.05 { -1.0 } else { 1.0 };
+        let dominance = balance.abs();
+        let disk_pressure = app_state
+            .disk_health_ema
+            .max(app_state.disk_health_peak_hold)
+            .clamp(0.0, 1.0);
+        let speed = (DISK_MIN_TRANSFER_PHASE_SPEED
+            + 1.60 * transfer_signal
+            + 1.40 * dominance
+            + 1.40 * disk_pressure)
+            .min(DISK_MAX_TRANSFER_PHASE_SPEED);
+
+        direction * speed
     }
 
     fn dht_wave_animation_active(
@@ -3334,12 +3371,7 @@ impl App {
         self.app_state.ui.file_activity_download_phase += frame_dt * download_steps_per_second;
         self.app_state.ui.file_activity_upload_phase += frame_dt * upload_steps_per_second;
 
-        let disk_activity = self
-            .app_state
-            .disk_health_ema
-            .max(self.app_state.disk_health_peak_hold)
-            .clamp(0.0, 1.0);
-        let disk_phase_speed = 1.6 + 5.0 * disk_activity;
+        let disk_phase_speed = Self::disk_health_phase_speed(&self.app_state);
         self.app_state.disk_health_phase = (self.app_state.disk_health_phase
             + frame_dt * disk_phase_speed)
             .rem_euclid(std::f64::consts::TAU);
@@ -7488,6 +7520,83 @@ mod tests {
             None,
             Instant::now()
         ));
+    }
+
+    #[test]
+    fn normal_animation_gate_ignores_held_disk_health_when_disk_is_idle() {
+        let app_state = AppState {
+            disk_health_state_level: 1,
+            disk_health_ema: 0.55,
+            disk_health_peak_hold: 0.70,
+            ..Default::default()
+        };
+
+        assert!(!App::normal_mode_animation_active(
+            &app_state,
+            None,
+            Instant::now()
+        ));
+    }
+
+    #[test]
+    fn normal_animation_gate_detects_current_disk_activity() {
+        let app_state = AppState {
+            avg_disk_read_bps: 1,
+            ..Default::default()
+        };
+
+        assert!(App::normal_mode_animation_active(
+            &app_state,
+            None,
+            Instant::now()
+        ));
+    }
+
+    #[test]
+    fn disk_health_phase_speed_keeps_idle_wobble_without_transfers() {
+        let app_state = AppState::default();
+
+        assert_eq!(
+            App::disk_health_phase_speed(&app_state),
+            super::DISK_IDLE_WOBBLE_PHASE_SPEED
+        );
+    }
+
+    #[test]
+    fn disk_health_phase_speed_uses_download_upload_direction() {
+        let download_dominant = AppState {
+            avg_download_history: vec![90_000_000],
+            avg_upload_history: vec![10_000_000],
+            ..Default::default()
+        };
+        let upload_dominant = AppState {
+            avg_download_history: vec![10_000_000],
+            avg_upload_history: vec![90_000_000],
+            ..Default::default()
+        };
+
+        assert!(App::disk_health_phase_speed(&download_dominant) > 0.0);
+        assert!(App::disk_health_phase_speed(&upload_dominant) < 0.0);
+    }
+
+    #[test]
+    fn disk_health_phase_speed_increases_with_pressure() {
+        let calm = AppState {
+            avg_download_history: vec![40_000_000],
+            avg_upload_history: vec![0],
+            disk_health_ema: 0.0,
+            disk_health_peak_hold: 0.0,
+            ..Default::default()
+        };
+        let pressured = AppState {
+            avg_download_history: vec![40_000_000],
+            avg_upload_history: vec![0],
+            disk_health_ema: 0.8,
+            disk_health_peak_hold: 0.0,
+            ..Default::default()
+        };
+
+        assert!(App::disk_health_phase_speed(&pressured) > App::disk_health_phase_speed(&calm));
     }
 
     #[test]
