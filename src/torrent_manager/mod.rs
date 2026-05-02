@@ -24,6 +24,8 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::watch;
 use tokio::time::Duration;
 
+#[cfg(feature = "synthetic-load")]
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -153,6 +155,8 @@ pub enum ManagerEvent {
 
 #[derive(Debug, Clone)]
 pub enum ManagerCommand {
+    #[cfg(feature = "synthetic-load")]
+    ConnectToPeer(SocketAddr),
     ProbeFileBatch {
         epoch: u64,
         start_file_index: usize,

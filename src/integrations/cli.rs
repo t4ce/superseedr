@@ -203,6 +203,14 @@ pub enum SyntheticLoadMode {
 }
 
 #[cfg(feature = "synthetic-load")]
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyntheticLoadAddMode {
+    Upfront,
+    Burst,
+    Staggered,
+}
+
+#[cfg(feature = "synthetic-load")]
 #[derive(Args, Debug, Clone)]
 pub struct SyntheticLoadArgs {
     #[arg(long, default_value_t = 1, help = "Number of synthetic torrents")]
@@ -215,6 +223,44 @@ pub struct SyntheticLoadArgs {
     pub peers: usize,
     #[arg(long, value_enum, default_value_t = SyntheticLoadMode::Download)]
     pub mode: SyntheticLoadMode,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = SyntheticLoadAddMode::Upfront,
+        help = "When synthetic torrent managers are added to the run"
+    )]
+    pub add_mode: SyntheticLoadAddMode,
+    #[arg(
+        long,
+        default_value_t = 1000,
+        help = "Delay between staggered synthetic torrent add batches"
+    )]
+    pub add_interval_ms: u64,
+    #[arg(
+        long,
+        default_value_t = 1,
+        help = "Number of synthetic torrents per staggered add batch"
+    )]
+    pub add_burst_size: usize,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = SyntheticLoadAddMode::Upfront,
+        help = "When synthetic peers are added after each torrent is active"
+    )]
+    pub peer_add_mode: SyntheticLoadAddMode,
+    #[arg(
+        long,
+        default_value_t = 1000,
+        help = "Delay between staggered synthetic peer add batches"
+    )]
+    pub peer_add_interval_ms: u64,
+    #[arg(
+        long,
+        default_value_t = 1,
+        help = "Number of synthetic peers per staggered peer add batch"
+    )]
+    pub peer_add_burst_size: usize,
     #[arg(long, default_value = "256MiB")]
     pub size_per_torrent: String,
     #[arg(long, default_value = "256KiB")]

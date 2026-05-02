@@ -2647,6 +2647,10 @@ impl TorrentManager {
                 Some(manager_command) = self.manager_command_rx.recv() => {
                     event!(Level::TRACE, ?manager_command);
                     match manager_command {
+                        #[cfg(feature = "synthetic-load")]
+                        ManagerCommand::ConnectToPeer(peer_addr) => {
+                            self.connect_to_peer(peer_addr);
+                        }
                         ManagerCommand::ProbeFileBatch {
                             epoch,
                             start_file_index,

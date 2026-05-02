@@ -3,7 +3,7 @@
 
 use crate::app::TorrentMetrics;
 use crate::config::Settings;
-use crate::integrations::cli::{SyntheticLoadArgs, SyntheticLoadMode};
+use crate::integrations::cli::{SyntheticLoadAddMode, SyntheticLoadArgs, SyntheticLoadMode};
 use crate::networking::protocol::{generate_message, Message};
 use crate::resource_manager::{
     ResourceManager, ResourceManagerClient, ResourceManagerSnapshot, ResourceType, ResourceUsage,
@@ -88,10 +88,201 @@ struct RunTopology {
     upload_peers: usize,
 }
 
+#[derive(Clone, Copy)]
+struct AddPlan {
+    mode: SyntheticLoadAddMode,
+    interval: Duration,
+    burst_size: usize,
+}
+
+impl AddPlan {
+    fn from_args(args: &SyntheticLoadArgs) -> Self {
+        Self {
+            mode: args.add_mode,
+            interval: Duration::from_millis(args.add_interval_ms),
+            burst_size: args.add_burst_size,
+        }
+    }
+
+    fn target_added(self, elapsed: Duration, total_torrents: usize) -> usize {
+        match self.mode {
+            SyntheticLoadAddMode::Upfront => total_torrents,
+            SyntheticLoadAddMode::Burst => total_torrents,
+            SyntheticLoadAddMode::Staggered => {
+                let completed_intervals = elapsed.as_millis() / self.interval.as_millis().max(1);
+                let batches_due = completed_intervals as usize + 1;
+                batches_due
+                    .saturating_mul(self.burst_size)
+                    .min(total_torrents)
+            }
+        }
+    }
+}
+
+struct AddContext<'a> {
+    specs: &'a [SyntheticTorrentSpec],
+    topology: RunTopology,
+    download_root: PathBuf,
+    upload_root: PathBuf,
+    harness: &'a HarnessContext,
+    plan: AddPlan,
+    peer_plan: AddPlan,
+    peer_ramps: Vec<PeerRamp>,
+    leecher_pipeline: usize,
+    next_torrent: usize,
+}
+
+impl AddContext<'_> {
+    async fn add_due_torrents(
+        &mut self,
+        elapsed: Duration,
+        managers: &mut Vec<ManagerRuntime>,
+        peer_handles: &mut Vec<JoinHandle<()>>,
+    ) -> Result<(), DynError> {
+        let target = self.plan.target_added(elapsed, self.specs.len());
+        self.add_until(target, elapsed, managers, peer_handles)
+            .await
+    }
+
+    async fn add_until(
+        &mut self,
+        target: usize,
+        elapsed: Duration,
+        managers: &mut Vec<ManagerRuntime>,
+        peer_handles: &mut Vec<JoinHandle<()>>,
+    ) -> Result<(), DynError> {
+        let target = target.min(self.specs.len());
+        while self.next_torrent < target {
+            let spec = &self.specs[self.next_torrent];
+            if self.topology.download_peers > 0 {
+                let setup = start_download_torrent(
+                    spec,
+                    self.specs.len(),
+                    self.topology.download_peers,
+                    &self.download_root,
+                    self.harness,
+                    elapsed,
+                )
+                .await?;
+                managers.extend(setup.managers);
+                peer_handles.extend(setup.peer_handles);
+                self.peer_ramps.extend(setup.peer_ramps);
+            }
+            if self.topology.upload_peers > 0 {
+                let setup = start_upload_torrent(
+                    spec,
+                    self.specs.len(),
+                    self.topology.upload_peers,
+                    &self.upload_root,
+                    self.harness,
+                    self.leecher_pipeline,
+                    elapsed,
+                )
+                .await?;
+                managers.extend(setup.managers);
+                peer_handles.extend(setup.peer_handles);
+                self.peer_ramps.extend(setup.peer_ramps);
+            }
+            self.next_torrent += 1;
+        }
+        Ok(())
+    }
+
+    async fn add_due_peers(
+        &mut self,
+        elapsed: Duration,
+        peer_handles: &mut Vec<JoinHandle<()>>,
+    ) -> Result<(), DynError> {
+        for ramp in &mut self.peer_ramps {
+            ramp.add_due_peers(elapsed, self.peer_plan, self.harness, peer_handles)
+                .await?;
+        }
+        Ok(())
+    }
+
+    fn active_peers(&self) -> usize {
+        self.peer_ramps.iter().map(PeerRamp::active_peers).sum()
+    }
+}
+
+enum PeerRampRole {
+    DownloadSeeder {
+        command_tx: mpsc::Sender<ManagerCommand>,
+    },
+    UploadLeecher {
+        addr: SocketAddr,
+        leecher_pipeline: usize,
+    },
+}
+
+struct PeerRamp {
+    spec: SyntheticTorrentSpec,
+    peer_indices: Vec<usize>,
+    next_peer: usize,
+    added_at: Duration,
+    role: PeerRampRole,
+}
+
+impl PeerRamp {
+    async fn add_due_peers(
+        &mut self,
+        elapsed: Duration,
+        plan: AddPlan,
+        harness: &HarnessContext,
+        peer_handles: &mut Vec<JoinHandle<()>>,
+    ) -> Result<(), DynError> {
+        let peer_elapsed = elapsed.checked_sub(self.added_at).unwrap_or_default();
+        let target = plan.target_added(peer_elapsed, self.peer_indices.len());
+        while self.next_peer < target {
+            let peer_index = self.peer_indices[self.next_peer];
+            match &self.role {
+                PeerRampRole::DownloadSeeder { command_tx } => {
+                    let (addr, handle) = spawn_synthetic_seeder(
+                        self.spec.clone(),
+                        peer_index,
+                        harness.counters.clone(),
+                        harness.shutdown_tx.clone(),
+                    )
+                    .await?;
+                    peer_handles.push(handle);
+                    command_tx
+                        .send(ManagerCommand::ConnectToPeer(addr))
+                        .await
+                        .map_err(|_| -> DynError {
+                            "failed to schedule synthetic peer connection".into()
+                        })?;
+                }
+                PeerRampRole::UploadLeecher {
+                    addr,
+                    leecher_pipeline,
+                } => {
+                    let handle = tokio::spawn(run_synthetic_leecher(
+                        self.spec.clone(),
+                        peer_index,
+                        *addr,
+                        *leecher_pipeline,
+                        harness.counters.clone(),
+                        harness.shutdown_tx.subscribe(),
+                    ));
+                    peer_handles.push(handle);
+                }
+            }
+            self.next_peer += 1;
+        }
+        Ok(())
+    }
+
+    fn active_peers(&self) -> usize {
+        self.next_peer
+    }
+}
+
 #[derive(Serialize)]
 struct SyntheticSample {
     elapsed_ms: u128,
     phase: &'static str,
+    active_torrents: u64,
+    active_peers: u64,
     download_bytes_total: u64,
     upload_bytes_total: u64,
     download_bps: u64,
@@ -120,10 +311,18 @@ struct SyntheticSample {
 struct SyntheticSummary {
     run_id: String,
     mode: String,
+    add_mode: String,
+    peer_add_mode: String,
     torrents: usize,
+    torrents_added: usize,
+    peers_added: usize,
     requested_peers: usize,
     download_peers: usize,
     upload_peers: usize,
+    add_interval_ms: u64,
+    add_burst_size: usize,
+    peer_add_interval_ms: u64,
+    peer_add_burst_size: usize,
     size_per_torrent_bytes: u64,
     piece_size_bytes: u64,
     duration_secs: u64,
@@ -176,6 +375,12 @@ pub async fn run(args: &SyntheticLoadArgs, json_output: bool) -> Result<(), DynE
     let (harness_shutdown_tx, _) = broadcast::channel::<()>(16);
     let (resource_shutdown_tx, _) = broadcast::channel::<()>(1);
     let topology = topology_for(args.mode, args.peers, args.torrents)?;
+    let add_plan = AddPlan::from_args(args);
+    let peer_plan = AddPlan {
+        mode: args.peer_add_mode,
+        interval: Duration::from_millis(args.peer_add_interval_ms),
+        burst_size: args.peer_add_burst_size,
+    };
     let resource_manager = build_resource_manager(args, topology, resource_shutdown_tx.clone());
     let resource_client = resource_manager.1.clone();
     tokio::spawn(resource_manager.0.run());
@@ -202,48 +407,56 @@ pub async fn run(args: &SyntheticLoadArgs, json_output: bool) -> Result<(), DynE
 
     let mut managers = Vec::new();
     let mut peer_handles = Vec::new();
+    let download_dir = output_dir.join("data").join("download");
+    let upload_dir = output_dir.join("data").join("upload");
+    let mut add_context = AddContext {
+        specs: &specs,
+        topology,
+        download_root: download_dir.clone(),
+        upload_root: upload_dir.clone(),
+        harness: &harness,
+        plan: add_plan,
+        peer_plan,
+        peer_ramps: Vec::new(),
+        leecher_pipeline: args.leecher_pipeline,
+        next_torrent: 0,
+    };
 
-    if topology.download_peers > 0 {
-        let download_dir = output_dir.join("data").join("download");
-        let download_setup =
-            start_download_side(&specs, topology.download_peers, &download_dir, &harness).await?;
-        managers.extend(download_setup.managers);
-        peer_handles.extend(download_setup.peer_handles);
+    if args.add_mode == SyntheticLoadAddMode::Upfront {
+        add_context
+            .add_until(
+                args.torrents,
+                Duration::ZERO,
+                &mut managers,
+                &mut peer_handles,
+            )
+            .await?;
+        add_context
+            .add_due_peers(Duration::ZERO, &mut peer_handles)
+            .await?;
     }
-
-    if topology.upload_peers > 0 {
-        let upload_dir = output_dir.join("data").join("upload");
-        let upload_setup = start_upload_side(
-            &specs,
-            topology.upload_peers,
-            &upload_dir,
-            &harness,
-            args.leecher_pipeline,
-        )
-        .await?;
-        managers.extend(upload_setup.managers);
-        peer_handles.extend(upload_setup.peer_handles);
-    }
-
-    drop(harness);
 
     let samples_path = output_dir.join("samples.jsonl");
     let mut sample_writer = BufWriter::new(File::create(&samples_path)?);
-    let summary = sample_loop(
+    let summary_result = sample_loop(
         SampleContext {
             args,
             config: &config,
             topology,
+            add_plan,
+            peer_plan,
             run_id: &run_id,
             output_dir: &output_dir,
             counters: counters.clone(),
             resource_client: &resource_client,
-            managers: &managers,
+            managers: &mut managers,
+            peer_handles: &mut peer_handles,
+            add_context,
             json_output,
         },
         &mut sample_writer,
     )
-    .await?;
+    .await;
     sample_writer.flush()?;
 
     shutdown_managers(&mut managers).await;
@@ -253,6 +466,8 @@ pub async fn run(args: &SyntheticLoadArgs, json_output: bool) -> Result<(), DynE
         handle.abort();
     }
     event_handle.abort();
+
+    let summary = summary_result?;
 
     let summary_path = output_dir.join("summary.json");
     tokio::fs::write(&summary_path, serde_json::to_vec_pretty(&summary)?).await?;
@@ -294,6 +509,18 @@ impl ParsedSyntheticConfig {
         if args.leecher_pipeline == 0 {
             return Err("synthetic-load requires --leecher-pipeline greater than 0".into());
         }
+        if args.add_interval_ms == 0 {
+            return Err("synthetic-load requires --add-interval-ms greater than 0".into());
+        }
+        if args.add_burst_size == 0 {
+            return Err("synthetic-load requires --add-burst-size greater than 0".into());
+        }
+        if args.peer_add_interval_ms == 0 {
+            return Err("synthetic-load requires --peer-add-interval-ms greater than 0".into());
+        }
+        if args.peer_add_burst_size == 0 {
+            return Err("synthetic-load requires --peer-add-burst-size greater than 0".into());
+        }
 
         let size_per_torrent = parse_size(&args.size_per_torrent)?;
         let piece_size = parse_size(&args.piece_size)?;
@@ -317,112 +544,94 @@ impl ParsedSyntheticConfig {
 struct SideSetup {
     managers: Vec<ManagerRuntime>,
     peer_handles: Vec<JoinHandle<()>>,
+    peer_ramps: Vec<PeerRamp>,
 }
 
-async fn start_download_side(
-    specs: &[SyntheticTorrentSpec],
+async fn start_download_torrent(
+    spec: &SyntheticTorrentSpec,
+    total_torrents: usize,
     peers: usize,
     data_root: &Path,
     harness: &HarnessContext,
+    added_at: Duration,
 ) -> Result<SideSetup, DynError> {
     tokio::fs::create_dir_all(data_root).await?;
 
-    let mut peer_addrs_by_torrent: Vec<Vec<SocketAddr>> = vec![Vec::new(); specs.len()];
-    let mut peer_handles = Vec::new();
-    for peer_index in 0..peers {
-        let torrent_index = peer_index % specs.len();
-        let spec = specs[torrent_index].clone();
-        let (addr, handle) = spawn_synthetic_seeder(
-            spec,
-            peer_index,
-            harness.counters.clone(),
-            harness.shutdown_tx.clone(),
-        )
-        .await?;
-        peer_addrs_by_torrent[torrent_index].push(addr);
-        peer_handles.push(handle);
-    }
+    let manager = build_manager(
+        spec,
+        data_root.join(format!("torrent_{:04}", spec.index)),
+        false,
+        harness,
+    )?;
+    let (manager, command_tx, metrics_rx) = manager;
+    let handle = tokio::spawn(async move { manager.run(false).await });
+    let peer_indices = peer_indices_for_torrent(peers, total_torrents, spec.index).collect();
+    let peer_ramp = PeerRamp {
+        spec: spec.clone(),
+        peer_indices,
+        next_peer: 0,
+        added_at,
+        role: PeerRampRole::DownloadSeeder {
+            command_tx: command_tx.clone(),
+        },
+    };
 
-    let mut managers = Vec::new();
-    for spec in specs {
-        let manager = build_manager(
-            spec,
-            data_root.join(format!("torrent_{:04}", spec.index)),
-            false,
-            harness,
-        )?;
-        let (mut manager, command_tx, metrics_rx) = manager;
-        for addr in &peer_addrs_by_torrent[spec.index] {
-            manager.connect_to_peer(*addr);
-        }
-        let handle = tokio::spawn(async move { manager.run(false).await });
-        managers.push(ManagerRuntime {
+    Ok(SideSetup {
+        managers: vec![ManagerRuntime {
             command_tx,
             metrics_rx,
             handle,
-        });
-    }
-
-    Ok(SideSetup {
-        managers,
-        peer_handles,
+        }],
+        peer_handles: Vec::new(),
+        peer_ramps: vec![peer_ramp],
     })
 }
 
-async fn start_upload_side(
-    specs: &[SyntheticTorrentSpec],
+async fn start_upload_torrent(
+    spec: &SyntheticTorrentSpec,
+    total_torrents: usize,
     peers: usize,
     data_root: &Path,
     harness: &HarnessContext,
     leecher_pipeline: usize,
+    added_at: Duration,
 ) -> Result<SideSetup, DynError> {
     tokio::fs::create_dir_all(data_root).await?;
 
-    let mut managers = Vec::new();
-    let mut listener_addrs = Vec::new();
-    let mut peer_handles = Vec::new();
+    let torrent_dir = data_root.join(format!("torrent_{:04}", spec.index));
+    prepare_seed_file(spec, &torrent_dir).await?;
+    let (incoming_tx, incoming_rx) = mpsc::channel(MANAGER_CHANNEL_SIZE);
+    let (addr, listener_handle) = spawn_incoming_router(
+        incoming_tx,
+        harness.counters.clone(),
+        harness.shutdown_tx.clone(),
+    )
+    .await?;
 
-    for spec in specs {
-        let torrent_dir = data_root.join(format!("torrent_{:04}", spec.index));
-        prepare_seed_file(spec, &torrent_dir).await?;
-        let (incoming_tx, incoming_rx) = mpsc::channel(MANAGER_CHANNEL_SIZE);
-        let (addr, listener_handle) = spawn_incoming_router(
-            incoming_tx,
-            harness.counters.clone(),
-            harness.shutdown_tx.clone(),
-        )
-        .await?;
-        listener_addrs.push(addr);
-        peer_handles.push(listener_handle);
+    let manager = build_manager_with_incoming(spec, torrent_dir, true, incoming_rx, harness)?;
+    let (manager, command_tx, metrics_rx) = manager;
+    let handle = tokio::spawn(async move { manager.run(false).await });
 
-        let manager = build_manager_with_incoming(spec, torrent_dir, true, incoming_rx, harness)?;
-        let (manager, command_tx, metrics_rx) = manager;
-        let handle = tokio::spawn(async move { manager.run(false).await });
-        managers.push(ManagerRuntime {
+    let peer_indices = peer_indices_for_torrent(peers, total_torrents, spec.index).collect();
+    let peer_ramp = PeerRamp {
+        spec: spec.clone(),
+        peer_indices,
+        next_peer: 0,
+        added_at,
+        role: PeerRampRole::UploadLeecher {
+            addr,
+            leecher_pipeline,
+        },
+    };
+
+    Ok(SideSetup {
+        managers: vec![ManagerRuntime {
             command_tx,
             metrics_rx,
             handle,
-        });
-    }
-
-    for peer_index in 0..peers {
-        let torrent_index = peer_index % specs.len();
-        let spec = specs[torrent_index].clone();
-        let addr = listener_addrs[torrent_index];
-        let handle = tokio::spawn(run_synthetic_leecher(
-            spec,
-            peer_index,
-            addr,
-            leecher_pipeline,
-            harness.counters.clone(),
-            harness.shutdown_tx.subscribe(),
-        ));
-        peer_handles.push(handle);
-    }
-
-    Ok(SideSetup {
-        managers,
-        peer_handles,
+        }],
+        peer_handles: vec![listener_handle],
+        peer_ramps: vec![peer_ramp],
     })
 }
 
@@ -727,11 +936,15 @@ struct SampleContext<'a> {
     args: &'a SyntheticLoadArgs,
     config: &'a ParsedSyntheticConfig,
     topology: RunTopology,
+    add_plan: AddPlan,
+    peer_plan: AddPlan,
     run_id: &'a str,
     output_dir: &'a Path,
     counters: Arc<SyntheticCounters>,
     resource_client: &'a ResourceManagerClient,
-    managers: &'a [ManagerRuntime],
+    managers: &'a mut Vec<ManagerRuntime>,
+    peer_handles: &'a mut Vec<JoinHandle<()>>,
+    add_context: AddContext<'a>,
     json_output: bool,
 }
 
@@ -743,11 +956,15 @@ async fn sample_loop(
         args,
         config,
         topology,
+        add_plan,
+        peer_plan,
         run_id,
         output_dir,
         counters,
         resource_client,
         managers,
+        peer_handles,
+        mut add_context,
         json_output,
     } = context;
 
@@ -766,8 +983,16 @@ async fn sample_loop(
 
     while start.elapsed() < total {
         ticker.tick().await;
-        let now = Instant::now();
-        let elapsed = now.duration_since(start);
+        let mut now = Instant::now();
+        let mut elapsed = now.duration_since(start);
+        add_context
+            .add_due_torrents(elapsed, managers, peer_handles)
+            .await?;
+        add_context.add_due_peers(elapsed, peer_handles).await?;
+        now = Instant::now();
+        elapsed = now.duration_since(start);
+        let active_torrents = add_context.next_torrent;
+        let active_peers = add_context.active_peers();
         let phase = if elapsed < warmup {
             "warmup"
         } else {
@@ -797,6 +1022,8 @@ async fn sample_loop(
         let sample = SyntheticSample {
             elapsed_ms: elapsed.as_millis(),
             phase,
+            active_torrents: active_torrents as u64,
+            active_peers: active_peers as u64,
             download_bytes_total: download_total,
             upload_bytes_total: upload_total,
             download_bps,
@@ -824,12 +1051,14 @@ async fn sample_loop(
 
         if !json_output {
             println!(
-                "[{:>6.1}s {:>7}] down={} up={} peers={} pieces={}/{} disk_q={}/{}",
+                "[{:>6.1}s {:>7}] torrents={} synthetic_peers={} connected={} down={} up={} pieces={}/{} disk_q={}/{}",
                 elapsed.as_secs_f64(),
                 phase,
+                sample.active_torrents,
+                sample.active_peers,
+                sample.connected_peers_reported,
                 format_bps(download_bps),
                 format_bps(upload_bps),
-                sample.connected_peers_reported,
                 sample.completed_pieces,
                 sample.total_pieces,
                 sample.resources.disk_read.queued,
@@ -865,10 +1094,18 @@ async fn sample_loop(
     Ok(SyntheticSummary {
         run_id: run_id.to_string(),
         mode: mode_name(args.mode).to_string(),
+        add_mode: add_mode_name(add_plan.mode).to_string(),
+        peer_add_mode: add_mode_name(peer_plan.mode).to_string(),
         torrents: args.torrents,
+        torrents_added: add_context.next_torrent,
+        peers_added: add_context.active_peers(),
         requested_peers: args.peers,
         download_peers: topology.download_peers,
         upload_peers: topology.upload_peers,
+        add_interval_ms: add_plan.interval.as_millis() as u64,
+        add_burst_size: add_plan.burst_size,
+        peer_add_interval_ms: peer_plan.interval.as_millis() as u64,
+        peer_add_burst_size: peer_plan.burst_size,
         size_per_torrent_bytes: config.size_per_torrent,
         piece_size_bytes: config.piece_size,
         duration_secs: args.duration_secs,
@@ -1291,10 +1528,54 @@ fn mode_name(mode: SyntheticLoadMode) -> &'static str {
     }
 }
 
+fn add_mode_name(mode: SyntheticLoadAddMode) -> &'static str {
+    match mode {
+        SyntheticLoadAddMode::Upfront => "upfront",
+        SyntheticLoadAddMode::Burst => "burst",
+        SyntheticLoadAddMode::Staggered => "staggered",
+    }
+}
+
+fn peer_indices_for_torrent(
+    peers: usize,
+    total_torrents: usize,
+    torrent_index: usize,
+) -> impl Iterator<Item = usize> {
+    (torrent_index..peers).step_by(total_torrents)
+}
+
 fn build_resource_manager(
     args: &SyntheticLoadArgs,
     topology: RunTopology,
     shutdown_tx: broadcast::Sender<()>,
 ) -> (ResourceManager, ResourceManagerClient) {
     ResourceManager::new(build_resource_manager_limits(args, topology), shutdown_tx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staggered_add_plan_advances_by_burst_size() {
+        let plan = AddPlan {
+            mode: SyntheticLoadAddMode::Staggered,
+            interval: Duration::from_millis(500),
+            burst_size: 2,
+        };
+
+        assert_eq!(plan.target_added(Duration::ZERO, 5), 2);
+        assert_eq!(plan.target_added(Duration::from_millis(499), 5), 2);
+        assert_eq!(plan.target_added(Duration::from_millis(500), 5), 4);
+        assert_eq!(plan.target_added(Duration::from_millis(1000), 5), 5);
+    }
+
+    #[test]
+    fn peer_indices_partition_peers_across_torrents() {
+        let partitions: Vec<Vec<usize>> = (0..3)
+            .map(|torrent_index| peer_indices_for_torrent(8, 3, torrent_index).collect())
+            .collect();
+
+        assert_eq!(partitions, vec![vec![0, 3, 6], vec![1, 4, 7], vec![2, 5]]);
+    }
 }
