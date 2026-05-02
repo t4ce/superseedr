@@ -42,6 +42,7 @@ default = ["dht", "pex"]
 # Individual features for conditional compilation
 dht = []
 pex = []
+synthetic-load = []
 
 
 [dev-dependencies]

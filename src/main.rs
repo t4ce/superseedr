@@ -19,6 +19,8 @@ mod networking;
 mod persistence;
 mod resource_manager;
 mod storage;
+#[cfg(feature = "synthetic-load")]
+mod synthetic_load;
 mod telemetry;
 mod theme;
 mod token_bucket;
@@ -750,6 +752,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
         tracing::info!("Show configs command processed, exiting temporary instance.");
+        return Ok(());
+    }
+
+    #[cfg(feature = "synthetic-load")]
+    if let Some(Commands::SyntheticLoad(args)) = cli.command.as_ref() {
+        if let Err(error) = synthetic_load::run(args, cli.json).await {
+            if output_mode == OutputMode::Json {
+                print_json_error(cli_command_name(cli.command.as_ref()), &error.to_string());
+            } else {
+                eprintln!("[Error] Synthetic load failed: {}", error);
+            }
+            std::process::exit(1);
+        }
+        tracing::info!("Synthetic load command processed, exiting temporary instance.");
         return Ok(());
     }
 
@@ -3046,6 +3062,8 @@ fn cli_command_name(command: Option<&Commands>) -> Option<&'static str> {
         Some(Commands::Purge { .. }) => Some("purge"),
         Some(Commands::Files { .. }) => Some("files"),
         Some(Commands::Priority { .. }) => Some("priority"),
+        #[cfg(feature = "synthetic-load")]
+        Some(Commands::SyntheticLoad(_)) => Some("synthetic-load"),
         None => None,
     }
 }

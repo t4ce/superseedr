@@ -45,6 +45,21 @@ pub struct ResourceManagerClient {
     control_tx: mpsc::Sender<ControlCommand>,
 }
 
+#[cfg(feature = "synthetic-load")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceUsage {
+    pub limit: usize,
+    pub in_use: usize,
+    pub queued: usize,
+    pub max_queue_size: usize,
+}
+
+#[cfg(feature = "synthetic-load")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResourceManagerSnapshot {
+    pub resources: HashMap<ResourceType, ResourceUsage>,
+}
+
 impl ResourceManagerClient {
     pub async fn acquire_peer_connection(&self) -> Result<PermitGuard, ResourceManagerError> {
         self.acquire(ResourceType::PeerConnection).await
@@ -65,6 +80,17 @@ impl ResourceManagerClient {
             .send(command)
             .await
             .map_err(|_| ResourceManagerError::ManagerShutdown)
+    }
+
+    #[cfg(feature = "synthetic-load")]
+    pub async fn snapshot(&self) -> Result<ResourceManagerSnapshot, ResourceManagerError> {
+        let (respond_to, rx) = oneshot::channel();
+        let command = ControlCommand::Snapshot { respond_to };
+        self.control_tx
+            .send(command)
+            .await
+            .map_err(|_| ResourceManagerError::ManagerShutdown)?;
+        rx.await.map_err(|_| ResourceManagerError::ManagerShutdown)
     }
 
     async fn acquire(&self, resource: ResourceType) -> Result<PermitGuard, ResourceManagerError> {
@@ -98,6 +124,10 @@ pub enum ControlCommand {
     },
     ProcessQueue {
         resource: ResourceType,
+    },
+    #[cfg(feature = "synthetic-load")]
+    Snapshot {
+        respond_to: oneshot::Sender<ResourceManagerSnapshot>,
     },
 }
 
@@ -182,11 +212,35 @@ impl ResourceManager {
                         ControlCommand::Release { resource } => self.handle_release(resource),
                         ControlCommand::UpdateLimits { limits } => self.handle_update_limits(limits),
                         ControlCommand::ProcessQueue { resource } => self.handle_process_queue(resource),
+                        #[cfg(feature = "synthetic-load")]
+                        ControlCommand::Snapshot { respond_to } => {
+                            let _ = respond_to.send(self.snapshot());
+                        }
                     }
                 },
                 else => { break; }
             }
         }
+    }
+
+    #[cfg(feature = "synthetic-load")]
+    fn snapshot(&self) -> ResourceManagerSnapshot {
+        let resources = self
+            .resources
+            .iter()
+            .map(|(resource, state)| {
+                (
+                    *resource,
+                    ResourceUsage {
+                        limit: state.limit,
+                        in_use: state.in_use,
+                        queued: state.wait_queue.len(),
+                        max_queue_size: state.max_queue_size,
+                    },
+                )
+            })
+            .collect();
+        ResourceManagerSnapshot { resources }
     }
 
     fn handle_acquire(

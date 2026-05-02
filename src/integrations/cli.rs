@@ -5,6 +5,8 @@ use crate::app::FilePriority;
 use crate::fs_atomic::write_bytes_atomically;
 use crate::integrations::control::{write_control_request, ControlPriorityTarget, ControlRequest};
 use crate::integrations::status::status_file_path;
+#[cfg(feature = "synthetic-load")]
+use clap::Args;
 use clap::{Parser, Subcommand, ValueEnum};
 use sha1::{Digest, Sha1};
 use std::fs;
@@ -176,6 +178,13 @@ pub enum Commands {
         #[arg(help = "Priority to apply")]
         priority: CliPriority,
     },
+    #[cfg(feature = "synthetic-load")]
+    #[command(
+        name = "synthetic-load",
+        hide = true,
+        about = "Run a local synthetic BitTorrent load harness"
+    )]
+    SyntheticLoad(SyntheticLoadArgs),
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +192,51 @@ pub enum CliPriority {
     Normal,
     High,
     Skip,
+}
+
+#[cfg(feature = "synthetic-load")]
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyntheticLoadMode {
+    Download,
+    Upload,
+    Swarm,
+}
+
+#[cfg(feature = "synthetic-load")]
+#[derive(Args, Debug, Clone)]
+pub struct SyntheticLoadArgs {
+    #[arg(long, default_value_t = 1, help = "Number of synthetic torrents")]
+    pub torrents: usize,
+    #[arg(
+        long,
+        default_value_t = 8,
+        help = "Total synthetic peers per active role; swarm splits this across download and upload roles"
+    )]
+    pub peers: usize,
+    #[arg(long, value_enum, default_value_t = SyntheticLoadMode::Download)]
+    pub mode: SyntheticLoadMode,
+    #[arg(long, default_value = "256MiB")]
+    pub size_per_torrent: String,
+    #[arg(long, default_value = "256KiB")]
+    pub piece_size: String,
+    #[arg(long, default_value_t = 30)]
+    pub duration_secs: u64,
+    #[arg(long, default_value_t = 12)]
+    pub warmup_secs: u64,
+    #[arg(long, default_value_t = 1000)]
+    pub metrics_interval_ms: u64,
+    #[arg(long, default_value_t = 512)]
+    pub leecher_pipeline: usize,
+    #[arg(long)]
+    pub target_gbps: Option<f64>,
+    #[arg(long)]
+    pub peer_connection_permits: Option<usize>,
+    #[arg(long, default_value_t = 256)]
+    pub disk_read_permits: usize,
+    #[arg(long, default_value_t = 256)]
+    pub disk_write_permits: usize,
+    #[arg(long, default_value = "tmp/synthetic-load")]
+    pub out: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -366,6 +420,8 @@ where
         | Commands::Info { .. }
         | Commands::Purge { .. }
         | Commands::Files { .. } => Ok(None),
+        #[cfg(feature = "synthetic-load")]
+        Commands::SyntheticLoad(_) => Ok(None),
     }
 }
 
