@@ -3,19 +3,28 @@
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) const SCHEMA_VERSION: u32 = 1;
 
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 fn temp_path_for(path: &Path) -> PathBuf {
-    let tmp_extension = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| format!("{ext}.tmp"))
-        .unwrap_or_else(|| "tmp".to_string());
-    path.with_extension(tmp_extension)
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut file_name = path
+        .file_name()
+        .map(OsString::from)
+        .unwrap_or_else(|| OsString::from("superseedr"));
+    file_name.push(format!(".tmp.{}.{}", std::process::id(), counter));
+
+    match path.parent() {
+        Some(parent) => parent.join(file_name),
+        None => PathBuf::from(file_name),
+    }
 }
 
 pub(crate) fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -24,8 +33,14 @@ pub(crate) fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> io::Result<()
     }
 
     let tmp_path = temp_path_for(path);
-    fs::write(&tmp_path, bytes)?;
-    fs::rename(&tmp_path, path)?;
+    if let Err(error) = fs::write(&tmp_path, bytes) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -135,8 +150,14 @@ pub(crate) async fn write_bytes_atomically_async(path: &Path, bytes: &[u8]) -> i
     }
 
     let tmp_path = temp_path_for(path);
-    tokio::fs::write(&tmp_path, bytes).await?;
-    tokio::fs::rename(&tmp_path, path).await?;
+    if let Err(error) = tokio::fs::write(&tmp_path, bytes).await {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(error);
+    }
+    if let Err(error) = tokio::fs::rename(&tmp_path, path).await {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -154,6 +175,42 @@ mod tests {
         write_bytes_atomically(&path, b"second").expect("write second");
 
         assert_eq!(fs::read_to_string(&path).expect("read file"), "second");
-        assert!(!path.with_extension("txt.tmp").exists());
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "unexpected temp files: {leftovers:?}");
+    }
+
+    #[test]
+    fn temp_paths_are_unique_for_same_target() {
+        let dir = tempdir().expect("create tempdir");
+        let path = dir.path().join("sample.txt");
+
+        let first = temp_path_for(&path);
+        let second = temp_path_for(&path);
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn write_bytes_atomically_removes_tmp_when_rename_fails() {
+        let dir = tempdir().expect("create tempdir");
+        let path = dir.path().join("blocked-target");
+        fs::create_dir(&path).expect("create blocking directory");
+
+        let error = write_bytes_atomically(&path, b"new contents")
+            .expect_err("rename over directory should fail");
+
+        assert!(!error.to_string().is_empty());
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "unexpected temp files: {leftovers:?}");
     }
 }

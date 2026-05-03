@@ -9,6 +9,7 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -973,9 +974,10 @@ fn load_launcher_host_id() -> io::Result<Option<String>> {
 }
 
 fn resolve_shared_config_selection() -> io::Result<Option<SharedConfigSelection>> {
-    if let Some(path) = env::var_os(SHARED_CONFIG_DIR_ENV)
+    if let Some(path) = env_var_os_case_insensitive(SHARED_CONFIG_DIR_ENV)
         .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+        .map(expand_home_path)
+        .map(absolutize_env_path)
     {
         let (mount_root, config_root) = resolve_shared_mount_and_config_root(path);
         return Ok(Some(SharedConfigSelection {
@@ -1071,9 +1073,12 @@ fn resolve_host_id() -> String {
 }
 
 fn resolve_host_id_selection() -> HostIdSelection {
-    let explicit_host_id = env::var(SHARED_HOST_ID_ENV)
-        .ok()
-        .or_else(|| env::var(LEGACY_SHARED_HOST_ID_ENV).ok());
+    let explicit_host_id = env_var_os_case_insensitive(SHARED_HOST_ID_ENV)
+        .and_then(|value| value.into_string().ok())
+        .or_else(|| {
+            env_var_os_case_insensitive(LEGACY_SHARED_HOST_ID_ENV)
+                .and_then(|value| value.into_string().ok())
+        });
     let launcher_host_id = load_launcher_host_id().ok().flatten();
     let env_hostnames = ["HOSTNAME", "COMPUTERNAME"]
         .into_iter()
@@ -1215,6 +1220,11 @@ fn strip_shared_mount_prefix(path: &Path, shared_mount_root: &Path) -> Result<Pa
         if let Ok(relative) = normalized_path.strip_prefix(&normalized_root) {
             return Ok(relative.to_path_buf());
         }
+        if let Some(relative) =
+            strip_windows_prefix_case_insensitive(&normalized_path, &normalized_root)
+        {
+            return Ok(relative);
+        }
     }
 
     Err(())
@@ -1223,11 +1233,42 @@ fn strip_shared_mount_prefix(path: &Path, shared_mount_root: &Path) -> Result<Pa
 #[cfg(windows)]
 fn path_without_verbatim_prefix(path: &Path) -> PathBuf {
     let raw = path.as_os_str().to_string_lossy();
+    if let Some(stripped) = raw.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{}", stripped));
+    }
     if let Some(stripped) = raw.strip_prefix(r"\\?\") {
         PathBuf::from(stripped)
     } else {
         path.to_path_buf()
     }
+}
+
+#[cfg(windows)]
+fn strip_windows_prefix_case_insensitive(path: &Path, root: &Path) -> Option<PathBuf> {
+    let mut path_components = path.components();
+    for root_component in root.components() {
+        let path_component = path_components.next()?;
+        if !component_eq_ignore_ascii_case(path_component, root_component) {
+            return None;
+        }
+    }
+
+    let mut relative = PathBuf::new();
+    for component in path_components {
+        match component {
+            Component::Normal(segment) => relative.push(segment),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(relative)
+}
+
+#[cfg(windows)]
+fn component_eq_ignore_ascii_case(left: Component<'_>, right: Component<'_>) -> bool {
+    left.as_os_str()
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
 }
 
 fn resolve_shared_data_path(
@@ -1310,8 +1351,8 @@ fn apply_env_overrides(settings: &Settings) -> io::Result<Settings> {
     if let Some(client_port) = parse_env_override(CLIENT_PORT_ENV)? {
         resolved.client_port = client_port;
     }
-    if let Some(default_download_folder) = env::var_os(DEFAULT_DOWNLOAD_FOLDER_ENV) {
-        resolved.default_download_folder = Some(PathBuf::from(default_download_folder));
+    if let Some(default_download_folder) = parse_path_env_override(DEFAULT_DOWNLOAD_FOLDER_ENV)? {
+        resolved.default_download_folder = Some(default_download_folder);
     }
     if let Some(output_status_interval) = parse_env_override(OUTPUT_STATUS_INTERVAL_ENV)? {
         resolved.output_status_interval = output_status_interval;
@@ -1325,19 +1366,118 @@ where
     T: std::str::FromStr,
     T::Err: std::fmt::Display,
 {
-    match env::var(key) {
-        Ok(value) => value.parse::<T>().map(Some).map_err(|error| {
+    match env_var_case_insensitive(key)? {
+        Some(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{key} must not be empty"),
+                ));
+            }
+            trimmed.parse::<T>().map(Some).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Invalid {key}={value:?}: {error}"),
+                )
+            })
+        }
+        None => Ok(None),
+    }
+}
+
+fn parse_path_env_override(key: &str) -> io::Result<Option<PathBuf>> {
+    let Some(value) = env_var_os_case_insensitive(key) else {
+        return Ok(None);
+    };
+
+    if value.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{key} must not be empty"),
+        ));
+    }
+
+    Ok(Some(expand_home_path(value)))
+}
+
+fn env_var_case_insensitive(key: &str) -> io::Result<Option<String>> {
+    match env_var_os_case_insensitive(key) {
+        Some(value) => value.into_string().map(Some).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Invalid {key}={value:?}: {error}"),
+                format!("{key} must be valid Unicode"),
             )
         }),
-        Err(env::VarError::NotPresent) => Ok(None),
-        Err(env::VarError::NotUnicode(_)) => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{key} must be valid Unicode"),
-        )),
+        None => Ok(None),
     }
+}
+
+fn env_var_os_case_insensitive(key: &str) -> Option<OsString> {
+    if let Some(value) = env::var_os(key) {
+        return Some(value);
+    }
+
+    env::vars_os().find_map(|(env_key, value)| {
+        env_key
+            .to_string_lossy()
+            .eq_ignore_ascii_case(key)
+            .then_some(value)
+    })
+}
+
+fn expand_home_path(value: OsString) -> PathBuf {
+    let path = PathBuf::from(&value);
+    let Some(raw) = value.to_str() else {
+        return path;
+    };
+
+    let rest = match raw {
+        "~" => Some(""),
+        value if value.starts_with("~/") || value.starts_with(r"~\") => Some(&value[2..]),
+        _ => None,
+    };
+
+    let Some(rest) = rest else {
+        return path;
+    };
+    let Some(home) = home_dir_from_env() else {
+        return path;
+    };
+
+    if rest.is_empty() {
+        home
+    } else {
+        home.join(rest)
+    }
+}
+
+fn home_dir_from_env() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        if let Some(profile) = env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
+            return Some(PathBuf::from(profile));
+        }
+        if let (Some(drive), Some(path)) = (env::var_os("HOMEDRIVE"), env::var_os("HOMEPATH")) {
+            let mut home = PathBuf::from(drive);
+            home.push(path);
+            return Some(home);
+        }
+    }
+
+    env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn absolutize_env_path(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+
+    env::current_dir()
+        .map(|current_dir| current_dir.join(&path))
+        .unwrap_or(path)
 }
 
 fn read_toml_or_default<T>(path: &Path) -> io::Result<T>
@@ -2813,6 +2953,26 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_env_overrides_trims_numeric_env_and_matches_case_insensitively() {
+        const LOWER_CLIENT_PORT_ENV: &str = "superseedr_client_port";
+
+        let _guard = watch_env_guard().lock().unwrap();
+        let _client_port = EnvVarRestore::capture(CLIENT_PORT_ENV);
+        let _lower_client_port = EnvVarRestore::capture(LOWER_CLIENT_PORT_ENV);
+
+        env::remove_var(CLIENT_PORT_ENV);
+        env::set_var(LOWER_CLIENT_PORT_ENV, " 61235 ");
+
+        let settings = Settings {
+            client_port: 7777,
+            ..Settings::default()
+        };
+        let resolved = apply_env_overrides(&settings).expect("apply env overrides");
+
+        assert_eq!(resolved.client_port, 61235);
+    }
+
+    #[test]
     fn test_apply_env_overrides_invalid_numeric_env_reports_key() {
         let _guard = watch_env_guard().lock().unwrap();
         let _client_port = EnvVarRestore::capture(CLIENT_PORT_ENV);
@@ -2833,6 +2993,47 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_env_overrides_rejects_empty_path_env() {
+        let _guard = watch_env_guard().lock().unwrap();
+        let _default_download_folder = EnvVarRestore::capture(DEFAULT_DOWNLOAD_FOLDER_ENV);
+
+        env::set_var(DEFAULT_DOWNLOAD_FOLDER_ENV, "");
+
+        let error = apply_env_overrides(&Settings::default())
+            .expect_err("empty default download folder env should fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains(DEFAULT_DOWNLOAD_FOLDER_ENV),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_apply_env_overrides_expands_home_path_env() {
+        let _guard = watch_env_guard().lock().unwrap();
+        let _default_download_folder = EnvVarRestore::capture(DEFAULT_DOWNLOAD_FOLDER_ENV);
+        let _home = EnvVarRestore::capture("HOME");
+        let _user_profile = EnvVarRestore::capture("USERPROFILE");
+        let _home_drive = EnvVarRestore::capture("HOMEDRIVE");
+        let _home_path = EnvVarRestore::capture("HOMEPATH");
+        let home = tempdir().expect("create home dir");
+
+        env::set_var("HOME", home.path());
+        env::set_var("USERPROFILE", home.path());
+        env::remove_var("HOMEDRIVE");
+        env::remove_var("HOMEPATH");
+        env::set_var(DEFAULT_DOWNLOAD_FOLDER_ENV, "~");
+
+        let resolved = apply_env_overrides(&Settings::default()).expect("apply env overrides");
+
+        assert_eq!(
+            resolved.default_download_folder,
+            Some(home.path().to_path_buf())
+        );
+    }
+
+    #[test]
     fn test_apply_env_overrides_ignores_unsupported_settings_vars() {
         let _guard = watch_env_guard().lock().unwrap();
         let _private_client = EnvVarRestore::capture("SUPERSEEDR_PRIVATE_CLIENT");
@@ -2849,6 +3050,57 @@ mod tests {
 
         assert!(!resolved.private_client);
         assert!(additional_watch_paths().is_empty());
+    }
+
+    #[test]
+    fn test_shared_config_dir_env_relative_path_is_resolved_from_current_dir() {
+        let _guard = watch_env_guard().lock().unwrap();
+        let _shared_dir = EnvVarRestore::capture(SHARED_CONFIG_DIR_ENV);
+
+        env::set_var(SHARED_CONFIG_DIR_ENV, "relative-shared-root");
+        clear_shared_config_state();
+
+        let current_dir = env::current_dir().expect("current dir");
+        let selection = resolve_shared_config_selection()
+            .expect("resolve shared config")
+            .expect("shared config enabled");
+
+        assert_eq!(
+            selection.mount_root,
+            current_dir.join("relative-shared-root")
+        );
+        assert_eq!(
+            selection.config_root,
+            current_dir
+                .join("relative-shared-root")
+                .join(SHARED_CONFIG_SUBDIR)
+        );
+
+        clear_shared_config_state();
+    }
+
+    #[test]
+    fn test_shared_config_dir_env_matches_case_insensitively() {
+        const LOWER_SHARED_CONFIG_DIR_ENV: &str = "superseedr_shared_config_dir";
+
+        let _guard = watch_env_guard().lock().unwrap();
+        let _shared_dir = EnvVarRestore::capture(SHARED_CONFIG_DIR_ENV);
+        let _lower_shared_dir = EnvVarRestore::capture(LOWER_SHARED_CONFIG_DIR_ENV);
+        let dir = tempdir().expect("create tempdir");
+
+        env::remove_var(SHARED_CONFIG_DIR_ENV);
+        env::set_var(LOWER_SHARED_CONFIG_DIR_ENV, dir.path());
+        clear_shared_config_state();
+
+        let selection = resolve_shared_config_selection()
+            .expect("resolve shared config")
+            .expect("shared config enabled");
+
+        assert_eq!(selection.source, SharedConfigSource::Env);
+        assert_eq!(selection.mount_root, dir.path());
+        assert_eq!(selection.config_root, dir.path().join(SHARED_CONFIG_SUBDIR));
+
+        clear_shared_config_state();
     }
 
     #[test]
@@ -2907,6 +3159,32 @@ mod tests {
         .expect_err("path outside shared root should fail");
 
         assert!(err.to_string().contains("must live under the shared root"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_shared_data_path_accepts_verbatim_unc_under_root() {
+        let shared_mount_root = Path::new(r"\\Server\Share\Root");
+        let absolute = Path::new(r"\\?\UNC\Server\Share\Root\downloads");
+
+        let encoded =
+            encode_shared_data_path(absolute, Some(shared_mount_root), "default_download_folder")
+                .expect("encode shared path");
+
+        assert_eq!(encoded, PathBuf::from("downloads"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_shared_data_path_accepts_case_variant_under_root() {
+        let shared_mount_root = Path::new(r"C:\SharedRoot");
+        let absolute = Path::new(r"c:\sharedroot\downloads");
+
+        let encoded =
+            encode_shared_data_path(absolute, Some(shared_mount_root), "default_download_folder")
+                .expect("encode shared path");
+
+        assert_eq!(encoded, PathBuf::from("downloads"));
     }
 
     #[test]
@@ -4503,6 +4781,28 @@ mod tests {
         } else {
             env::remove_var(LEGACY_SHARED_HOST_ID_ENV);
         }
+        clear_shared_config_state();
+    }
+
+    #[test]
+    fn test_shared_host_id_env_matches_case_insensitively() {
+        const LOWER_SHARED_HOST_ID_ENV: &str = "superseedr_shared_host_id";
+
+        let _guard = watch_env_guard().lock().unwrap();
+        let _shared_dir = EnvVarRestore::capture(SHARED_CONFIG_DIR_ENV);
+        let _host_id = EnvVarRestore::capture(SHARED_HOST_ID_ENV);
+        let _lower_host_id = EnvVarRestore::capture(LOWER_SHARED_HOST_ID_ENV);
+        let _legacy_host_id = EnvVarRestore::capture(LEGACY_SHARED_HOST_ID_ENV);
+        let dir = tempdir().expect("create tempdir");
+
+        env::set_var(SHARED_CONFIG_DIR_ENV, dir.path());
+        env::remove_var(SHARED_HOST_ID_ENV);
+        env::set_var(LOWER_SHARED_HOST_ID_ENV, "lower-node");
+        env::remove_var(LEGACY_SHARED_HOST_ID_ENV);
+        clear_shared_config_state();
+
+        assert_eq!(shared_host_id().as_deref(), Some("lower-node"));
+
         clear_shared_config_state();
     }
 

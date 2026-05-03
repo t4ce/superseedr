@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use chrono::{Local, NaiveDate};
+use chrono::{NaiveDate, Utc};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -84,11 +84,11 @@ trait LogDateProvider: Send {
     fn current_date(&self) -> NaiveDate;
 }
 
-struct LocalDateProvider;
+struct UtcDateProvider;
 
-impl LogDateProvider for LocalDateProvider {
+impl LogDateProvider for UtcDateProvider {
     fn current_date(&self) -> NaiveDate {
-        Local::now().date_naive()
+        Utc::now().date_naive()
     }
 }
 
@@ -98,6 +98,7 @@ struct DailyRollingFileWriter {
     max_log_files: usize,
     date_provider: Box<dyn LogDateProvider>,
     current_date: Option<NaiveDate>,
+    reported_roll_error_date: Option<NaiveDate>,
     file: Option<File>,
 }
 
@@ -114,6 +115,7 @@ impl DailyRollingFileWriter {
             max_log_files,
             date_provider,
             current_date: None,
+            reported_roll_error_date: None,
             file: None,
         };
         writer.roll_if_needed()?;
@@ -145,28 +147,45 @@ impl DailyRollingFileWriter {
         let path = self
             .log_dir
             .join(daily_log_file_name(&self.filename_prefix, today));
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let file = match OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if self.file.is_some() => {
+                if self.reported_roll_error_date != Some(today) {
+                    eprintln!(
+                        "[Warn] Could not roll log file to {}; continuing with previous file: {}",
+                        path.display(),
+                        error
+                    );
+                    self.reported_roll_error_date = Some(today);
+                }
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         self.file = Some(file);
         self.current_date = Some(today);
-        self.prune_old_logs()
+        self.reported_roll_error_date = None;
+        self.prune_old_logs();
+        Ok(())
     }
 
-    fn prune_old_logs(&self) -> io::Result<()> {
+    fn prune_old_logs(&self) {
         if self.max_log_files == 0 {
-            return Ok(());
+            return;
         }
 
-        let mut logs = matching_log_files(&self.log_dir, &self.filename_prefix)?;
-        if logs.len() <= self.max_log_files {
-            return Ok(());
+        if let Err(error) = prune_old_logs(
+            &self.log_dir,
+            &self.filename_prefix,
+            self.max_log_files,
+            |path| fs::remove_file(path),
+        ) {
+            eprintln!(
+                "[Warn] Error pruning log files in {}: {}",
+                self.log_dir.display(),
+                error
+            );
         }
-
-        logs.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-        let remove_count = logs.len() - self.max_log_files;
-        for (_, path) in logs.into_iter().take(remove_count) {
-            fs::remove_file(path)?;
-        }
-        Ok(())
     }
 }
 
@@ -180,7 +199,7 @@ pub(crate) fn non_blocking_daily_file_writer(
         filename_prefix,
         max_log_files,
         DEFAULT_BUFFERED_LINES,
-        Box::new(LocalDateProvider),
+        Box::new(UtcDateProvider),
     )
 }
 
@@ -215,19 +234,34 @@ fn non_blocking_daily_file_writer_with_date_provider(
 }
 
 fn run_log_worker(mut file_writer: DailyRollingFileWriter, receiver: Receiver<LogCommand>) {
+    let mut reported_write_error = false;
     while let Ok(command) = receiver.recv() {
         match command {
             LogCommand::Write(bytes) => {
-                let _ = file_writer.write_all(&bytes);
+                if let Err(error) = file_writer.write_all(&bytes) {
+                    report_log_worker_error(&mut reported_write_error, error);
+                }
             }
             LogCommand::Flush(sender) => {
                 let _ = sender.send(file_writer.flush());
             }
             LogCommand::Shutdown => {
-                let _ = file_writer.flush();
+                if let Err(error) = file_writer.flush() {
+                    report_log_worker_error(&mut reported_write_error, error);
+                }
                 break;
             }
         }
+    }
+}
+
+fn report_log_worker_error(reported: &mut bool, error: io::Error) {
+    if !*reported {
+        eprintln!(
+            "[Warn] File logging failed; future log lines may be lost: {}",
+            error
+        );
+        *reported = true;
     }
 }
 
@@ -271,6 +305,38 @@ fn matching_log_files(
     }
 
     Ok(logs)
+}
+
+fn prune_old_logs<F>(
+    log_dir: &Path,
+    filename_prefix: &str,
+    max_log_files: usize,
+    remove_file: F,
+) -> io::Result<()>
+where
+    F: Fn(&Path) -> io::Result<()>,
+{
+    if max_log_files == 0 {
+        return Ok(());
+    }
+
+    let mut logs = matching_log_files(log_dir, filename_prefix)?;
+    if logs.len() <= max_log_files {
+        return Ok(());
+    }
+
+    logs.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    let remove_count = logs.len() - max_log_files;
+    for (_, path) in logs.into_iter().take(remove_count) {
+        if let Err(error) = remove_file(&path) {
+            eprintln!(
+                "[Warn] Failed to remove old log file {}: {}",
+                path.display(),
+                error
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -318,7 +384,7 @@ mod tests {
 
         let contents = fs::read_to_string(
             dir.path()
-                .join(daily_log_file_name("app", Local::now().date_naive())),
+                .join(daily_log_file_name("app", Utc::now().date_naive())),
         )
         .expect("read log file");
         assert!(contents.contains("sample log line"));
@@ -397,6 +463,71 @@ mod tests {
             .exists());
         assert!(dir.path().join("app.not-a-date.log").exists());
         assert!(dir.path().join("other.2026-05-01.log").exists());
+    }
+
+    #[test]
+    fn retention_delete_failures_do_not_fail_pruning() {
+        let dir = tempdir().expect("create tempdir");
+        let start = date(2026, 4, 1);
+        for offset in 0..4 {
+            let log_date = start
+                .checked_add_signed(Duration::days(offset))
+                .expect("date in range");
+            fs::write(
+                dir.path().join(daily_log_file_name("app", log_date)),
+                format!("old {offset}\n"),
+            )
+            .expect("seed log");
+        }
+
+        let result = prune_old_logs(dir.path(), "app", 2, |_path| {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "locked"))
+        });
+
+        assert!(result.is_ok());
+        let matching = matching_log_files(dir.path(), "app").expect("list matching logs");
+        assert_eq!(matching.len(), 4);
+    }
+
+    #[test]
+    fn rollover_open_failure_keeps_previous_file() {
+        let dir = tempdir().expect("create tempdir");
+        let current_date = Arc::new(Mutex::new(date(2026, 5, 1)));
+        let provider = SharedDateProvider {
+            date: Arc::clone(&current_date),
+        };
+        let mut writer = DailyRollingFileWriter::new(
+            dir.path().to_path_buf(),
+            "app".to_string(),
+            31,
+            Box::new(provider),
+        )
+        .expect("create log writer");
+
+        writer.write_all(b"first day\n").expect("write first day");
+        writer.flush().expect("flush first day");
+        fs::create_dir(dir.path().join("app.2026-05-02.log")).expect("create rollover blocker");
+
+        *current_date.lock().unwrap() = date(2026, 5, 2);
+        writer
+            .write_all(b"second day stayed on previous file\n")
+            .expect("write through rollover failure");
+        writer.flush().expect("flush previous file");
+
+        let first =
+            fs::read_to_string(dir.path().join("app.2026-05-01.log")).expect("read first log");
+        assert!(first.contains("first day"));
+        assert!(first.contains("second day stayed on previous file"));
+
+        fs::remove_dir(dir.path().join("app.2026-05-02.log")).expect("remove rollover blocker");
+        writer
+            .write_all(b"second day recovered\n")
+            .expect("write through recovered rollover");
+        writer.flush().expect("flush recovered file");
+
+        let second =
+            fs::read_to_string(dir.path().join("app.2026-05-02.log")).expect("read second log");
+        assert!(second.contains("second day recovered"));
     }
 
     #[test]
