@@ -33,6 +33,8 @@ use crate::torrent_manager::state::TorrentStatus;
 use crate::torrent_manager::state::TrackerState;
 use crate::torrent_manager::ManagerCommand;
 use crate::torrent_manager::ManagerEvent;
+#[cfg(feature = "synthetic-load")]
+use crate::torrent_manager::SyntheticPeerConnectFailure;
 
 use crate::errors::StorageError;
 use crate::storage::create_and_allocate_files;
@@ -97,6 +99,19 @@ const ACTIVITY_MESSAGE_MAX_LEN: usize = 28;
 
 const BASE_BACKOFF_MS: u64 = 1000;
 const JITTER_MS: u64 = 100;
+
+#[cfg(feature = "synthetic-load")]
+fn synthetic_peer_connect_failure(error: &std::io::Error) -> SyntheticPeerConnectFailure {
+    match error.kind() {
+        std::io::ErrorKind::ConnectionRefused => SyntheticPeerConnectFailure::ConnectionRefused,
+        std::io::ErrorKind::ConnectionReset => SyntheticPeerConnectFailure::ConnectionReset,
+        std::io::ErrorKind::ConnectionAborted => SyntheticPeerConnectFailure::ConnectionAborted,
+        std::io::ErrorKind::AddrInUse => SyntheticPeerConnectFailure::AddrInUse,
+        std::io::ErrorKind::AddrNotAvailable => SyntheticPeerConnectFailure::AddrNotAvailable,
+        std::io::ErrorKind::TimedOut => SyntheticPeerConnectFailure::TimedOut,
+        _ => SyntheticPeerConnectFailure::OtherIo,
+    }
+}
 
 struct PreparedFileProbeEntry {
     relative_path: std::path::PathBuf,
@@ -1904,6 +1919,8 @@ impl TorrentManager {
         }
 
         let torrent_manager_tx_clone = self.torrent_manager_tx.clone();
+        #[cfg(feature = "synthetic-load")]
+        let manager_event_tx_clone = self.manager_event_tx.clone();
         let resource_manager_clone = self.resource_manager.clone();
         let global_dl_bucket_clone = self.global_dl_bucket.clone();
         let global_ul_bucket_clone = self.global_ul_bucket.clone();
@@ -1920,6 +1937,10 @@ impl TorrentManager {
             peer_id: peer_ip_port.clone(),
             tx: peer_session_tx,
         });
+        #[cfg(feature = "synthetic-load")]
+        let _ = self
+            .manager_event_tx
+            .try_send(ManagerEvent::PeerConnectAttempted);
 
         let bitfield = match self.state.torrent {
             None => None,
@@ -1932,10 +1953,34 @@ impl TorrentManager {
                 permit_result = timeout(Duration::from_secs(10), resource_manager_clone.acquire_peer_connection()) => {
                     match permit_result {
                         Ok(Ok(permit)) => Some(permit), // Acquired
-                        _ => None, // Timeout or Manager Shutdown
+                        Ok(Err(ResourceManagerError::ManagerShutdown)) => {
+                            #[cfg(feature = "synthetic-load")]
+                            let _ = manager_event_tx_clone.try_send(ManagerEvent::PeerConnectFailed {
+                                reason: SyntheticPeerConnectFailure::PermitManagerShutdown,
+                            });
+                            None
+                        }
+                        Ok(Err(ResourceManagerError::QueueFull)) => {
+                            #[cfg(feature = "synthetic-load")]
+                            let _ = manager_event_tx_clone.try_send(ManagerEvent::PeerConnectFailed {
+                                reason: SyntheticPeerConnectFailure::PermitQueueFull,
+                            });
+                            None
+                        }
+                        Err(_) => {
+                            #[cfg(feature = "synthetic-load")]
+                            let _ = manager_event_tx_clone.try_send(ManagerEvent::PeerConnectFailed {
+                                reason: SyntheticPeerConnectFailure::PermitTimeout,
+                            });
+                            None
+                        }
                     }
                 }
                 _ = shutdown_rx_permit.recv() => {
+                    #[cfg(feature = "synthetic-load")]
+                    let _ = manager_event_tx_clone.try_send(ManagerEvent::PeerConnectFailed {
+                        reason: SyntheticPeerConnectFailure::PermitManagerShutdown,
+                    });
                     None
                 }
             };
@@ -1944,45 +1989,68 @@ impl TorrentManager {
                 let connection_result =
                     timeout(Duration::from_secs(2), TcpStream::connect(peer_addr)).await;
 
-                if let Ok(Ok(stream)) = connection_result {
-                    let _held_session_permit = session_permit;
-                    let session = PeerSession::new(PeerSessionParameters {
-                        info_hash: info_hash_clone,
-                        torrent_metadata_length: torrent_metadata_length_clone,
-                        connection_type: ConnectionType::Outgoing,
-                        torrent_manager_rx: peer_session_rx,
-                        torrent_manager_tx: torrent_manager_tx_clone.clone(),
-                        peer_ip_port: peer_ip_port_clone.clone(),
-                        client_id: client_id_clone.into(),
-                        global_dl_bucket: global_dl_bucket_clone,
-                        global_ul_bucket: global_ul_bucket_clone,
-                        shutdown_tx,
-                    });
+                match connection_result {
+                    Ok(Ok(stream)) => {
+                        #[cfg(feature = "synthetic-load")]
+                        let _ =
+                            manager_event_tx_clone.try_send(ManagerEvent::PeerConnectEstablished);
+                        let _held_session_permit = session_permit;
+                        let session = PeerSession::new(PeerSessionParameters {
+                            info_hash: info_hash_clone.clone(),
+                            torrent_metadata_length: torrent_metadata_length_clone,
+                            connection_type: ConnectionType::Outgoing,
+                            torrent_manager_rx: peer_session_rx,
+                            torrent_manager_tx: torrent_manager_tx_clone.clone(),
+                            peer_ip_port: peer_ip_port_clone.clone(),
+                            client_id: client_id_clone.into(),
+                            global_dl_bucket: global_dl_bucket_clone,
+                            global_ul_bucket: global_ul_bucket_clone,
+                            shutdown_tx,
+                        });
 
-                    tokio::select! {
-                        session_result = session.run(stream, Vec::new(), bitfield) => {
-                            if let Err(e) = session_result {
+                        tokio::select! {
+                            session_result = session.run(stream, Vec::new(), bitfield) => {
+                                if let Err(e) = session_result {
+                                    #[cfg(feature = "synthetic-load")]
+                                    let _ = manager_event_tx_clone
+                                        .try_send(ManagerEvent::PeerSessionFailed);
+                                    event!(
+                                        Level::DEBUG,
+                                        "PEER SESSION {}: ENDED IN ERROR: {}",
+                                        &peer_ip_port_clone,
+                                        e
+                                    );
+                                }
+                            }
+                            _ = shutdown_rx_session.recv() => {
                                 event!(
                                     Level::DEBUG,
-                                    "PEER SESSION {}: ENDED IN ERROR: {}",
-                                    &peer_ip_port_clone,
-                                    e
+                                    "PEER SESSION {}: Shutting down due to manager signal.",
+                                    &peer_ip_port_clone
                                 );
                             }
                         }
-                        _ = shutdown_rx_session.recv() => {
-                            event!(
-                                Level::DEBUG,
-                                "PEER SESSION {}: Shutting down due to manager signal.",
-                                &peer_ip_port_clone
-                            );
-                        }
                     }
-                } else {
-                    let _ = torrent_manager_tx_clone
-                        .send(TorrentCommand::UnresponsivePeer(peer_ip_port))
-                        .await;
-                    event!(Level::DEBUG, peer = %peer_ip_port_clone, "PEER TIMEOUT or connection refused");
+                    Ok(Err(error)) => {
+                        #[cfg(feature = "synthetic-load")]
+                        let _ = manager_event_tx_clone.try_send(ManagerEvent::PeerConnectFailed {
+                            reason: synthetic_peer_connect_failure(&error),
+                        });
+                        let _ = torrent_manager_tx_clone
+                            .send(TorrentCommand::UnresponsivePeer(peer_ip_port))
+                            .await;
+                        event!(Level::DEBUG, peer = %peer_ip_port_clone, error = %error, "PEER connection failed");
+                    }
+                    Err(_) => {
+                        #[cfg(feature = "synthetic-load")]
+                        let _ = manager_event_tx_clone.try_send(ManagerEvent::PeerConnectFailed {
+                            reason: SyntheticPeerConnectFailure::ConnectTimeout,
+                        });
+                        let _ = torrent_manager_tx_clone
+                            .send(TorrentCommand::UnresponsivePeer(peer_ip_port))
+                            .await;
+                        event!(Level::DEBUG, peer = %peer_ip_port_clone, "PEER connection timed out");
+                    }
                 }
             }
 

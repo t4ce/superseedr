@@ -136,6 +136,16 @@ pub enum ManagerEvent {
     PeerDisconnected {
         info_hash: Vec<u8>,
     },
+    #[cfg(feature = "synthetic-load")]
+    PeerConnectAttempted,
+    #[cfg(feature = "synthetic-load")]
+    PeerConnectEstablished,
+    #[cfg(feature = "synthetic-load")]
+    PeerConnectFailed {
+        reason: SyntheticPeerConnectFailure,
+    },
+    #[cfg(feature = "synthetic-load")]
+    PeerSessionFailed,
 
     BlockReceived {
         info_hash: Vec<u8>,
@@ -151,6 +161,22 @@ pub enum ManagerEvent {
         info_hash: Vec<u8>,
         torrent: Box<Torrent>,
     },
+}
+
+#[cfg(feature = "synthetic-load")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyntheticPeerConnectFailure {
+    PermitTimeout,
+    PermitManagerShutdown,
+    PermitQueueFull,
+    ConnectTimeout,
+    ConnectionRefused,
+    ConnectionReset,
+    ConnectionAborted,
+    AddrInUse,
+    AddrNotAvailable,
+    TimedOut,
+    OtherIo,
 }
 
 #[derive(Debug, Clone)]

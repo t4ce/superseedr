@@ -4577,6 +4577,11 @@ impl App {
             | ManagerEvent::PeerDisconnected { .. }
             | ManagerEvent::BlockReceived { .. }
             | ManagerEvent::BlockSent { .. } => {}
+            #[cfg(feature = "synthetic-load")]
+            ManagerEvent::PeerConnectAttempted
+            | ManagerEvent::PeerConnectEstablished
+            | ManagerEvent::PeerConnectFailed { .. }
+            | ManagerEvent::PeerSessionFailed => {}
         }
     }
 
