@@ -3,7 +3,9 @@
 
 use crate::app::TorrentMetrics;
 use crate::config::Settings;
-use crate::integrations::cli::{SyntheticLoadAddMode, SyntheticLoadArgs, SyntheticLoadMode};
+use crate::integrations::cli::{
+    SyntheticBenchmarkArgs, SyntheticLoadAddMode, SyntheticLoadArgs, SyntheticLoadMode,
+};
 use crate::networking::protocol::{generate_message, Message};
 use crate::resource_manager::{
     ResourceManager, ResourceManagerClient, ResourceManagerSnapshot, ResourceType, ResourceUsage,
@@ -498,6 +500,8 @@ struct SyntheticSummary {
     avg_upload_bps: u64,
     avg_download_mbps: f64,
     avg_upload_mbps: f64,
+    completed_pieces: u64,
+    total_pieces: u64,
     seeder_requests: u64,
     leecher_requests: u64,
     leecher_pieces: u64,
@@ -518,6 +522,214 @@ struct SyntheticSummary {
 }
 
 #[derive(Serialize)]
+struct BenchmarkSummary {
+    run_id: String,
+    disk_budget_bytes: u64,
+    preferred_size_per_torrent_bytes: u64,
+    piece_size_bytes: u64,
+    max_torrents: usize,
+    max_peers: usize,
+    planned_steps: usize,
+    keep_output: bool,
+    report: BenchmarkReport,
+    profiles: Vec<BenchmarkProfileSummary>,
+    output_dir: PathBuf,
+}
+
+#[derive(Serialize)]
+struct BenchmarkReport {
+    runtime_secs: f64,
+    runtime: String,
+    planned_steps: usize,
+    steps_run: usize,
+    retry_attempts: usize,
+    transient_issue_attempts: usize,
+    recovered_after_retry_steps: usize,
+    clean_steps: usize,
+    issue_steps: usize,
+    configured_max_torrents: usize,
+    configured_max_peers: usize,
+    disk_budget_bytes: u64,
+    preferred_size_per_torrent_bytes: u64,
+    piece_size_bytes: u64,
+    issue_retries: usize,
+    retry_delay_ms: u64,
+    peer_connection_limit_policy: String,
+    os_limit_note: String,
+    scenarios: Vec<BenchmarkScenarioReport>,
+}
+
+#[derive(Serialize)]
+struct BenchmarkScenarioReport {
+    mode: String,
+    verdict: String,
+    capacity_estimate: String,
+    clean_torrents: usize,
+    clean_peers: usize,
+    clean_disk_working_set_bytes: u64,
+    clean_size_per_torrent_bytes: u64,
+    first_issue_torrents: Option<usize>,
+    first_issue_peers: Option<usize>,
+    first_issue: Option<String>,
+    likely_bottleneck: String,
+    runtime_secs: f64,
+    steps_run: usize,
+    retry_attempts: usize,
+    transient_issue_attempts: usize,
+    recovered_after_retry_steps: usize,
+    planned_steps: usize,
+    peak_download_bps: u64,
+    peak_upload_bps: u64,
+    observed_disk_read_bytes_per_sec: u64,
+    observed_disk_write_bytes_per_sec: u64,
+    disk_read_ops_per_sec: f64,
+    disk_write_ops_per_sec: f64,
+    max_sample_delay_ms: u64,
+    protocol_errors: u64,
+    outbound_failed: u64,
+    outbound_permit_timeout: u64,
+    peer_connection_limit: usize,
+    disk_read_permits: usize,
+    disk_write_permits: usize,
+}
+
+#[derive(Serialize)]
+struct BenchmarkProfileSummary {
+    mode: String,
+    planned_steps: usize,
+    final_torrents: usize,
+    final_peers: usize,
+    final_size_per_torrent_bytes: u64,
+    final_estimated_disk_bytes: u64,
+    metrics: BenchmarkProfileMetrics,
+    last_clean: Option<BenchmarkStepSummary>,
+    first_issue: Option<BenchmarkStepSummary>,
+    steps: Vec<BenchmarkStepSummary>,
+}
+
+#[derive(Clone, Serialize)]
+struct BenchmarkProfileMetrics {
+    steps_run: usize,
+    retry_attempts: usize,
+    transient_issue_attempts: usize,
+    recovered_after_retry_steps: usize,
+    final_issue_steps: usize,
+    clean_steps: usize,
+    issue_steps: usize,
+    total_measured_secs: f64,
+    total_download_bytes: u64,
+    total_upload_bytes: u64,
+    max_download_bps: u64,
+    max_upload_bps: u64,
+    max_sample_delay_ms: u64,
+    estimated_disk_high_water_bytes: u64,
+    protocol_errors: u64,
+    protocol_error_detail: ProtocolErrorSample,
+    outbound_failed: u64,
+    outbound_permit_timeout: u64,
+    outbound_connect: OutboundConnectSample,
+    synthetic_leecher_errors: u64,
+    seeder_requests: u64,
+    leecher_requests: u64,
+    leecher_pieces: u64,
+    connections: u64,
+    disconnects: u64,
+    manager_peer_connected: u64,
+    manager_peer_disconnected: u64,
+    manager_block_received: u64,
+    manager_block_sent: u64,
+    disk_read_started: u64,
+    disk_read_finished: u64,
+    disk_write_started: u64,
+    disk_write_finished: u64,
+    completed_pieces: u64,
+    total_pieces: u64,
+    data_removed_steps: usize,
+    data_kept_steps: usize,
+}
+
+#[derive(Clone, Serialize)]
+struct BenchmarkStepSummary {
+    step: usize,
+    planned_steps: usize,
+    attempt: usize,
+    max_attempts: usize,
+    will_retry: bool,
+    retry_delay_ms: u64,
+    mode: String,
+    torrents: usize,
+    peers: usize,
+    size_per_torrent_bytes: u64,
+    estimated_disk_bytes: u64,
+    estimated_final_disk_bytes: u64,
+    disk_budget_bytes: u64,
+    measured_secs: f64,
+    wall_secs: f64,
+    eta: BenchmarkEta,
+    download_bytes: u64,
+    upload_bytes: u64,
+    avg_download_bps: u64,
+    avg_upload_bps: u64,
+    avg_download_mbps: f64,
+    avg_upload_mbps: f64,
+    torrents_added: usize,
+    peers_added: usize,
+    requested_peers: usize,
+    max_peer_add_lag: usize,
+    max_sample_delay_ms: u64,
+    protocol_errors: u64,
+    protocol_error_detail: ProtocolErrorSample,
+    outbound_failed: u64,
+    outbound_permit_timeout: u64,
+    outbound_connect: OutboundConnectSample,
+    synthetic_leecher_errors: u64,
+    seeder_requests: u64,
+    leecher_requests: u64,
+    leecher_pieces: u64,
+    connections: u64,
+    disconnects: u64,
+    manager_peer_connected: u64,
+    manager_peer_disconnected: u64,
+    manager_block_received: u64,
+    manager_block_sent: u64,
+    disk_read_started: u64,
+    disk_read_finished: u64,
+    disk_write_started: u64,
+    disk_write_finished: u64,
+    completed_pieces: u64,
+    total_pieces: u64,
+    error: Option<String>,
+    issues: Vec<String>,
+    summary_path: Option<PathBuf>,
+    samples_path: Option<PathBuf>,
+    data_removed: bool,
+}
+
+#[derive(Clone, Default, Serialize)]
+struct BenchmarkEta {
+    current_scenario_remaining_steps: usize,
+    full_benchmark_remaining_steps: usize,
+    current_scenario_eta_secs: f64,
+    full_benchmark_eta_secs: f64,
+    average_step_wall_secs: f64,
+    elapsed_wall_secs: f64,
+}
+
+#[derive(Clone)]
+struct BenchmarkStepTiming {
+    wall_secs: f64,
+    eta: BenchmarkEta,
+}
+
+struct BenchmarkAttemptContext {
+    attempt: usize,
+    max_attempts: usize,
+    will_retry: bool,
+    retry_delay_ms: u64,
+    timing: BenchmarkStepTiming,
+}
+
+#[derive(Clone, Default, Serialize)]
 struct OutboundConnectSample {
     attempts: u64,
     established: u64,
@@ -536,7 +748,7 @@ struct OutboundConnectSample {
     session_failed: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Default, Serialize)]
 struct ProtocolErrorSample {
     synthetic_seeder: u64,
     incoming_hub_handshake: u64,
@@ -549,6 +761,68 @@ struct ProtocolErrorSample {
     synthetic_leecher_timed_out: u64,
     synthetic_leecher_other_io: u64,
     synthetic_leecher_non_io: u64,
+}
+
+#[derive(Clone)]
+struct BenchmarkStepPlan {
+    step: usize,
+    planned_steps: usize,
+    torrents: usize,
+    peers: usize,
+    size_per_torrent_bytes: u64,
+    estimated_disk_bytes: u64,
+    estimated_final_disk_bytes: u64,
+    disk_budget_bytes: u64,
+}
+
+struct BenchmarkRunProgress {
+    remaining_planned_steps: usize,
+    completed_steps: usize,
+    elapsed_wall_secs: f64,
+}
+
+impl BenchmarkRunProgress {
+    fn new(total_planned_steps: usize) -> Self {
+        Self {
+            remaining_planned_steps: total_planned_steps,
+            completed_steps: 0,
+            elapsed_wall_secs: 0.0,
+        }
+    }
+
+    fn record_step(
+        &mut self,
+        wall_secs: f64,
+        skipped_steps: usize,
+        current_scenario_remaining_steps: usize,
+        added_retry_attempts: usize,
+    ) -> BenchmarkStepTiming {
+        self.completed_steps = self.completed_steps.saturating_add(1);
+        self.elapsed_wall_secs += wall_secs;
+        self.remaining_planned_steps = self
+            .remaining_planned_steps
+            .saturating_sub(1usize.saturating_add(skipped_steps))
+            .saturating_add(added_retry_attempts);
+        let average_step_wall_secs = if self.completed_steps == 0 {
+            0.0
+        } else {
+            self.elapsed_wall_secs / self.completed_steps as f64
+        };
+
+        BenchmarkStepTiming {
+            wall_secs,
+            eta: BenchmarkEta {
+                current_scenario_remaining_steps,
+                full_benchmark_remaining_steps: self.remaining_planned_steps,
+                current_scenario_eta_secs: average_step_wall_secs
+                    * current_scenario_remaining_steps as f64,
+                full_benchmark_eta_secs: average_step_wall_secs
+                    * self.remaining_planned_steps as f64,
+                average_step_wall_secs,
+                elapsed_wall_secs: self.elapsed_wall_secs,
+            },
+        }
+    }
 }
 
 #[derive(Default, Serialize)]
@@ -567,6 +841,27 @@ struct ResourceSample {
 }
 
 pub async fn run(args: &SyntheticLoadArgs, json_output: bool) -> Result<(), DynError> {
+    let (summary, samples_path, summary_path) = run_once(args, json_output).await?;
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!(
+            "Synthetic load complete: down={} up={} samples={} summary={}",
+            format_bps(summary.avg_download_bps),
+            format_bps(summary.avg_upload_bps),
+            samples_path.display(),
+            summary_path.display()
+        );
+    }
+
+    Ok(())
+}
+
+async fn run_once(
+    args: &SyntheticLoadArgs,
+    suppress_sample_output: bool,
+) -> Result<(SyntheticSummary, PathBuf, PathBuf), DynError> {
     let config = ParsedSyntheticConfig::from_args(args)?;
     let run_id = Local::now().format("run_%Y%m%d_%H%M%S").to_string();
     let output_dir = args.out.join(&run_id);
@@ -693,7 +988,7 @@ pub async fn run(args: &SyntheticLoadArgs, json_output: bool) -> Result<(), DynE
             peer_handles: &mut peer_handles,
             orchestration_rx: &mut orchestration_rx,
             orchestration_progress: &mut orchestration_progress,
-            json_output,
+            json_output: suppress_sample_output,
         },
         &mut sample_writer,
     )
@@ -723,24 +1018,342 @@ pub async fn run(args: &SyntheticLoadArgs, json_output: bool) -> Result<(), DynE
     let summary_path = output_dir.join("summary.json");
     tokio::fs::write(&summary_path, serde_json::to_vec_pretty(&summary)?).await?;
 
+    Ok((summary, samples_path, summary_path))
+}
+
+pub async fn run_benchmark(
+    args: &SyntheticBenchmarkArgs,
+    json_output: bool,
+) -> Result<(), DynError> {
+    let config = ParsedBenchmarkConfig::from_args(args)?;
+    let benchmark_started = Instant::now();
+    let run_id = Local::now().format("benchmark_%Y%m%d_%H%M%S").to_string();
+    let output_dir = args.out.join(&run_id);
+    tokio::fs::create_dir_all(&output_dir).await?;
+
+    let modes = [
+        SyntheticLoadMode::Download,
+        SyntheticLoadMode::Upload,
+        SyntheticLoadMode::Swarm,
+    ];
+    let total_planned_steps = benchmark_total_planned_steps(args, &config, &modes);
+    let mut progress = BenchmarkRunProgress::new(total_planned_steps);
+    let mut profiles = Vec::new();
+    for mode in modes {
+        match run_benchmark_profile(args, &config, mode, &output_dir, json_output, &mut progress)
+            .await
+        {
+            Ok(profile) => profiles.push(profile),
+            Err(error) => {
+                profiles.push(benchmark_failed_profile_summary(
+                    args,
+                    &config,
+                    mode,
+                    error.to_string(),
+                    &mut progress,
+                ));
+            }
+        }
+    }
+    let runtime_secs = benchmark_started.elapsed().as_secs_f64();
+    let report = benchmark_report(args, &config, &profiles, total_planned_steps, runtime_secs);
+
+    let summary = BenchmarkSummary {
+        run_id,
+        disk_budget_bytes: config.disk_budget,
+        preferred_size_per_torrent_bytes: config.preferred_size_per_torrent,
+        piece_size_bytes: config.piece_size,
+        max_torrents: args.max_torrents,
+        max_peers: args.max_peers,
+        planned_steps: total_planned_steps,
+        keep_output: args.keep_output,
+        report,
+        profiles,
+        output_dir: output_dir.clone(),
+    };
+
+    let summary_path = output_dir.join("benchmark_summary.json");
+    tokio::fs::write(&summary_path, serde_json::to_vec_pretty(&summary)?).await?;
+
     if json_output {
         println!("{}", serde_json::to_string_pretty(&summary)?);
     } else {
-        println!(
-            "Synthetic load complete: down={} up={} samples={} summary={}",
-            format_bps(summary.avg_download_bps),
-            format_bps(summary.avg_upload_bps),
-            samples_path.display(),
-            summary_path.display()
-        );
+        print_benchmark_report(&summary, &summary_path);
     }
 
     Ok(())
 }
 
+async fn run_benchmark_profile(
+    args: &SyntheticBenchmarkArgs,
+    config: &ParsedBenchmarkConfig,
+    mode: SyntheticLoadMode,
+    output_dir: &Path,
+    json_output: bool,
+    progress: &mut BenchmarkRunProgress,
+) -> Result<BenchmarkProfileSummary, DynError> {
+    let plans = benchmark_step_plans(args, config, mode)?;
+    let final_plan = plans
+        .last()
+        .cloned()
+        .ok_or_else(|| "benchmark generated no steps".to_string())?;
+    let mut steps = Vec::new();
+    let mut last_clean = None;
+    let mut first_issue = None;
+
+    if !json_output {
+        println!(
+            "Benchmark {}: planned_steps={} final={}t/{}p final_size_per_torrent={} estimated_disk={}/{} budget={}",
+            mode_name(mode),
+            final_plan.planned_steps,
+            final_plan.torrents,
+            final_plan.peers,
+            format_bytes(final_plan.size_per_torrent_bytes),
+            format_bytes(final_plan.estimated_disk_bytes),
+            format_bytes(config.disk_budget),
+            format_bytes(config.disk_budget)
+        );
+    }
+
+    'plans: for plan in plans {
+        let max_attempts = args.issue_retries.saturating_add(1).max(1);
+        for attempt in 1..=max_attempts {
+            let step_out = output_dir.join(mode_name(mode)).join(format!(
+                "step_{:02}_{}t_{}p_attempt_{:02}",
+                plan.step, plan.torrents, plan.peers, attempt
+            ));
+            let synthetic_args = benchmark_synthetic_args(
+                args,
+                mode,
+                plan.torrents,
+                plan.peers,
+                plan.size_per_torrent_bytes,
+                step_out,
+            );
+
+            if !json_output {
+                println!(
+                    "Benchmark {} step {}/{} attempt {}/{}: torrents={} peers={} size_per_torrent={} estimated_disk={}/{} budget={}",
+                    mode_name(mode),
+                    plan.step,
+                    plan.planned_steps,
+                    attempt,
+                    max_attempts,
+                    plan.torrents,
+                    plan.peers,
+                    format_bytes(plan.size_per_torrent_bytes),
+                    format_bytes(plan.estimated_disk_bytes),
+                    format_bytes(final_plan.estimated_disk_bytes),
+                    format_bytes(config.disk_budget)
+                );
+            }
+
+            let step_started = Instant::now();
+            let (summary, samples_path, summary_path) = match run_once(&synthetic_args, true).await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    let will_retry = attempt < max_attempts;
+                    let timing = progress.record_step(
+                        step_started.elapsed().as_secs_f64(),
+                        if will_retry {
+                            0
+                        } else {
+                            remaining_steps_after_issue(&plan)
+                        },
+                        if will_retry {
+                            remaining_steps_in_current_scenario(&plan).saturating_add(1)
+                        } else {
+                            0
+                        },
+                        usize::from(will_retry),
+                    );
+                    let attempt_context = BenchmarkAttemptContext {
+                        attempt,
+                        max_attempts,
+                        will_retry,
+                        retry_delay_ms: args.retry_delay_ms,
+                        timing,
+                    };
+                    let step = benchmark_failed_step_summary(
+                        mode,
+                        &plan,
+                        attempt_context,
+                        error.to_string(),
+                    );
+                    if !json_output {
+                        print_benchmark_step_result(&step);
+                    }
+                    if will_retry {
+                        steps.push(step);
+                        sleep_before_benchmark_retry(args.retry_delay_ms).await;
+                        continue;
+                    }
+                    first_issue = Some(step.clone());
+                    steps.push(step);
+                    break 'plans;
+                }
+            };
+            let data_removed = if args.keep_output {
+                false
+            } else {
+                remove_run_data_dir(&summary.output_dir).await?
+            };
+            let issues = benchmark_issues(&summary, args);
+            let has_issue = !issues.is_empty();
+            let will_retry = has_issue && attempt < max_attempts;
+            let timing = progress.record_step(
+                step_started.elapsed().as_secs_f64(),
+                if has_issue && !will_retry {
+                    remaining_steps_after_issue(&plan)
+                } else {
+                    0
+                },
+                if will_retry {
+                    remaining_steps_in_current_scenario(&plan).saturating_add(1)
+                } else if has_issue {
+                    0
+                } else {
+                    remaining_steps_in_current_scenario(&plan)
+                },
+                usize::from(will_retry),
+            );
+            let step = benchmark_step_summary(
+                &summary,
+                &plan,
+                BenchmarkAttemptContext {
+                    attempt,
+                    max_attempts,
+                    will_retry,
+                    retry_delay_ms: args.retry_delay_ms,
+                    timing,
+                },
+                samples_path,
+                summary_path,
+                issues,
+                data_removed,
+            );
+
+            if !json_output {
+                print_benchmark_step_result(&step);
+            }
+
+            if step.issues.is_empty() {
+                last_clean = Some(step.clone());
+                steps.push(step);
+                break;
+            }
+
+            if will_retry {
+                steps.push(step);
+                sleep_before_benchmark_retry(args.retry_delay_ms).await;
+                continue;
+            }
+
+            first_issue = Some(step.clone());
+            steps.push(step);
+            break 'plans;
+        }
+    }
+    let metrics = benchmark_profile_metrics(&steps);
+
+    Ok(BenchmarkProfileSummary {
+        mode: mode_name(mode).to_string(),
+        planned_steps: final_plan.planned_steps,
+        final_torrents: final_plan.torrents,
+        final_peers: final_plan.peers,
+        final_size_per_torrent_bytes: final_plan.size_per_torrent_bytes,
+        final_estimated_disk_bytes: final_plan.estimated_disk_bytes,
+        metrics,
+        last_clean,
+        first_issue,
+        steps,
+    })
+}
+
 struct ParsedSyntheticConfig {
     size_per_torrent: u64,
     piece_size: u64,
+}
+
+struct ParsedBenchmarkConfig {
+    disk_budget: u64,
+    preferred_size_per_torrent: u64,
+    piece_size: u64,
+}
+
+impl ParsedBenchmarkConfig {
+    fn from_args(args: &SyntheticBenchmarkArgs) -> Result<Self, DynError> {
+        if args.start_torrents == 0 || args.max_torrents == 0 {
+            return Err("benchmark requires torrent counts greater than 0".into());
+        }
+        if args.start_peers == 0 || args.max_peers == 0 {
+            return Err("benchmark requires peer counts greater than 0".into());
+        }
+        if args.max_steps == 0 {
+            return Err("benchmark requires --max-steps greater than 0".into());
+        }
+        if args.duration_secs == 0 {
+            return Err("benchmark requires --duration-secs greater than 0".into());
+        }
+        if args.metrics_interval_ms == 0 {
+            return Err("benchmark requires --metrics-interval-ms greater than 0".into());
+        }
+        if args.leecher_pipeline == 0 {
+            return Err("benchmark requires --leecher-pipeline greater than 0".into());
+        }
+        if args.peer_add_interval_ms == 0 {
+            return Err("benchmark requires --peer-add-interval-ms greater than 0".into());
+        }
+        if args.peer_add_burst_size == 0 {
+            return Err("benchmark requires --peer-add-burst-size greater than 0".into());
+        }
+        if args.target_gbps <= 0.0 || !args.target_gbps.is_finite() {
+            return Err("benchmark requires --target-gbps to be finite and greater than 0".into());
+        }
+
+        let disk_budget = parse_size(&args.disk_budget)?;
+        let preferred_size_per_torrent = parse_size(&args.size_per_torrent)?;
+        let piece_size = parse_size(&args.piece_size)?;
+        if piece_size == 0 || piece_size > u32::MAX as u64 {
+            return Err("--piece-size must be between 1 byte and u32::MAX".into());
+        }
+        if preferred_size_per_torrent < piece_size {
+            return Err("--size-per-torrent must be at least --piece-size".into());
+        }
+        let min_download_budget = estimated_disk_bytes(
+            SyntheticLoadMode::Download,
+            args.start_torrents.min(args.max_torrents),
+            piece_size,
+        );
+        let min_swarm_budget = estimated_disk_bytes(
+            SyntheticLoadMode::Swarm,
+            args.start_torrents.min(args.max_torrents),
+            piece_size,
+        );
+        if disk_budget < min_download_budget {
+            return Err(format!(
+                "--disk-budget {} is too small for the first download/upload step; need at least {}",
+                format_bytes(disk_budget),
+                format_bytes(min_download_budget)
+            )
+            .into());
+        }
+        if disk_budget < min_swarm_budget {
+            return Err(format!(
+                "--disk-budget {} is too small for the first swarm step; need at least {}",
+                format_bytes(disk_budget),
+                format_bytes(min_swarm_budget)
+            )
+            .into());
+        }
+
+        Ok(Self {
+            disk_budget,
+            preferred_size_per_torrent,
+            piece_size,
+        })
+    }
 }
 
 impl ParsedSyntheticConfig {
@@ -1684,6 +2297,7 @@ async fn sample_loop(
     let upload_bytes = last_sample_upload.saturating_sub(base_upload);
     let avg_download_bps = bytes_to_bits_per_second(download_bytes, measured_secs);
     let avg_upload_bps = bytes_to_bits_per_second(upload_bytes, measured_secs);
+    let manager_totals = manager_totals(managers);
 
     Ok(SyntheticSummary {
         run_id: run_id.to_string(),
@@ -1714,6 +2328,8 @@ async fn sample_loop(
         avg_upload_bps,
         avg_download_mbps: avg_download_bps as f64 / 1_000_000.0,
         avg_upload_mbps: avg_upload_bps as f64 / 1_000_000.0,
+        completed_pieces: manager_totals.completed_pieces,
+        total_pieces: manager_totals.total_pieces,
         seeder_requests: counters.seeder_requests.load(Ordering::Relaxed),
         leecher_requests: counters.leecher_requests.load(Ordering::Relaxed),
         leecher_pieces: counters.leecher_pieces.load(Ordering::Relaxed),
@@ -1908,6 +2524,1010 @@ fn topology_for(
     }
 
     Ok(topology)
+}
+
+fn benchmark_step_plans(
+    args: &SyntheticBenchmarkArgs,
+    config: &ParsedBenchmarkConfig,
+    mode: SyntheticLoadMode,
+) -> Result<Vec<BenchmarkStepPlan>, DynError> {
+    let mut torrents = args.start_torrents.min(args.max_torrents);
+    let mut peers = args.start_peers.min(args.max_peers);
+    let mut plans = Vec::new();
+
+    for step_index in 0..args.max_steps {
+        let step_peers = benchmark_step_peers(mode, torrents, peers, args.max_peers)?;
+        let size_per_torrent = benchmark_size_per_torrent(config, mode, torrents)?;
+        plans.push(BenchmarkStepPlan {
+            step: step_index + 1,
+            planned_steps: 0,
+            torrents,
+            peers: step_peers,
+            size_per_torrent_bytes: size_per_torrent,
+            estimated_disk_bytes: estimated_disk_bytes(mode, torrents, size_per_torrent),
+            estimated_final_disk_bytes: 0,
+            disk_budget_bytes: config.disk_budget,
+        });
+
+        if torrents == args.max_torrents && peers == args.max_peers {
+            break;
+        }
+
+        let next = next_benchmark_step(mode, torrents, peers, args.max_torrents, args.max_peers);
+        if next == (torrents, peers) {
+            break;
+        }
+        torrents = next.0;
+        peers = next.1;
+    }
+
+    let planned_steps = plans.len();
+    let final_estimated_disk_bytes = plans
+        .last()
+        .map(|plan| plan.estimated_disk_bytes)
+        .unwrap_or_default();
+    for plan in &mut plans {
+        plan.planned_steps = planned_steps;
+        plan.estimated_final_disk_bytes = final_estimated_disk_bytes;
+    }
+
+    Ok(plans)
+}
+
+fn benchmark_total_planned_steps(
+    args: &SyntheticBenchmarkArgs,
+    config: &ParsedBenchmarkConfig,
+    modes: &[SyntheticLoadMode],
+) -> usize {
+    modes
+        .iter()
+        .map(|&mode| {
+            benchmark_step_plans(args, config, mode)
+                .map(|plans| plans.len())
+                .unwrap_or(1)
+        })
+        .sum::<usize>()
+        .max(1)
+}
+
+fn remaining_steps_in_current_scenario(plan: &BenchmarkStepPlan) -> usize {
+    plan.planned_steps.saturating_sub(plan.step)
+}
+
+fn remaining_steps_after_issue(plan: &BenchmarkStepPlan) -> usize {
+    remaining_steps_in_current_scenario(plan)
+}
+
+async fn sleep_before_benchmark_retry(retry_delay_ms: u64) {
+    if retry_delay_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
+    }
+}
+
+fn benchmark_synthetic_args(
+    args: &SyntheticBenchmarkArgs,
+    mode: SyntheticLoadMode,
+    torrents: usize,
+    peers: usize,
+    size_per_torrent: u64,
+    out: PathBuf,
+) -> SyntheticLoadArgs {
+    SyntheticLoadArgs {
+        torrents,
+        peers,
+        mode,
+        add_mode: SyntheticLoadAddMode::Upfront,
+        add_interval_ms: 1000,
+        add_burst_size: 1,
+        peer_add_mode: SyntheticLoadAddMode::Staggered,
+        peer_add_interval_ms: args.peer_add_interval_ms,
+        peer_add_burst_size: args.peer_add_burst_size,
+        size_per_torrent: size_per_torrent.to_string(),
+        piece_size: args.piece_size.clone(),
+        duration_secs: args.duration_secs,
+        warmup_secs: args.warmup_secs,
+        metrics_interval_ms: args.metrics_interval_ms,
+        leecher_pipeline: args.leecher_pipeline,
+        target_gbps: Some(args.target_gbps),
+        peer_connection_permits: args.peer_connection_permits,
+        disk_read_permits: args.disk_read_permits,
+        disk_write_permits: args.disk_write_permits,
+        out,
+    }
+}
+
+fn benchmark_size_per_torrent(
+    config: &ParsedBenchmarkConfig,
+    mode: SyntheticLoadMode,
+    torrents: usize,
+) -> Result<u64, DynError> {
+    let side_multiplier = disk_side_multiplier(mode) as u64;
+    let budget_per_torrent = config
+        .disk_budget
+        .checked_div((torrents as u64).saturating_mul(side_multiplier).max(1))
+        .unwrap_or(0);
+    let requested = config.preferred_size_per_torrent.min(budget_per_torrent);
+    if requested < config.piece_size {
+        return Err(format!(
+            "{} torrents in {} mode need at least {} of disk budget at piece size {}; current budget is {}",
+            torrents,
+            mode_name(mode),
+            format_bytes(estimated_disk_bytes(mode, torrents, config.piece_size)),
+            format_bytes(config.piece_size),
+            format_bytes(config.disk_budget)
+        )
+        .into());
+    }
+
+    let pieces = (requested / config.piece_size).max(1);
+    Ok(pieces.saturating_mul(config.piece_size))
+}
+
+fn disk_side_multiplier(mode: SyntheticLoadMode) -> usize {
+    match mode {
+        SyntheticLoadMode::Swarm => 2,
+        SyntheticLoadMode::Download | SyntheticLoadMode::Upload => 1,
+    }
+}
+
+fn estimated_disk_bytes(mode: SyntheticLoadMode, torrents: usize, size_per_torrent: u64) -> u64 {
+    size_per_torrent
+        .saturating_mul(torrents as u64)
+        .saturating_mul(disk_side_multiplier(mode) as u64)
+}
+
+fn benchmark_step_peers(
+    mode: SyntheticLoadMode,
+    torrents: usize,
+    peers: usize,
+    max_peers: usize,
+) -> Result<usize, DynError> {
+    let min_peers = benchmark_min_peers(mode, torrents);
+    if min_peers > max_peers {
+        return Err(format!(
+            "{} torrents in {} mode need at least {} peers; --max-peers is {}",
+            torrents,
+            mode_name(mode),
+            min_peers,
+            max_peers
+        )
+        .into());
+    }
+    Ok(peers.max(min_peers).min(max_peers))
+}
+
+fn benchmark_min_peers(mode: SyntheticLoadMode, torrents: usize) -> usize {
+    match mode {
+        SyntheticLoadMode::Swarm => torrents.saturating_mul(2),
+        SyntheticLoadMode::Download | SyntheticLoadMode::Upload => torrents,
+    }
+}
+
+fn next_benchmark_step(
+    mode: SyntheticLoadMode,
+    torrents: usize,
+    peers: usize,
+    max_torrents: usize,
+    max_peers: usize,
+) -> (usize, usize) {
+    if torrents < max_torrents {
+        let next_torrents = torrents.saturating_mul(2).min(max_torrents);
+        (
+            next_torrents,
+            peers.max(benchmark_min_peers(mode, next_torrents).min(max_peers)),
+        )
+    } else {
+        (torrents, peers.saturating_mul(2).min(max_peers))
+    }
+}
+
+fn benchmark_issues(summary: &SyntheticSummary, args: &SyntheticBenchmarkArgs) -> Vec<String> {
+    let mut issues = Vec::new();
+    if summary.torrents_added < summary.torrents {
+        issues.push(format!(
+            "torrent_add_lag: added {}/{}",
+            summary.torrents_added, summary.torrents
+        ));
+    }
+    if summary.peers_added < summary.requested_peers {
+        issues.push(format!(
+            "peer_add_lag: added {}/{}",
+            summary.peers_added, summary.requested_peers
+        ));
+    }
+    if summary.max_sample_delay_ms > args.max_sample_delay_ms {
+        issues.push(format!(
+            "sample_delay: {}ms > {}ms",
+            summary.max_sample_delay_ms, args.max_sample_delay_ms
+        ));
+    }
+    if summary.protocol_errors > 0 {
+        issues.push(format!("protocol_errors: {}", summary.protocol_errors));
+    }
+    if summary.outbound_connect.permit_timeout > 0 {
+        issues.push(format!(
+            "outbound_permit_timeout: {}",
+            summary.outbound_connect.permit_timeout
+        ));
+    }
+    if summary.outbound_connect.connect_timeout > 0 {
+        issues.push(format!(
+            "outbound_connect_timeout: {}",
+            summary.outbound_connect.connect_timeout
+        ));
+    }
+    if summary.outbound_connect.connection_refused > 0 {
+        issues.push(format!(
+            "outbound_connection_refused: {}",
+            summary.outbound_connect.connection_refused
+        ));
+    }
+    if summary
+        .protocol_error_detail
+        .synthetic_leecher_connection_refused
+        > 0
+    {
+        issues.push(format!(
+            "synthetic_leecher_connection_refused: {}",
+            summary
+                .protocol_error_detail
+                .synthetic_leecher_connection_refused
+        ));
+    }
+    issues
+}
+
+fn benchmark_step_summary(
+    summary: &SyntheticSummary,
+    plan: &BenchmarkStepPlan,
+    attempt: BenchmarkAttemptContext,
+    samples_path: PathBuf,
+    summary_path: PathBuf,
+    issues: Vec<String>,
+    data_removed: bool,
+) -> BenchmarkStepSummary {
+    BenchmarkStepSummary {
+        step: plan.step,
+        planned_steps: plan.planned_steps,
+        attempt: attempt.attempt,
+        max_attempts: attempt.max_attempts,
+        will_retry: attempt.will_retry,
+        retry_delay_ms: if attempt.will_retry {
+            attempt.retry_delay_ms
+        } else {
+            0
+        },
+        mode: summary.mode.clone(),
+        torrents: summary.torrents,
+        peers: summary.requested_peers,
+        size_per_torrent_bytes: plan.size_per_torrent_bytes,
+        estimated_disk_bytes: plan.estimated_disk_bytes,
+        estimated_final_disk_bytes: plan.estimated_final_disk_bytes,
+        disk_budget_bytes: plan.disk_budget_bytes,
+        measured_secs: summary.measured_secs,
+        wall_secs: attempt.timing.wall_secs,
+        eta: attempt.timing.eta,
+        download_bytes: summary.download_bytes,
+        upload_bytes: summary.upload_bytes,
+        avg_download_bps: summary.avg_download_bps,
+        avg_upload_bps: summary.avg_upload_bps,
+        avg_download_mbps: summary.avg_download_mbps,
+        avg_upload_mbps: summary.avg_upload_mbps,
+        torrents_added: summary.torrents_added,
+        peers_added: summary.peers_added,
+        requested_peers: summary.requested_peers,
+        max_peer_add_lag: summary.max_peer_add_lag,
+        max_sample_delay_ms: summary.max_sample_delay_ms,
+        protocol_errors: summary.protocol_errors,
+        protocol_error_detail: summary.protocol_error_detail.clone(),
+        outbound_failed: summary.outbound_connect.failed,
+        outbound_permit_timeout: summary.outbound_connect.permit_timeout,
+        outbound_connect: summary.outbound_connect.clone(),
+        synthetic_leecher_errors: summary.protocol_error_detail.synthetic_leecher,
+        seeder_requests: summary.seeder_requests,
+        leecher_requests: summary.leecher_requests,
+        leecher_pieces: summary.leecher_pieces,
+        connections: summary.connections,
+        disconnects: summary.disconnects,
+        manager_peer_connected: summary.manager_peer_connected,
+        manager_peer_disconnected: summary.manager_peer_disconnected,
+        manager_block_received: summary.manager_block_received,
+        manager_block_sent: summary.manager_block_sent,
+        disk_read_started: summary.disk_read_started,
+        disk_read_finished: summary.disk_read_finished,
+        disk_write_started: summary.disk_write_started,
+        disk_write_finished: summary.disk_write_finished,
+        completed_pieces: summary.completed_pieces,
+        total_pieces: summary.total_pieces,
+        error: None,
+        issues,
+        summary_path: Some(summary_path),
+        samples_path: Some(samples_path),
+        data_removed,
+    }
+}
+
+fn benchmark_failed_step_summary(
+    mode: SyntheticLoadMode,
+    plan: &BenchmarkStepPlan,
+    attempt: BenchmarkAttemptContext,
+    error: String,
+) -> BenchmarkStepSummary {
+    let issue = format!("runtime_error: {error}");
+    BenchmarkStepSummary {
+        step: plan.step,
+        planned_steps: plan.planned_steps,
+        attempt: attempt.attempt,
+        max_attempts: attempt.max_attempts,
+        will_retry: attempt.will_retry,
+        retry_delay_ms: if attempt.will_retry {
+            attempt.retry_delay_ms
+        } else {
+            0
+        },
+        mode: mode_name(mode).to_string(),
+        torrents: plan.torrents,
+        peers: plan.peers,
+        size_per_torrent_bytes: plan.size_per_torrent_bytes,
+        estimated_disk_bytes: plan.estimated_disk_bytes,
+        estimated_final_disk_bytes: plan.estimated_final_disk_bytes,
+        disk_budget_bytes: plan.disk_budget_bytes,
+        measured_secs: 0.0,
+        wall_secs: attempt.timing.wall_secs,
+        eta: attempt.timing.eta,
+        download_bytes: 0,
+        upload_bytes: 0,
+        avg_download_bps: 0,
+        avg_upload_bps: 0,
+        avg_download_mbps: 0.0,
+        avg_upload_mbps: 0.0,
+        torrents_added: 0,
+        peers_added: 0,
+        requested_peers: plan.peers,
+        max_peer_add_lag: plan.peers,
+        max_sample_delay_ms: 0,
+        protocol_errors: 0,
+        protocol_error_detail: ProtocolErrorSample::default(),
+        outbound_failed: 0,
+        outbound_permit_timeout: 0,
+        outbound_connect: OutboundConnectSample::default(),
+        synthetic_leecher_errors: 0,
+        seeder_requests: 0,
+        leecher_requests: 0,
+        leecher_pieces: 0,
+        connections: 0,
+        disconnects: 0,
+        manager_peer_connected: 0,
+        manager_peer_disconnected: 0,
+        manager_block_received: 0,
+        manager_block_sent: 0,
+        disk_read_started: 0,
+        disk_read_finished: 0,
+        disk_write_started: 0,
+        disk_write_finished: 0,
+        completed_pieces: 0,
+        total_pieces: 0,
+        error: Some(error),
+        issues: vec![issue],
+        summary_path: None,
+        samples_path: None,
+        data_removed: false,
+    }
+}
+
+fn benchmark_failed_profile_summary(
+    args: &SyntheticBenchmarkArgs,
+    config: &ParsedBenchmarkConfig,
+    mode: SyntheticLoadMode,
+    error: String,
+    progress: &mut BenchmarkRunProgress,
+) -> BenchmarkProfileSummary {
+    let torrents = args.start_torrents.min(args.max_torrents);
+    let min_peers = benchmark_min_peers(mode, torrents);
+    let peers = args
+        .start_peers
+        .min(args.max_peers)
+        .max(min_peers.min(args.max_peers));
+    let size_per_torrent =
+        benchmark_size_per_torrent(config, mode, torrents).unwrap_or(config.piece_size);
+    let estimated_disk = estimated_disk_bytes(mode, torrents, size_per_torrent);
+    let plan = BenchmarkStepPlan {
+        step: 1,
+        planned_steps: 1,
+        torrents,
+        peers,
+        size_per_torrent_bytes: size_per_torrent,
+        estimated_disk_bytes: estimated_disk,
+        estimated_final_disk_bytes: estimated_disk,
+        disk_budget_bytes: config.disk_budget,
+    };
+    let timing = progress.record_step(0.0, 0, 0, 0);
+    let step = benchmark_failed_step_summary(
+        mode,
+        &plan,
+        BenchmarkAttemptContext {
+            attempt: 1,
+            max_attempts: 1,
+            will_retry: false,
+            retry_delay_ms: 0,
+            timing,
+        },
+        error,
+    );
+    let steps = vec![step.clone()];
+
+    BenchmarkProfileSummary {
+        mode: mode_name(mode).to_string(),
+        planned_steps: 1,
+        final_torrents: torrents,
+        final_peers: peers,
+        final_size_per_torrent_bytes: size_per_torrent,
+        final_estimated_disk_bytes: estimated_disk,
+        metrics: benchmark_profile_metrics(&steps),
+        last_clean: None,
+        first_issue: Some(step),
+        steps,
+    }
+}
+
+fn benchmark_profile_metrics(steps: &[BenchmarkStepSummary]) -> BenchmarkProfileMetrics {
+    let mut metrics = BenchmarkProfileMetrics {
+        steps_run: steps.len(),
+        retry_attempts: steps.iter().filter(|step| step.attempt > 1).count(),
+        transient_issue_attempts: steps
+            .iter()
+            .filter(|step| !step.issues.is_empty() && step.will_retry)
+            .count(),
+        recovered_after_retry_steps: steps
+            .iter()
+            .filter(|step| step.issues.is_empty() && step.attempt > 1)
+            .count(),
+        final_issue_steps: steps
+            .iter()
+            .filter(|step| !step.issues.is_empty() && !step.will_retry)
+            .count(),
+        clean_steps: steps.iter().filter(|step| step.issues.is_empty()).count(),
+        issue_steps: steps.iter().filter(|step| !step.issues.is_empty()).count(),
+        total_measured_secs: steps.iter().map(|step| step.measured_secs).sum(),
+        total_download_bytes: 0,
+        total_upload_bytes: 0,
+        max_download_bps: 0,
+        max_upload_bps: 0,
+        max_sample_delay_ms: 0,
+        estimated_disk_high_water_bytes: 0,
+        protocol_errors: 0,
+        protocol_error_detail: ProtocolErrorSample::default(),
+        outbound_failed: 0,
+        outbound_permit_timeout: 0,
+        outbound_connect: OutboundConnectSample::default(),
+        synthetic_leecher_errors: 0,
+        seeder_requests: 0,
+        leecher_requests: 0,
+        leecher_pieces: 0,
+        connections: 0,
+        disconnects: 0,
+        manager_peer_connected: 0,
+        manager_peer_disconnected: 0,
+        manager_block_received: 0,
+        manager_block_sent: 0,
+        disk_read_started: 0,
+        disk_read_finished: 0,
+        disk_write_started: 0,
+        disk_write_finished: 0,
+        completed_pieces: 0,
+        total_pieces: 0,
+        data_removed_steps: 0,
+        data_kept_steps: 0,
+    };
+
+    for step in steps {
+        metrics.total_download_bytes = metrics
+            .total_download_bytes
+            .saturating_add(step.download_bytes);
+        metrics.total_upload_bytes = metrics.total_upload_bytes.saturating_add(step.upload_bytes);
+        metrics.max_download_bps = metrics.max_download_bps.max(step.avg_download_bps);
+        metrics.max_upload_bps = metrics.max_upload_bps.max(step.avg_upload_bps);
+        metrics.max_sample_delay_ms = metrics.max_sample_delay_ms.max(step.max_sample_delay_ms);
+        metrics.estimated_disk_high_water_bytes = metrics
+            .estimated_disk_high_water_bytes
+            .max(step.estimated_disk_bytes);
+        metrics.protocol_errors = metrics.protocol_errors.saturating_add(step.protocol_errors);
+        add_protocol_error_sample(
+            &mut metrics.protocol_error_detail,
+            &step.protocol_error_detail,
+        );
+        metrics.outbound_failed = metrics.outbound_failed.saturating_add(step.outbound_failed);
+        metrics.outbound_permit_timeout = metrics
+            .outbound_permit_timeout
+            .saturating_add(step.outbound_permit_timeout);
+        add_outbound_connect_sample(&mut metrics.outbound_connect, &step.outbound_connect);
+        metrics.synthetic_leecher_errors = metrics
+            .synthetic_leecher_errors
+            .saturating_add(step.synthetic_leecher_errors);
+        metrics.seeder_requests = metrics.seeder_requests.saturating_add(step.seeder_requests);
+        metrics.leecher_requests = metrics
+            .leecher_requests
+            .saturating_add(step.leecher_requests);
+        metrics.leecher_pieces = metrics.leecher_pieces.saturating_add(step.leecher_pieces);
+        metrics.connections = metrics.connections.saturating_add(step.connections);
+        metrics.disconnects = metrics.disconnects.saturating_add(step.disconnects);
+        metrics.manager_peer_connected = metrics
+            .manager_peer_connected
+            .saturating_add(step.manager_peer_connected);
+        metrics.manager_peer_disconnected = metrics
+            .manager_peer_disconnected
+            .saturating_add(step.manager_peer_disconnected);
+        metrics.manager_block_received = metrics
+            .manager_block_received
+            .saturating_add(step.manager_block_received);
+        metrics.manager_block_sent = metrics
+            .manager_block_sent
+            .saturating_add(step.manager_block_sent);
+        metrics.disk_read_started = metrics
+            .disk_read_started
+            .saturating_add(step.disk_read_started);
+        metrics.disk_read_finished = metrics
+            .disk_read_finished
+            .saturating_add(step.disk_read_finished);
+        metrics.disk_write_started = metrics
+            .disk_write_started
+            .saturating_add(step.disk_write_started);
+        metrics.disk_write_finished = metrics
+            .disk_write_finished
+            .saturating_add(step.disk_write_finished);
+        metrics.completed_pieces = metrics
+            .completed_pieces
+            .saturating_add(step.completed_pieces);
+        metrics.total_pieces = metrics.total_pieces.saturating_add(step.total_pieces);
+        if step.data_removed {
+            metrics.data_removed_steps += 1;
+        } else if step.summary_path.is_some() {
+            metrics.data_kept_steps += 1;
+        }
+    }
+
+    metrics
+}
+
+fn add_protocol_error_sample(total: &mut ProtocolErrorSample, sample: &ProtocolErrorSample) {
+    total.synthetic_seeder = total
+        .synthetic_seeder
+        .saturating_add(sample.synthetic_seeder);
+    total.incoming_hub_handshake = total
+        .incoming_hub_handshake
+        .saturating_add(sample.incoming_hub_handshake);
+    total.incoming_hub_route_miss = total
+        .incoming_hub_route_miss
+        .saturating_add(sample.incoming_hub_route_miss);
+    total.incoming_hub_route_send = total
+        .incoming_hub_route_send
+        .saturating_add(sample.incoming_hub_route_send);
+    total.synthetic_leecher = total
+        .synthetic_leecher
+        .saturating_add(sample.synthetic_leecher);
+    total.synthetic_leecher_addr_in_use = total
+        .synthetic_leecher_addr_in_use
+        .saturating_add(sample.synthetic_leecher_addr_in_use);
+    total.synthetic_leecher_addr_not_available = total
+        .synthetic_leecher_addr_not_available
+        .saturating_add(sample.synthetic_leecher_addr_not_available);
+    total.synthetic_leecher_connection_refused = total
+        .synthetic_leecher_connection_refused
+        .saturating_add(sample.synthetic_leecher_connection_refused);
+    total.synthetic_leecher_timed_out = total
+        .synthetic_leecher_timed_out
+        .saturating_add(sample.synthetic_leecher_timed_out);
+    total.synthetic_leecher_other_io = total
+        .synthetic_leecher_other_io
+        .saturating_add(sample.synthetic_leecher_other_io);
+    total.synthetic_leecher_non_io = total
+        .synthetic_leecher_non_io
+        .saturating_add(sample.synthetic_leecher_non_io);
+}
+
+fn add_outbound_connect_sample(total: &mut OutboundConnectSample, sample: &OutboundConnectSample) {
+    total.attempts = total.attempts.saturating_add(sample.attempts);
+    total.established = total.established.saturating_add(sample.established);
+    total.failed = total.failed.saturating_add(sample.failed);
+    total.permit_timeout = total.permit_timeout.saturating_add(sample.permit_timeout);
+    total.permit_manager_shutdown = total
+        .permit_manager_shutdown
+        .saturating_add(sample.permit_manager_shutdown);
+    total.permit_queue_full = total
+        .permit_queue_full
+        .saturating_add(sample.permit_queue_full);
+    total.connect_timeout = total.connect_timeout.saturating_add(sample.connect_timeout);
+    total.connection_refused = total
+        .connection_refused
+        .saturating_add(sample.connection_refused);
+    total.connection_reset = total
+        .connection_reset
+        .saturating_add(sample.connection_reset);
+    total.connection_aborted = total
+        .connection_aborted
+        .saturating_add(sample.connection_aborted);
+    total.addr_in_use = total.addr_in_use.saturating_add(sample.addr_in_use);
+    total.addr_not_available = total
+        .addr_not_available
+        .saturating_add(sample.addr_not_available);
+    total.timed_out = total.timed_out.saturating_add(sample.timed_out);
+    total.other_io = total.other_io.saturating_add(sample.other_io);
+    total.session_failed = total.session_failed.saturating_add(sample.session_failed);
+}
+
+fn benchmark_report(
+    args: &SyntheticBenchmarkArgs,
+    config: &ParsedBenchmarkConfig,
+    profiles: &[BenchmarkProfileSummary],
+    planned_steps: usize,
+    runtime_secs: f64,
+) -> BenchmarkReport {
+    let steps_run = profiles
+        .iter()
+        .map(|profile| profile.metrics.steps_run)
+        .sum();
+    let clean_steps = profiles
+        .iter()
+        .map(|profile| profile.metrics.clean_steps)
+        .sum();
+    let issue_steps = profiles
+        .iter()
+        .map(|profile| profile.metrics.issue_steps)
+        .sum();
+    let retry_attempts = profiles
+        .iter()
+        .map(|profile| profile.metrics.retry_attempts)
+        .sum();
+    let transient_issue_attempts = profiles
+        .iter()
+        .map(|profile| profile.metrics.transient_issue_attempts)
+        .sum();
+    let recovered_after_retry_steps = profiles
+        .iter()
+        .map(|profile| profile.metrics.recovered_after_retry_steps)
+        .sum();
+    let scenarios = profiles
+        .iter()
+        .map(|profile| benchmark_scenario_report(args, profile))
+        .collect();
+
+    BenchmarkReport {
+        runtime_secs,
+        runtime: format_duration_secs(runtime_secs),
+        planned_steps,
+        steps_run,
+        retry_attempts,
+        transient_issue_attempts,
+        recovered_after_retry_steps,
+        clean_steps,
+        issue_steps,
+        configured_max_torrents: args.max_torrents,
+        configured_max_peers: args.max_peers,
+        disk_budget_bytes: config.disk_budget,
+        preferred_size_per_torrent_bytes: config.preferred_size_per_torrent,
+        piece_size_bytes: config.piece_size,
+        issue_retries: args.issue_retries,
+        retry_delay_ms: args.retry_delay_ms,
+        peer_connection_limit_policy: peer_connection_limit_policy(args),
+        os_limit_note: os_limit_note(),
+        scenarios,
+    }
+}
+
+fn benchmark_scenario_report(
+    args: &SyntheticBenchmarkArgs,
+    profile: &BenchmarkProfileSummary,
+) -> BenchmarkScenarioReport {
+    let clean = profile.last_clean.as_ref();
+    let issue = profile.first_issue.as_ref();
+    let capacity_step = clean.or(issue).or_else(|| profile.steps.last());
+    let clean_torrents = clean.map(|step| step.torrents).unwrap_or_default();
+    let clean_peers = clean.map(|step| step.peers).unwrap_or_default();
+    let clean_disk_working_set_bytes = clean
+        .map(|step| step.estimated_disk_bytes)
+        .unwrap_or_default();
+    let clean_size_per_torrent_bytes = clean
+        .map(|step| step.size_per_torrent_bytes)
+        .unwrap_or_default();
+    let runtime_secs = profile.steps.iter().map(|step| step.wall_secs).sum::<f64>();
+    let measured_secs = profile.metrics.total_measured_secs.max(0.001);
+    let disk_read_ops_per_sec = profile.metrics.disk_read_finished as f64 / runtime_secs.max(0.001);
+    let disk_write_ops_per_sec =
+        profile.metrics.disk_write_finished as f64 / runtime_secs.max(0.001);
+
+    BenchmarkScenarioReport {
+        mode: profile.mode.clone(),
+        verdict: benchmark_verdict(profile),
+        capacity_estimate: benchmark_capacity_estimate(profile),
+        clean_torrents,
+        clean_peers,
+        clean_disk_working_set_bytes,
+        clean_size_per_torrent_bytes,
+        first_issue_torrents: issue.map(|step| step.torrents),
+        first_issue_peers: issue.map(|step| step.peers),
+        first_issue: issue.map(|step| step.issues.join("; ")),
+        likely_bottleneck: likely_bottleneck(profile),
+        runtime_secs,
+        steps_run: profile.metrics.steps_run,
+        retry_attempts: profile.metrics.retry_attempts,
+        transient_issue_attempts: profile.metrics.transient_issue_attempts,
+        recovered_after_retry_steps: profile.metrics.recovered_after_retry_steps,
+        planned_steps: profile.planned_steps,
+        peak_download_bps: profile.metrics.max_download_bps,
+        peak_upload_bps: profile.metrics.max_upload_bps,
+        observed_disk_read_bytes_per_sec: bytes_per_second(
+            profile.metrics.total_upload_bytes,
+            measured_secs,
+        ),
+        observed_disk_write_bytes_per_sec: bytes_per_second(
+            profile.metrics.total_download_bytes,
+            measured_secs,
+        ),
+        disk_read_ops_per_sec,
+        disk_write_ops_per_sec,
+        max_sample_delay_ms: profile.metrics.max_sample_delay_ms,
+        protocol_errors: profile.metrics.protocol_errors,
+        outbound_failed: profile.metrics.outbound_failed,
+        outbound_permit_timeout: profile.metrics.outbound_permit_timeout,
+        peer_connection_limit: capacity_step
+            .map(|step| effective_peer_connection_limit(step.peers, args.peer_connection_permits))
+            .unwrap_or_default(),
+        disk_read_permits: args.disk_read_permits,
+        disk_write_permits: args.disk_write_permits,
+    }
+}
+
+fn benchmark_verdict(profile: &BenchmarkProfileSummary) -> String {
+    match (&profile.last_clean, &profile.first_issue) {
+        (Some(clean), None) if clean.step >= profile.planned_steps => {
+            "clean_to_configured_limit".to_string()
+        }
+        (Some(_), None) => "clean_until_stopped".to_string(),
+        (Some(_), Some(_)) => "bounded_by_first_issue".to_string(),
+        (None, Some(_)) => "failed_first_step".to_string(),
+        (None, None) => "no_steps".to_string(),
+    }
+}
+
+fn benchmark_capacity_estimate(profile: &BenchmarkProfileSummary) -> String {
+    match (&profile.last_clean, &profile.first_issue) {
+        (Some(clean), None) if clean.step >= profile.planned_steps => format!(
+            "at least {} torrents / {} peers; configured limit reached without benchmark issues",
+            clean.torrents, clean.peers
+        ),
+        (Some(clean), None) => format!(
+            "at least {} torrents / {} peers; run ended before a failing step",
+            clean.torrents, clean.peers
+        ),
+        (Some(clean), Some(issue)) => format!(
+            "clean through {} torrents / {} peers; first issue at {} torrents / {} peers",
+            clean.torrents, clean.peers, issue.torrents, issue.peers
+        ),
+        (None, Some(issue)) => format!(
+            "no clean capacity established; first issue at {} torrents / {} peers",
+            issue.torrents, issue.peers
+        ),
+        (None, None) => "no benchmark steps ran".to_string(),
+    }
+}
+
+fn likely_bottleneck(profile: &BenchmarkProfileSummary) -> String {
+    let issue = match profile.first_issue.as_ref() {
+        Some(issue) => issue,
+        None => return "none detected within configured benchmark limits".to_string(),
+    };
+    let joined = issue.issues.join("; ");
+    if joined.contains("sample_delay") {
+        "scheduler or event-loop lag".to_string()
+    } else if joined.contains("outbound_permit_timeout") {
+        "peer connection permit pressure".to_string()
+    } else if joined.contains("outbound_connect_timeout")
+        || joined.contains("outbound_connection_refused")
+        || issue.outbound_failed > 0
+    {
+        "socket/connect pressure".to_string()
+    } else if joined.contains("peer_add_lag") || joined.contains("torrent_add_lag") {
+        "orchestration could not add torrents or peers fast enough".to_string()
+    } else if issue.protocol_errors > 0 || joined.contains("synthetic_leecher") {
+        "protocol/session errors".to_string()
+    } else if joined.contains("runtime_error") {
+        "runtime/setup error".to_string()
+    } else {
+        format!("benchmark issue: {joined}")
+    }
+}
+
+fn effective_peer_connection_limit(peers: usize, configured: Option<usize>) -> usize {
+    configured.unwrap_or_else(|| peers.saturating_mul(2).saturating_add(128).max(256))
+}
+
+fn peer_connection_limit_policy(args: &SyntheticBenchmarkArgs) -> String {
+    match args.peer_connection_permits {
+        Some(limit) => format!("fixed {limit} peer connection permits"),
+        None => "auto per step: max(256, peers * 2 + 128)".to_string(),
+    }
+}
+
+fn os_limit_note() -> String {
+    if cfg!(windows) {
+        "Windows has no POSIX ulimit; benchmark reports harness peer permits and socket/connect failures instead".to_string()
+    } else {
+        "POSIX file-descriptor ulimit is not sampled by this harness; compare this report with `ulimit -n` when diagnosing socket ceilings".to_string()
+    }
+}
+
+async fn remove_run_data_dir(output_dir: &Path) -> Result<bool, DynError> {
+    let data_dir = output_dir.join("data");
+    if tokio::fs::try_exists(&data_dir).await? {
+        tokio::fs::remove_dir_all(&data_dir).await?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+fn print_benchmark_report(summary: &BenchmarkSummary, summary_path: &Path) {
+    println!();
+    println!("Benchmark Report");
+    println!("================");
+    println!(
+        "Runtime: {} | attempts: {} across {} planned steps, {} clean, {} issue, {} retry attempts, {} recovered",
+        summary.report.runtime,
+        summary.report.steps_run,
+        summary.report.planned_steps,
+        summary.report.clean_steps,
+        summary.report.issue_steps,
+        summary.report.retry_attempts,
+        summary.report.recovered_after_retry_steps
+    );
+    println!(
+        "Configured target: up to {} torrents / {} peers | disk budget={} | preferred torrent size={} | piece size={}",
+        summary.report.configured_max_torrents,
+        summary.report.configured_max_peers,
+        format_bytes(summary.report.disk_budget_bytes),
+        format_bytes(summary.report.preferred_size_per_torrent_bytes),
+        format_bytes(summary.report.piece_size_bytes)
+    );
+    println!(
+        "Resource limits: peer connections={} | disk permits read/write={}/{}",
+        summary.report.peer_connection_limit_policy,
+        summary
+            .report
+            .scenarios
+            .first()
+            .map(|scenario| scenario.disk_read_permits)
+            .unwrap_or_default(),
+        summary
+            .report
+            .scenarios
+            .first()
+            .map(|scenario| scenario.disk_write_permits)
+            .unwrap_or_default()
+    );
+    println!(
+        "Retry policy: {} additional attempts per issue, delay {}",
+        summary.report.issue_retries,
+        format_duration_secs(summary.report.retry_delay_ms as f64 / 1000.0)
+    );
+    println!("OS limit note: {}", summary.report.os_limit_note);
+    println!("Report JSON: {}", summary_path.display());
+
+    println!();
+    println!("Capacity Estimates");
+    println!("------------------");
+    for scenario in &summary.report.scenarios {
+        print_benchmark_scenario_report(scenario);
+    }
+
+    println!("Interpretation");
+    println!("--------------");
+    println!(
+        "A clean-to-limit result is a lower bound: this machine handled at least that many torrents and peers under this harness configuration."
+    );
+    println!(
+        "A bounded result means the capacity estimate is between the last clean step and the final issue step after retries; inspect samples.jsonl for that scenario before treating it as a hard product limit."
+    );
+    println!(
+        "Transient issue attempts are retried before a scenario is stopped, so a single noisy sample no longer defines capacity."
+    );
+    println!(
+        "Disk read/write rates are inferred from payload bytes moved during the synthetic run, not a standalone raw disk benchmark."
+    );
+}
+
+fn print_benchmark_scenario_report(scenario: &BenchmarkScenarioReport) {
+    println!("{}:", scenario.mode);
+    println!("  Verdict: {}", scenario.verdict);
+    println!("  Capacity: {}", scenario.capacity_estimate);
+    if let Some(issue) = &scenario.first_issue {
+        println!(
+            "  First issue: {} torrents / {} peers -> {}",
+            scenario.first_issue_torrents.unwrap_or_default(),
+            scenario.first_issue_peers.unwrap_or_default(),
+            issue
+        );
+    }
+    println!(
+        "  Throughput: peak down={} peak up={}",
+        format_bps(scenario.peak_download_bps),
+        format_bps(scenario.peak_upload_bps)
+    );
+    println!(
+        "  Disk payload rate: read={} write={} | disk ops read/write={:.1}/{:.1}/s",
+        format_bytes_per_second(scenario.observed_disk_read_bytes_per_sec),
+        format_bytes_per_second(scenario.observed_disk_write_bytes_per_sec),
+        scenario.disk_read_ops_per_sec,
+        scenario.disk_write_ops_per_sec
+    );
+    println!(
+        "  Working set: clean={} at {} per torrent | peer permit limit={}",
+        format_bytes(scenario.clean_disk_working_set_bytes),
+        format_bytes(scenario.clean_size_per_torrent_bytes),
+        scenario.peer_connection_limit
+    );
+    println!(
+        "  Health: runtime={} attempts={} planned_steps={} retries={} transient_issues={} recovered={} max_tick_lag={}ms protocol_errors={} outbound_failed={} permit_timeouts={}",
+        format_duration_secs(scenario.runtime_secs),
+        scenario.steps_run,
+        scenario.planned_steps,
+        scenario.retry_attempts,
+        scenario.transient_issue_attempts,
+        scenario.recovered_after_retry_steps,
+        scenario.max_sample_delay_ms,
+        scenario.protocol_errors,
+        scenario.outbound_failed,
+        scenario.outbound_permit_timeout
+    );
+    println!("  Bottleneck signal: {}", scenario.likely_bottleneck);
+    println!();
+}
+
+fn print_benchmark_step_result(step: &BenchmarkStepSummary) {
+    let status = if step.issues.is_empty() {
+        "ok"
+    } else if step.will_retry {
+        "retry"
+    } else {
+        "issue"
+    };
+    println!(
+        "  -> step {}/{} attempt {}/{} {}: down={} up={} bytes={}/{} pieces={}/{} torrents={}/{} peers={}/{} tick_lag={}ms protocol_errors={} outbound_failed={} disk_rw={}/{} data_removed={} eta_scenario={} eta_benchmark={} remaining={}/{} wall={}",
+        step.step,
+        step.planned_steps,
+        step.attempt,
+        step.max_attempts,
+        status,
+        format_bps(step.avg_download_bps),
+        format_bps(step.avg_upload_bps),
+        format_bytes(step.download_bytes),
+        format_bytes(step.upload_bytes),
+        step.completed_pieces,
+        step.total_pieces,
+        step.torrents_added,
+        step.torrents,
+        step.peers_added,
+        step.requested_peers,
+        step.max_sample_delay_ms,
+        step.protocol_errors,
+        step.outbound_failed,
+        step.disk_read_finished,
+        step.disk_write_finished,
+        step.data_removed,
+        format_duration_secs(step.eta.current_scenario_eta_secs),
+        format_duration_secs(step.eta.full_benchmark_eta_secs),
+        step.eta.current_scenario_remaining_steps,
+        step.eta.full_benchmark_remaining_steps,
+        format_duration_secs(step.wall_secs)
+    );
+    if !step.issues.is_empty() {
+        println!("     issues: {}", step.issues.join("; "));
+        if step.will_retry {
+            println!(
+                "     retrying after {}",
+                format_duration_secs(step.retry_delay_ms as f64 / 1000.0)
+            );
+        }
+    }
 }
 
 fn build_torrent_specs(
@@ -2253,6 +3873,10 @@ fn bytes_to_bits_per_second(bytes: u64, secs: f64) -> u64 {
     ((bytes as f64 * 8.0) / secs.max(0.001)) as u64
 }
 
+fn bytes_per_second(bytes: u64, secs: f64) -> u64 {
+    (bytes as f64 / secs.max(0.001)) as u64
+}
+
 fn format_bps(bits_per_second: u64) -> String {
     let bps = bits_per_second as f64;
     if bps >= 1_000_000_000.0 {
@@ -2263,6 +3887,45 @@ fn format_bps(bits_per_second: u64) -> String {
         format!("{:.1}Kbps", bps / 1_000.0)
     } else {
         format!("{}bps", bits_per_second)
+    }
+}
+
+fn format_bytes_per_second(bytes_per_second: u64) -> String {
+    format!("{}/s", format_bytes(bytes_per_second))
+}
+
+fn format_bytes(bytes: u64) -> String {
+    let value = bytes as f64;
+    if value >= 1024.0 * 1024.0 * 1024.0 {
+        format!("{:.2}GiB", value / (1024.0 * 1024.0 * 1024.0))
+    } else if value >= 1024.0 * 1024.0 {
+        format!("{:.2}MiB", value / (1024.0 * 1024.0))
+    } else if value >= 1024.0 {
+        format!("{:.2}KiB", value / 1024.0)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
+fn format_duration_secs(secs: f64) -> String {
+    if !secs.is_finite() {
+        return "unknown".to_string();
+    }
+    let secs = secs.max(0.0);
+    if secs > 0.0 && secs < 1.0 {
+        return format!("{:.0}ms", secs * 1000.0);
+    }
+    let total_secs = secs.ceil() as u64;
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+
+    if hours > 0 {
+        format!("{hours}h{minutes:02}m{seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{seconds}s")
     }
 }
 
@@ -2370,5 +4033,82 @@ mod tests {
 
         let semantic_error: DynError = "mismatched synthetic info hash".into();
         assert!(!is_expected_connection_close(semantic_error.as_ref()));
+    }
+
+    fn benchmark_args() -> SyntheticBenchmarkArgs {
+        SyntheticBenchmarkArgs {
+            start_torrents: 10,
+            start_peers: 10,
+            max_torrents: 10,
+            max_peers: 20,
+            max_steps: 1,
+            disk_budget: "20MiB".to_string(),
+            size_per_torrent: "8MiB".to_string(),
+            piece_size: "1MiB".to_string(),
+            duration_secs: 1,
+            warmup_secs: 0,
+            metrics_interval_ms: 1000,
+            leecher_pipeline: 1,
+            target_gbps: 1.0,
+            peer_add_interval_ms: 1000,
+            peer_add_burst_size: 1,
+            peer_connection_permits: None,
+            disk_read_permits: 256,
+            disk_write_permits: 256,
+            max_sample_delay_ms: 5000,
+            issue_retries: 2,
+            retry_delay_ms: 1000,
+            keep_output: false,
+            out: PathBuf::from("tmp/synthetic-benchmark-test"),
+        }
+    }
+
+    #[test]
+    fn benchmark_size_per_torrent_clamps_to_disk_budget() {
+        let args = benchmark_args();
+        let config = ParsedBenchmarkConfig::from_args(&args).unwrap();
+
+        let download_size =
+            benchmark_size_per_torrent(&config, SyntheticLoadMode::Download, 10).unwrap();
+        let swarm_size = benchmark_size_per_torrent(&config, SyntheticLoadMode::Swarm, 10).unwrap();
+
+        assert_eq!(download_size, 2 * 1024 * 1024);
+        assert_eq!(swarm_size, 1024 * 1024);
+        assert!(
+            estimated_disk_bytes(SyntheticLoadMode::Download, 10, download_size)
+                <= config.disk_budget
+        );
+        assert!(
+            estimated_disk_bytes(SyntheticLoadMode::Swarm, 10, swarm_size) <= config.disk_budget
+        );
+    }
+
+    #[test]
+    fn benchmark_step_peers_enforces_swarm_peer_floor() {
+        assert_eq!(
+            benchmark_step_peers(SyntheticLoadMode::Swarm, 10, 3, 20).unwrap(),
+            20
+        );
+
+        let error = benchmark_step_peers(SyntheticLoadMode::Swarm, 10, 3, 19)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("need at least 20 peers"));
+    }
+
+    #[test]
+    fn next_benchmark_step_scales_torrents_before_peers() {
+        assert_eq!(
+            next_benchmark_step(SyntheticLoadMode::Download, 10, 10, 40, 100),
+            (20, 20)
+        );
+        assert_eq!(
+            next_benchmark_step(SyntheticLoadMode::Swarm, 10, 10, 40, 100),
+            (20, 40)
+        );
+        assert_eq!(
+            next_benchmark_step(SyntheticLoadMode::Download, 40, 10, 40, 100),
+            (40, 20)
+        );
     }
 }

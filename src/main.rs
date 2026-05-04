@@ -746,6 +746,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     #[cfg(feature = "synthetic-load")]
+    if let Some(Commands::Benchmark(args)) = cli.command.as_ref() {
+        if let Err(error) = synthetic_load::run_benchmark(args, cli.json).await {
+            if output_mode == OutputMode::Json {
+                print_json_error(cli_command_name(cli.command.as_ref()), &error.to_string());
+            } else {
+                eprintln!("[Error] Benchmark failed: {}", error);
+            }
+            std::process::exit(1);
+        }
+        tracing::info!("Benchmark command processed, exiting temporary instance.");
+        return Ok(());
+    }
+
+    #[cfg(feature = "synthetic-load")]
     if let Some(Commands::SyntheticLoad(args)) = cli.command.as_ref() {
         if let Err(error) = synthetic_load::run(args, cli.json).await {
             if output_mode == OutputMode::Json {
@@ -3052,6 +3066,8 @@ fn cli_command_name(command: Option<&Commands>) -> Option<&'static str> {
         Some(Commands::Purge { .. }) => Some("purge"),
         Some(Commands::Files { .. }) => Some("files"),
         Some(Commands::Priority { .. }) => Some("priority"),
+        #[cfg(feature = "synthetic-load")]
+        Some(Commands::Benchmark(_)) => Some("benchmark"),
         #[cfg(feature = "synthetic-load")]
         Some(Commands::SyntheticLoad(_)) => Some("synthetic-load"),
         None => None,

@@ -179,6 +179,9 @@ pub enum Commands {
         priority: CliPriority,
     },
     #[cfg(feature = "synthetic-load")]
+    #[command(about = "Run adaptive local synthetic benchmarks with bounded disk usage")]
+    Benchmark(SyntheticBenchmarkArgs),
+    #[cfg(feature = "synthetic-load")]
     #[command(
         name = "synthetic-load",
         hide = true,
@@ -208,6 +211,84 @@ pub enum SyntheticLoadAddMode {
     Upfront,
     Burst,
     Staggered,
+}
+
+#[cfg(feature = "synthetic-load")]
+#[derive(Args, Debug, Clone)]
+pub struct SyntheticBenchmarkArgs {
+    #[arg(long, default_value_t = 10, help = "Initial torrent count")]
+    pub start_torrents: usize,
+    #[arg(long, default_value_t = 100, help = "Initial synthetic peer count")]
+    pub start_peers: usize,
+    #[arg(long, default_value_t = 1000, help = "Maximum torrent count to try")]
+    pub max_torrents: usize,
+    #[arg(
+        long,
+        default_value_t = 100_000,
+        help = "Maximum synthetic peer count to try"
+    )]
+    pub max_peers: usize,
+    #[arg(
+        long,
+        default_value_t = 12,
+        help = "Maximum benchmark steps per scenario"
+    )]
+    pub max_steps: usize,
+    #[arg(
+        long,
+        default_value = "8GiB",
+        help = "Maximum generated disk working set per benchmark step"
+    )]
+    pub disk_budget: String,
+    #[arg(
+        long,
+        default_value = "8MiB",
+        help = "Preferred per-torrent payload size before disk budget clamping"
+    )]
+    pub size_per_torrent: String,
+    #[arg(long, default_value = "256KiB")]
+    pub piece_size: String,
+    #[arg(long, default_value_t = 30)]
+    pub duration_secs: u64,
+    #[arg(long, default_value_t = 0)]
+    pub warmup_secs: u64,
+    #[arg(long, default_value_t = 1000)]
+    pub metrics_interval_ms: u64,
+    #[arg(long, default_value_t = 1)]
+    pub leecher_pipeline: usize,
+    #[arg(long, default_value_t = 1.0)]
+    pub target_gbps: f64,
+    #[arg(long, default_value_t = 1000)]
+    pub peer_add_interval_ms: u64,
+    #[arg(long, default_value_t = 10)]
+    pub peer_add_burst_size: usize,
+    #[arg(long)]
+    pub peer_connection_permits: Option<usize>,
+    #[arg(long, default_value_t = 256)]
+    pub disk_read_permits: usize,
+    #[arg(long, default_value_t = 256)]
+    pub disk_write_permits: usize,
+    #[arg(long, default_value_t = 5000)]
+    pub max_sample_delay_ms: u64,
+    #[arg(
+        long,
+        default_value_t = 2,
+        help = "Number of additional attempts before a benchmark issue stops a scenario"
+    )]
+    pub issue_retries: usize,
+    #[arg(
+        long,
+        default_value_t = 1000,
+        help = "Delay before retrying a benchmark step after an issue"
+    )]
+    pub retry_delay_ms: u64,
+    #[arg(
+        long,
+        help = "Keep generated data directories after each benchmark step"
+    )]
+    pub keep_output: bool,
+    #[arg(long, default_value = "tmp/synthetic-benchmark")]
+    pub out: PathBuf,
 }
 
 #[cfg(feature = "synthetic-load")]
@@ -466,6 +547,8 @@ where
         | Commands::Info { .. }
         | Commands::Purge { .. }
         | Commands::Files { .. } => Ok(None),
+        #[cfg(feature = "synthetic-load")]
+        Commands::Benchmark(_) => Ok(None),
         #[cfg(feature = "synthetic-load")]
         Commands::SyntheticLoad(_) => Ok(None),
     }

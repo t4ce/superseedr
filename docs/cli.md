@@ -58,6 +58,15 @@ superseedr pause <INFO_HASH_HEX_OR_PATH>
 superseedr resume <INFO_HASH_HEX_OR_PATH>
 ```
 
+Engineering benchmark builds can also run the local synthetic benchmark harness:
+
+```bash
+cargo run --release --features synthetic-load -- benchmark --max-torrents 1000 --max-peers 100000
+```
+
+See [`docs/synthetic-benchmark.md`](synthetic-benchmark.md) for deeper
+synthetic load testing, disk-budget behavior, and per-scenario examples.
+
 ## Targeting Torrents
 
 Many commands accept either:
@@ -328,6 +337,45 @@ Target the file by:
 
 - `--file-index`
 - `--file-path`
+
+### `benchmark`
+
+```bash
+cargo run --release --features synthetic-load -- benchmark [OPTIONS]
+```
+
+Run adaptive local synthetic benchmarks for download-only, upload-only, and
+mixed swarm scenarios.
+
+This command is only available in builds compiled with the `synthetic-load`
+feature. It generates local synthetic torrents and peers, keeps each benchmark
+step inside `--disk-budget`, writes JSON summaries and per-sample metrics, and
+removes generated data after each step unless `--keep-output` is set.
+
+Text output reports each scenario's planned final size, each step's
+current/final estimated disk use, ETA for the current scenario and full
+benchmark, and a final capacity report. The final report estimates the clean
+torrent and peer count per scenario, shows configured resource limits, reports
+observed disk payload rates, and calls out likely bottleneck signals. If a step
+shows overload symptoms, benchmark mode retries the step before stopping that
+scenario and continuing with the next one.
+
+Common options:
+
+- `--start-torrents` and `--max-torrents`
+- `--start-peers` and `--max-peers`
+- `--max-steps`
+- `--duration-secs`
+- `--disk-budget`
+- `--size-per-torrent`
+- `--piece-size`
+- `--target-gbps`
+- `--issue-retries`
+- `--retry-delay-ms`
+- `--out`
+
+For the full benchmark and lower-level `synthetic-load` harness guide, see
+[`docs/synthetic-benchmark.md`](synthetic-benchmark.md).
 
 ## Online And Offline Behavior
 
