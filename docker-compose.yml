@@ -30,7 +30,9 @@ services:
     entrypoint: ["superseedr"]
     command: []
     network_mode: "service:gluetun"
-    depends_on: [gluetun]
+    depends_on:
+      gluetun:
+        condition: service_healthy
     volumes:
       - ${HOST_SUPERSEEDR_ROOT_PATH:-superseedr-root}:/seedbox
       - ${HOST_SUPERSEEDR_SHARE_PATH:-superseedr-share}:/root/.local/share/jagalite.superseedr
