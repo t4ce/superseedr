@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use ratatui::{prelude::*, widgets::*};
 use std::time::{SystemTime, UNIX_EPOCH};
 

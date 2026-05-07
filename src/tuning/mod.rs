@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use rand::seq::SliceRandom;
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 use crate::app::CalculatedLimits;
 use crate::resource_manager::ResourceType;

@@ -34,7 +34,7 @@ mod tuning;
 mod watch_inbox;
 
 use app::{App, AppRuntimeMode};
-use rand::Rng;
+use rand::RngExt;
 
 use std::fs;
 use std::fs::File;

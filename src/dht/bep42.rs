@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use super::types::{Bep42State, NodeId};
-use rand::Rng;
+use rand::RngExt;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const IPV4_MASK: u32 = 0x030f3fff;

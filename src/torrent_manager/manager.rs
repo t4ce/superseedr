@@ -56,7 +56,7 @@ use crate::tracker::client::{
 };
 use crate::tracker::normalize_tracker_urls;
 
-use rand::Rng;
+use rand::RngExt;
 
 use crate::torrent_file::Torrent;
 

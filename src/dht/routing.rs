@@ -5,7 +5,7 @@ use super::bep42::{classify_node, same_public_identity_group};
 use super::types::{
     is_routable_dht_addr, AddressFamily, Bep42State, NodeId, NodeRecord, NodeTrust,
 };
-use rand::Rng;
+use rand::RngExt;
 use std::cmp::Ordering;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};

@@ -8832,7 +8832,7 @@ mod prop_tests {
     const MAX_BLOCK: u32 = 131_072;
 
     use rand::rngs::StdRng;
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
 
     #[derive(Clone, Debug)]
     enum TorrentVariant {

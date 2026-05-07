@@ -44,7 +44,7 @@ use crate::tui::screen_context::ScreenContext;
 use crate::tui::tree::{TreeFilter, TreeMathHelper, TreeViewState};
 use chrono::{DateTime, Utc};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::net::SocketAddr;

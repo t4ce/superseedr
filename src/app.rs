@@ -13,7 +13,7 @@ use magnet_url::Magnet;
 
 use fuzzy_matcher::FuzzyMatcher;
 
-use rand::Rng;
+use rand::RngExt;
 
 use strum_macros::EnumIter;
 

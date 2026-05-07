@@ -7,7 +7,7 @@ use crate::tracker::RawTrackerResponse;
 use crate::tracker::TrackerEvent;
 use crate::tracker::TrackerResponse;
 
-use rand::Rng;
+use rand::RngExt;
 use reqwest::header;
 use reqwest::Client;
 use reqwest::StatusCode;
