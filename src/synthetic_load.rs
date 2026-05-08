@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
+use tokio::signal;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 
@@ -44,8 +45,11 @@ const MAX_TORRENTS_PER_ORCHESTRATION_TICK: usize = 25;
 const MAX_PEERS_PER_ORCHESTRATION_TICK: usize = 1_000;
 const SYNTHETIC_PEERS_PER_INCOMING_HUB: usize = 8_000;
 const MAX_SYNTHETIC_INCOMING_HUBS: usize = 16;
+#[cfg(not(target_os = "macos"))]
 const SYNTHETIC_LOCAL_PORT_BASE: u16 = 10_000;
+#[cfg(not(target_os = "macos"))]
 const SYNTHETIC_LOCAL_PORT_SPAN: usize = 30_000;
+const BENCHMARK_INTERRUPT_ISSUE: &str = "interrupted by Ctrl+C";
 
 type DynError = Box<dyn Error + Send + Sync>;
 type IncomingPeerTx = mpsc::Sender<(TcpStream, Vec<u8>)>;
@@ -124,6 +128,62 @@ struct ManagerRuntime {
     handle: JoinHandle<Result<(), Box<dyn Error + Send + Sync>>>,
 }
 
+struct SyntheticRunCleanup {
+    managers: Vec<ManagerRuntime>,
+    peer_handles: Vec<JoinHandle<()>>,
+    harness_shutdown_tx: broadcast::Sender<()>,
+    resource_shutdown_tx: broadcast::Sender<()>,
+    resource_handle: JoinHandle<()>,
+    event_handle: JoinHandle<()>,
+    cleaned: bool,
+}
+
+impl SyntheticRunCleanup {
+    fn new(
+        harness_shutdown_tx: broadcast::Sender<()>,
+        resource_shutdown_tx: broadcast::Sender<()>,
+        resource_handle: JoinHandle<()>,
+        event_handle: JoinHandle<()>,
+    ) -> Self {
+        Self {
+            managers: Vec::new(),
+            peer_handles: Vec::new(),
+            harness_shutdown_tx,
+            resource_shutdown_tx,
+            resource_handle,
+            event_handle,
+            cleaned: false,
+        }
+    }
+
+    async fn cleanup(&mut self) {
+        if self.cleaned {
+            return;
+        }
+        self.cleaned = true;
+
+        shutdown_managers(&mut self.managers).await;
+        let _ = self.harness_shutdown_tx.send(());
+        let _ = self.resource_shutdown_tx.send(());
+        for handle in &self.peer_handles {
+            handle.abort();
+        }
+        for handle in &mut self.peer_handles {
+            let _ = handle.await;
+        }
+        self.resource_handle.abort();
+        let _ = (&mut self.resource_handle).await;
+        self.event_handle.abort();
+        let _ = (&mut self.event_handle).await;
+    }
+
+    async fn fail<T>(&mut self, error: impl Into<DynError>) -> Result<T, DynError> {
+        let error = error.into();
+        self.cleanup().await;
+        Err(error)
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct OrchestrationProgress {
     active_torrents: usize,
@@ -152,6 +212,35 @@ impl SyntheticIncomingHub {
     fn register(&self, info_hash: Vec<u8>, tx: IncomingPeerTx) {
         if let Ok(mut routes) = self.routes.lock() {
             routes.insert(info_hash, tx);
+        }
+    }
+
+    fn addr_for_peer(&self, peer_index: usize) -> SocketAddr {
+        synthetic_single_listener_addr(peer_index, self.port)
+    }
+}
+
+#[derive(Clone)]
+struct SyntheticSeederHub {
+    #[cfg(not(target_os = "macos"))]
+    port: u16,
+    #[cfg(target_os = "macos")]
+    peer_ports: Arc<[u16]>,
+}
+
+impl SyntheticSeederHub {
+    fn addr_for_peer(&self, peer_index: usize) -> Result<SocketAddr, DynError> {
+        #[cfg(target_os = "macos")]
+        {
+            let port = self.peer_ports.get(peer_index).copied().ok_or_else(|| {
+                format!("missing synthetic seeder listener for peer index {peer_index}")
+            })?;
+            Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(synthetic_loopback_addr(peer_index, self.port))
         }
     }
 }
@@ -241,7 +330,7 @@ struct AddContext {
     topology: RunTopology,
     download_root: PathBuf,
     upload_root: PathBuf,
-    download_seeder_port: Option<u16>,
+    download_seeder_hub: Option<SyntheticSeederHub>,
     upload_incoming_hubs: Vec<SyntheticIncomingHub>,
     harness: HarnessContext,
     plan: AddPlan,
@@ -282,8 +371,9 @@ impl AddContext {
                     self.specs.len(),
                     self.topology.download_peers,
                     &self.download_root,
-                    self.download_seeder_port
-                        .ok_or("missing synthetic seeder port for download side")?,
+                    self.download_seeder_hub
+                        .as_ref()
+                        .ok_or("missing synthetic seeder hub for download side")?,
                     &self.harness,
                     elapsed,
                 )
@@ -361,10 +451,10 @@ impl AddContext {
 enum PeerRampRole {
     DownloadSeeder {
         command_tx: mpsc::Sender<ManagerCommand>,
-        seeder_port: u16,
+        seeder_hub: SyntheticSeederHub,
     },
     UploadLeecher {
-        seeder_port: u16,
+        incoming_hub: SyntheticIncomingHub,
         leecher_pipeline: usize,
     },
 }
@@ -394,9 +484,9 @@ impl PeerRamp {
             match &self.role {
                 PeerRampRole::DownloadSeeder {
                     command_tx,
-                    seeder_port,
+                    seeder_hub,
                 } => {
-                    let addr = synthetic_loopback_addr(peer_index, *seeder_port);
+                    let addr = seeder_hub.addr_for_peer(peer_index)?;
                     command_tx
                         .send(ManagerCommand::ConnectToPeer(addr))
                         .await
@@ -405,10 +495,10 @@ impl PeerRamp {
                         })?;
                 }
                 PeerRampRole::UploadLeecher {
-                    seeder_port,
+                    incoming_hub,
                     leecher_pipeline,
                 } => {
-                    let addr = synthetic_loopback_addr(peer_index, *seeder_port);
+                    let addr = incoming_hub.addr_for_peer(peer_index);
                     let handle = tokio::spawn(run_synthetic_leecher(
                         self.spec.clone(),
                         peer_index,
@@ -519,11 +609,13 @@ struct SyntheticSummary {
     disk_write_started: u64,
     disk_write_finished: u64,
     output_dir: PathBuf,
+    interrupted: bool,
 }
 
 #[derive(Serialize)]
 struct BenchmarkSummary {
     run_id: String,
+    interrupted: bool,
     disk_budget_bytes: u64,
     preferred_size_per_torrent_bytes: u64,
     piece_size_bytes: u64,
@@ -538,6 +630,7 @@ struct BenchmarkSummary {
 
 #[derive(Serialize)]
 struct BenchmarkReport {
+    interrupted: bool,
     runtime_secs: f64,
     runtime: String,
     planned_steps: usize,
@@ -841,7 +934,7 @@ struct ResourceSample {
 }
 
 pub async fn run(args: &SyntheticLoadArgs, json_output: bool) -> Result<(), DynError> {
-    let (summary, samples_path, summary_path) = run_once(args, json_output).await?;
+    let (summary, samples_path, summary_path) = run_once(args, json_output, None).await?;
 
     if json_output {
         println!("{}", serde_json::to_string_pretty(&summary)?);
@@ -858,9 +951,32 @@ pub async fn run(args: &SyntheticLoadArgs, json_output: bool) -> Result<(), DynE
     Ok(())
 }
 
+fn benchmark_interrupted(interrupt_rx: &watch::Receiver<bool>) -> bool {
+    *interrupt_rx.borrow()
+}
+
+fn benchmark_interrupt_requested(interrupt_rx: Option<&watch::Receiver<bool>>) -> bool {
+    interrupt_rx.map(benchmark_interrupted).unwrap_or(false)
+}
+
+async fn wait_for_benchmark_interrupt(interrupt_rx: &mut watch::Receiver<bool>) -> bool {
+    if benchmark_interrupted(interrupt_rx) {
+        return true;
+    }
+    loop {
+        if interrupt_rx.changed().await.is_err() {
+            return false;
+        }
+        if *interrupt_rx.borrow_and_update() {
+            return true;
+        }
+    }
+}
+
 async fn run_once(
     args: &SyntheticLoadArgs,
     suppress_sample_output: bool,
+    interrupt_rx: Option<watch::Receiver<bool>>,
 ) -> Result<(SyntheticSummary, PathBuf, PathBuf), DynError> {
     let config = ParsedSyntheticConfig::from_args(args)?;
     let run_id = Local::now().format("run_%Y%m%d_%H%M%S").to_string();
@@ -878,15 +994,21 @@ async fn run_once(
         interval: Duration::from_millis(args.peer_add_interval_ms),
         burst_size: args.peer_add_burst_size,
     };
+    let specs: Arc<[SyntheticTorrentSpec]> =
+        build_torrent_specs(args.torrents, config.size_per_torrent, config.piece_size)?.into();
+
     let resource_manager = build_resource_manager(args, topology, resource_shutdown_tx.clone());
     let resource_client = resource_manager.1.clone();
-    tokio::spawn(resource_manager.0.run());
+    let resource_handle = tokio::spawn(resource_manager.0.run());
 
     let (event_tx, event_rx) = mpsc::channel::<ManagerEvent>(EVENT_CHANNEL_SIZE);
     let event_handle = tokio::spawn(collect_manager_events(event_rx, counters.clone()));
-
-    let specs: Arc<[SyntheticTorrentSpec]> =
-        build_torrent_specs(args.torrents, config.size_per_torrent, config.piece_size)?.into();
+    let mut cleanup = SyntheticRunCleanup::new(
+        harness_shutdown_tx.clone(),
+        resource_shutdown_tx.clone(),
+        resource_handle,
+        event_handle,
+    );
 
     let rate_limit = args
         .target_gbps
@@ -903,19 +1025,22 @@ async fn run_once(
         shutdown_tx: harness_shutdown_tx.clone(),
     };
 
-    let mut managers = Vec::new();
-    let mut peer_handles = Vec::new();
     let download_dir = output_dir.join("data").join("download");
     let upload_dir = output_dir.join("data").join("upload");
-    let download_seeder_port = if topology.download_peers > 0 {
-        let (port, handle) = spawn_synthetic_seeder_hub(
+    let download_seeder_hub = if topology.download_peers > 0 {
+        let (hub, handle) = match spawn_synthetic_seeder_hub(
             specs.clone(),
             counters.clone(),
             harness_shutdown_tx.clone(),
+            topology.download_peers,
         )
-        .await?;
-        peer_handles.push(handle);
-        Some(port)
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => return cleanup.fail(error).await,
+        };
+        cleanup.peer_handles.push(handle);
+        Some(hub)
     } else {
         None
     };
@@ -927,8 +1052,11 @@ async fn run_once(
             .clamp(1, MAX_SYNTHETIC_INCOMING_HUBS);
         for _ in 0..hub_count {
             let (hub, handle) =
-                spawn_incoming_hub(counters.clone(), harness_shutdown_tx.clone()).await?;
-            peer_handles.push(handle);
+                match spawn_incoming_hub(counters.clone(), harness_shutdown_tx.clone()).await {
+                    Ok(result) => result,
+                    Err(error) => return cleanup.fail(error).await,
+                };
+            cleanup.peer_handles.push(handle);
             upload_incoming_hubs.push(hub);
         }
     }
@@ -937,7 +1065,7 @@ async fn run_once(
         topology,
         download_root: download_dir.clone(),
         upload_root: upload_dir.clone(),
-        download_seeder_port,
+        download_seeder_hub,
         upload_incoming_hubs,
         harness: harness.clone(),
         plan: add_plan,
@@ -947,19 +1075,25 @@ async fn run_once(
         next_torrent: 0,
     };
     if args.add_mode == SyntheticLoadAddMode::Upfront {
-        add_context
+        if let Err(error) = add_context
             .add_until(
                 args.torrents,
                 Duration::ZERO,
-                &mut managers,
-                &mut peer_handles,
+                &mut cleanup.managers,
+                &mut cleanup.peer_handles,
                 usize::MAX,
             )
-            .await?;
+            .await
+        {
+            return cleanup.fail(error).await;
+        }
         if args.peer_add_mode == SyntheticLoadAddMode::Upfront {
-            add_context
-                .add_due_peers(Duration::ZERO, &mut peer_handles, usize::MAX)
-                .await?;
+            if let Err(error) = add_context
+                .add_due_peers(Duration::ZERO, &mut cleanup.peer_handles, usize::MAX)
+                .await
+            {
+                return cleanup.fail(error).await;
+            }
         }
     }
     let mut orchestration_progress = add_context.progress();
@@ -972,7 +1106,12 @@ async fn run_once(
     ));
 
     let samples_path = output_dir.join("samples.jsonl");
-    let mut sample_writer = BufWriter::new(File::create(&samples_path)?);
+    let sample_file = match File::create(&samples_path) {
+        Ok(file) => file,
+        Err(error) => return cleanup.fail(error).await,
+    };
+    let mut sample_writer = BufWriter::new(sample_file);
+    let interrupt_snapshot = interrupt_rx.clone();
     let summary_result = sample_loop(
         SampleContext {
             args,
@@ -984,33 +1123,49 @@ async fn run_once(
             output_dir: &output_dir,
             counters: counters.clone(),
             resource_client: &resource_client,
-            managers: &mut managers,
-            peer_handles: &mut peer_handles,
+            managers: &mut cleanup.managers,
+            peer_handles: &mut cleanup.peer_handles,
             orchestration_rx: &mut orchestration_rx,
             orchestration_progress: &mut orchestration_progress,
+            interrupt_rx,
             json_output: suppress_sample_output,
         },
         &mut sample_writer,
     )
     .await;
-    sample_writer.flush()?;
-
-    let orchestrator_result = wait_for_orchestrator(
-        &mut orchestrator_handle,
-        &mut orchestration_rx,
-        &mut managers,
-        &mut peer_handles,
-        &mut orchestration_progress,
-    )
-    .await;
-
-    shutdown_managers(&mut managers).await;
-    let _ = harness_shutdown_tx.send(());
-    let _ = resource_shutdown_tx.send(());
-    for handle in peer_handles {
-        handle.abort();
+    if let Err(error) = sample_writer.flush() {
+        cleanup.cleanup().await;
+        return Err(error.into());
     }
-    event_handle.abort();
+
+    let interrupted = match &summary_result {
+        Ok(summary) => summary.interrupted,
+        Err(_) => false,
+    } || interrupt_snapshot
+        .as_ref()
+        .map(benchmark_interrupted)
+        .unwrap_or(false);
+    let orchestrator_result = if interrupted {
+        orchestrator_handle.abort();
+        drain_orchestration_updates(
+            &mut orchestration_rx,
+            &mut cleanup.managers,
+            &mut cleanup.peer_handles,
+            &mut orchestration_progress,
+        )
+        .map(|_| ())
+    } else {
+        wait_for_orchestrator(
+            &mut orchestrator_handle,
+            &mut orchestration_rx,
+            &mut cleanup.managers,
+            &mut cleanup.peer_handles,
+            &mut orchestration_progress,
+        )
+        .await
+    };
+
+    cleanup.cleanup().await;
 
     orchestrator_result?;
     let summary = summary_result?;
@@ -1030,6 +1185,12 @@ pub async fn run_benchmark(
     let run_id = Local::now().format("benchmark_%Y%m%d_%H%M%S").to_string();
     let output_dir = args.out.join(&run_id);
     tokio::fs::create_dir_all(&output_dir).await?;
+    let (interrupt_tx, interrupt_rx) = watch::channel(false);
+    let interrupt_handle = tokio::spawn(async move {
+        if signal::ctrl_c().await.is_ok() {
+            let _ = interrupt_tx.send(true);
+        }
+    });
 
     let modes = [
         SyntheticLoadMode::Download,
@@ -1040,8 +1201,19 @@ pub async fn run_benchmark(
     let mut progress = BenchmarkRunProgress::new(total_planned_steps);
     let mut profiles = Vec::new();
     for mode in modes {
-        match run_benchmark_profile(args, &config, mode, &output_dir, json_output, &mut progress)
-            .await
+        if benchmark_interrupted(&interrupt_rx) {
+            break;
+        }
+        match run_benchmark_profile(
+            args,
+            &config,
+            mode,
+            &output_dir,
+            json_output,
+            &mut progress,
+            &interrupt_rx,
+        )
+        .await
         {
             Ok(profile) => profiles.push(profile),
             Err(error) => {
@@ -1054,12 +1226,24 @@ pub async fn run_benchmark(
                 ));
             }
         }
+        if benchmark_interrupted(&interrupt_rx) {
+            break;
+        }
     }
+    let interrupted = benchmark_interrupted(&interrupt_rx);
     let runtime_secs = benchmark_started.elapsed().as_secs_f64();
-    let report = benchmark_report(args, &config, &profiles, total_planned_steps, runtime_secs);
+    let report = benchmark_report(
+        args,
+        &config,
+        &profiles,
+        total_planned_steps,
+        runtime_secs,
+        interrupted,
+    );
 
     let summary = BenchmarkSummary {
         run_id,
+        interrupted,
         disk_budget_bytes: config.disk_budget,
         preferred_size_per_torrent_bytes: config.preferred_size_per_torrent,
         piece_size_bytes: config.piece_size,
@@ -1073,14 +1257,24 @@ pub async fn run_benchmark(
     };
 
     let summary_path = output_dir.join("benchmark_summary.json");
-    tokio::fs::write(&summary_path, serde_json::to_vec_pretty(&summary)?).await?;
+    let summary_write_error = tokio::fs::write(&summary_path, serde_json::to_vec_pretty(&summary)?)
+        .await
+        .err();
 
     if json_output {
         println!("{}", serde_json::to_string_pretty(&summary)?);
     } else {
         print_benchmark_report(&summary, &summary_path);
     }
+    if let Some(error) = summary_write_error {
+        eprintln!(
+            "[Warn] Failed to write benchmark JSON at {}: {}",
+            summary_path.display(),
+            error
+        );
+    }
 
+    interrupt_handle.abort();
     Ok(())
 }
 
@@ -1091,6 +1285,7 @@ async fn run_benchmark_profile(
     output_dir: &Path,
     json_output: bool,
     progress: &mut BenchmarkRunProgress,
+    interrupt_rx: &watch::Receiver<bool>,
 ) -> Result<BenchmarkProfileSummary, DynError> {
     let plans = benchmark_step_plans(args, config, mode)?;
     let final_plan = plans
@@ -1103,11 +1298,11 @@ async fn run_benchmark_profile(
 
     if !json_output {
         println!(
-            "Benchmark {}: planned_steps={} final={}t/{}p final_size_per_torrent={} estimated_disk={}/{} budget={}",
+            "Benchmark {}: planned_steps={} final={} torrents / {} peers final_size_per_torrent={} estimated_disk={}/{} budget={}",
             mode_name(mode),
             final_plan.planned_steps,
-            final_plan.torrents,
-            final_plan.peers,
+            format_count(final_plan.torrents),
+            format_count(final_plan.peers),
             format_bytes(final_plan.size_per_torrent_bytes),
             format_bytes(final_plan.estimated_disk_bytes),
             format_bytes(config.disk_budget),
@@ -1116,8 +1311,14 @@ async fn run_benchmark_profile(
     }
 
     'plans: for plan in plans {
+        if benchmark_interrupted(interrupt_rx) {
+            break;
+        }
         let max_attempts = args.issue_retries.saturating_add(1).max(1);
         for attempt in 1..=max_attempts {
+            if benchmark_interrupted(interrupt_rx) {
+                break 'plans;
+            }
             let step_out = output_dir.join(mode_name(mode)).join(format!(
                 "step_{:02}_{}t_{}p_attempt_{:02}",
                 plan.step, plan.torrents, plan.peers, attempt
@@ -1149,51 +1350,60 @@ async fn run_benchmark_profile(
             }
 
             let step_started = Instant::now();
-            let (summary, samples_path, summary_path) = match run_once(&synthetic_args, true).await
-            {
-                Ok(result) => result,
-                Err(error) => {
-                    let will_retry = attempt < max_attempts;
-                    let timing = progress.record_step(
-                        step_started.elapsed().as_secs_f64(),
+            let (summary, samples_path, summary_path) =
+                match run_once(&synthetic_args, true, Some(interrupt_rx.clone())).await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let will_retry =
+                            !benchmark_interrupted(interrupt_rx) && attempt < max_attempts;
+                        let timing = progress.record_step(
+                            step_started.elapsed().as_secs_f64(),
+                            if will_retry {
+                                0
+                            } else {
+                                remaining_steps_after_issue(&plan)
+                            },
+                            if will_retry {
+                                remaining_steps_in_current_scenario(&plan).saturating_add(1)
+                            } else {
+                                0
+                            },
+                            usize::from(will_retry),
+                        );
+                        let attempt_context = BenchmarkAttemptContext {
+                            attempt,
+                            max_attempts,
+                            will_retry,
+                            retry_delay_ms: args.retry_delay_ms,
+                            timing,
+                        };
+                        let step = benchmark_failed_step_summary(
+                            mode,
+                            &plan,
+                            attempt_context,
+                            error.to_string(),
+                        );
+                        if !json_output {
+                            print_benchmark_step_result(&step);
+                        }
                         if will_retry {
-                            0
-                        } else {
-                            remaining_steps_after_issue(&plan)
-                        },
-                        if will_retry {
-                            remaining_steps_in_current_scenario(&plan).saturating_add(1)
-                        } else {
-                            0
-                        },
-                        usize::from(will_retry),
-                    );
-                    let attempt_context = BenchmarkAttemptContext {
-                        attempt,
-                        max_attempts,
-                        will_retry,
-                        retry_delay_ms: args.retry_delay_ms,
-                        timing,
-                    };
-                    let step = benchmark_failed_step_summary(
-                        mode,
-                        &plan,
-                        attempt_context,
-                        error.to_string(),
-                    );
-                    if !json_output {
-                        print_benchmark_step_result(&step);
-                    }
-                    if will_retry {
+                            steps.push(step);
+                            let mut retry_interrupt_rx = interrupt_rx.clone();
+                            if sleep_before_benchmark_retry(
+                                args.retry_delay_ms,
+                                &mut retry_interrupt_rx,
+                            )
+                            .await
+                            {
+                                break 'plans;
+                            }
+                            continue;
+                        }
+                        first_issue = Some(step.clone());
                         steps.push(step);
-                        sleep_before_benchmark_retry(args.retry_delay_ms).await;
-                        continue;
+                        break 'plans;
                     }
-                    first_issue = Some(step.clone());
-                    steps.push(step);
-                    break 'plans;
-                }
-            };
+                };
             let data_removed = if args.keep_output {
                 false
             } else {
@@ -1201,7 +1411,7 @@ async fn run_benchmark_profile(
             };
             let issues = benchmark_issues(&summary, args);
             let has_issue = !issues.is_empty();
-            let will_retry = has_issue && attempt < max_attempts;
+            let will_retry = has_issue && !summary.interrupted && attempt < max_attempts;
             let timing = progress.record_step(
                 step_started.elapsed().as_secs_f64(),
                 if has_issue && !will_retry {
@@ -1246,7 +1456,11 @@ async fn run_benchmark_profile(
 
             if will_retry {
                 steps.push(step);
-                sleep_before_benchmark_retry(args.retry_delay_ms).await;
+                let mut retry_interrupt_rx = interrupt_rx.clone();
+                if sleep_before_benchmark_retry(args.retry_delay_ms, &mut retry_interrupt_rx).await
+                {
+                    break 'plans;
+                }
                 continue;
             }
 
@@ -1424,7 +1638,7 @@ async fn start_download_torrent(
     total_torrents: usize,
     peers: usize,
     data_root: &Path,
-    seeder_port: u16,
+    seeder_hub: &SyntheticSeederHub,
     harness: &HarnessContext,
     added_at: Duration,
 ) -> Result<SideSetup, DynError> {
@@ -1446,7 +1660,7 @@ async fn start_download_torrent(
         added_at,
         role: PeerRampRole::DownloadSeeder {
             command_tx: command_tx.clone(),
-            seeder_port,
+            seeder_hub: seeder_hub.clone(),
         },
     };
 
@@ -1488,7 +1702,7 @@ async fn start_upload_torrent(
         next_peer: 0,
         added_at: context.added_at,
         role: PeerRampRole::UploadLeecher {
-            seeder_port: context.incoming_hub.port,
+            incoming_hub: context.incoming_hub.clone(),
             leecher_pipeline: context.leecher_pipeline,
         },
     };
@@ -1584,7 +1798,8 @@ async fn spawn_synthetic_seeder_hub(
     specs: Arc<[SyntheticTorrentSpec]>,
     counters: Arc<SyntheticCounters>,
     shutdown_tx: broadcast::Sender<()>,
-) -> Result<(u16, JoinHandle<()>), DynError> {
+    peer_slots: usize,
+) -> Result<(SyntheticSeederHub, JoinHandle<()>), DynError> {
     let specs_by_hash: Arc<HashMap<Vec<u8>, SyntheticTorrentSpec>> = Arc::new(
         specs
             .iter()
@@ -1592,10 +1807,81 @@ async fn spawn_synthetic_seeder_hub(
             .map(|spec| (spec.info_hash.clone(), spec))
             .collect(),
     );
-    let listener = TcpListener::bind("0.0.0.0:0").await?;
-    let port = listener.local_addr()?.port();
     let next_peer_id = Arc::new(AtomicU64::new(0));
-    let handle = tokio::spawn(async move {
+
+    #[cfg(target_os = "macos")]
+    {
+        // macOS does not route unconfigured 127/8 aliases, so give each
+        // synthetic seeder a unique localhost listener port instead.
+        let listener_count = peer_slots.max(1);
+        let mut ports = Vec::with_capacity(listener_count);
+        let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(listener_count);
+        for _ in 0..listener_count {
+            let listener = match TcpListener::bind(synthetic_listener_bind_addr()).await {
+                Ok(listener) => listener,
+                Err(error) => {
+                    for mut handle in handles {
+                        handle.abort();
+                        let _ = (&mut handle).await;
+                    }
+                    return Err(error.into());
+                }
+            };
+            let port = match listener.local_addr() {
+                Ok(addr) => addr.port(),
+                Err(error) => {
+                    for mut handle in handles {
+                        handle.abort();
+                        let _ = (&mut handle).await;
+                    }
+                    return Err(error.into());
+                }
+            };
+            ports.push(port);
+            handles.push(spawn_synthetic_seeder_accept_loop(
+                listener,
+                specs_by_hash.clone(),
+                counters.clone(),
+                shutdown_tx.clone(),
+                next_peer_id.clone(),
+            ));
+        }
+        let handle = tokio::spawn(async move {
+            for handle in handles {
+                let _ = handle.await;
+            }
+        });
+        Ok((
+            SyntheticSeederHub {
+                peer_ports: Arc::<[u16]>::from(ports),
+            },
+            handle,
+        ))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let listener = TcpListener::bind(synthetic_listener_bind_addr()).await?;
+        let port = listener.local_addr()?.port();
+        let handle = spawn_synthetic_seeder_accept_loop(
+            listener,
+            specs_by_hash,
+            counters,
+            shutdown_tx,
+            next_peer_id,
+        );
+        Ok((SyntheticSeederHub { port }, handle))
+    }
+}
+
+fn spawn_synthetic_seeder_accept_loop(
+    listener: TcpListener,
+    specs_by_hash: Arc<HashMap<Vec<u8>, SyntheticTorrentSpec>>,
+    counters: Arc<SyntheticCounters>,
+    shutdown_tx: broadcast::Sender<()>,
+    next_peer_id: Arc<AtomicU64>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
         let mut shutdown_rx = shutdown_tx.subscribe();
         loop {
             tokio::select! {
@@ -1649,10 +1935,10 @@ async fn spawn_synthetic_seeder_hub(
                 }
             }
         }
-    });
-    Ok((port, handle))
+    })
 }
 
+#[cfg(not(target_os = "macos"))]
 fn synthetic_loopback_addr(peer_index: usize, port: u16) -> SocketAddr {
     let host = (peer_index as u32 % 0x00ff_ffff).saturating_add(1);
     SocketAddr::new(
@@ -1666,6 +1952,32 @@ fn synthetic_loopback_addr(peer_index: usize, port: u16) -> SocketAddr {
     )
 }
 
+fn synthetic_single_listener_addr(peer_index: usize, port: u16) -> SocketAddr {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = peer_index;
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        synthetic_loopback_addr(peer_index, port)
+    }
+}
+
+fn synthetic_listener_bind_addr() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "127.0.0.1:0"
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        "0.0.0.0:0"
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
 fn synthetic_local_addr(peer_index: usize) -> SocketAddr {
     let host = (peer_index / SYNTHETIC_LOCAL_PORT_SPAN) as u32 + 1;
     let port = SYNTHETIC_LOCAL_PORT_BASE
@@ -1684,24 +1996,35 @@ fn synthetic_local_addr(peer_index: usize) -> SocketAddr {
 }
 
 fn bind_synthetic_leecher_socket(peer_index: usize) -> Result<TcpSocket, std::io::Error> {
-    let mut last_error = None;
-    for attempt in 0..4 {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = peer_index;
         let socket = TcpSocket::new_v4()?;
-        let local_addr = synthetic_local_addr(peer_index + attempt * SYNTHETIC_LOCAL_PORT_SPAN);
-        match socket.bind(local_addr) {
-            Ok(()) => return Ok(socket),
-            Err(error) if error.kind() == ErrorKind::AddrInUse => {
-                last_error = Some(error);
-            }
-            Err(error) => return Err(error),
-        }
+        socket.bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))?;
+        Ok(socket)
     }
-    Err(last_error.unwrap_or_else(|| {
-        std::io::Error::new(
-            ErrorKind::AddrInUse,
-            "synthetic leecher local ports exhausted",
-        )
-    }))
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut last_error = None;
+        for attempt in 0..4 {
+            let socket = TcpSocket::new_v4()?;
+            let local_addr = synthetic_local_addr(peer_index + attempt * SYNTHETIC_LOCAL_PORT_SPAN);
+            match socket.bind(local_addr) {
+                Ok(()) => return Ok(socket),
+                Err(error) if error.kind() == ErrorKind::AddrInUse => {
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            std::io::Error::new(
+                ErrorKind::AddrInUse,
+                "synthetic leecher local ports exhausted",
+            )
+        }))
+    }
 }
 
 fn is_expected_connection_close(error: &(dyn Error + Send + Sync + 'static)) -> bool {
@@ -1832,7 +2155,7 @@ async fn spawn_incoming_hub(
     counters: Arc<SyntheticCounters>,
     shutdown_tx: broadcast::Sender<()>,
 ) -> Result<(SyntheticIncomingHub, JoinHandle<()>), DynError> {
-    let listener = TcpListener::bind("0.0.0.0:0").await?;
+    let listener = TcpListener::bind(synthetic_listener_bind_addr()).await?;
     let port = listener.local_addr()?.port();
     let routes: IncomingRoutes = Arc::new(Mutex::new(HashMap::new()));
     let hub = SyntheticIncomingHub {
@@ -1998,6 +2321,7 @@ struct SampleContext<'a> {
     peer_handles: &'a mut Vec<JoinHandle<()>>,
     orchestration_rx: &'a mut mpsc::UnboundedReceiver<OrchestrationUpdate>,
     orchestration_progress: &'a mut OrchestrationProgress,
+    interrupt_rx: Option<watch::Receiver<bool>>,
     json_output: bool,
 }
 
@@ -2138,6 +2462,7 @@ async fn sample_loop(
         peer_handles,
         orchestration_rx,
         orchestration_progress,
+        mut interrupt_rx,
         json_output,
     } = context;
 
@@ -2160,9 +2485,26 @@ async fn sample_loop(
     let mut max_torrent_add_lag = 0usize;
     let mut max_peer_add_lag = 0usize;
     let mut max_sample_delay_ms = 0u64;
+    let mut interrupted = benchmark_interrupt_requested(interrupt_rx.as_ref());
 
     while start.elapsed() < total {
-        ticker.tick().await;
+        if interrupted {
+            break;
+        }
+        if let Some(interrupt_rx) = interrupt_rx.as_mut() {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                was_interrupted = wait_for_benchmark_interrupt(interrupt_rx) => {
+                    interrupted = was_interrupted;
+                    if interrupted {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        } else {
+            ticker.tick().await;
+        }
         let now = Instant::now();
         let elapsed = now.duration_since(start);
         drain_orchestration_updates(
@@ -2347,6 +2689,7 @@ async fn sample_loop(
         disk_write_started: counters.disk_write_started.load(Ordering::Relaxed),
         disk_write_finished: counters.disk_write_finished.load(Ordering::Relaxed),
         output_dir: output_dir.to_path_buf(),
+        interrupted,
     })
 }
 
@@ -2367,6 +2710,9 @@ async fn shutdown_managers(managers: &mut [ManagerRuntime]) {
             if !manager.handle.is_finished() {
                 manager.handle.abort();
             }
+        }
+        for manager in managers.iter_mut() {
+            let _ = (&mut manager.handle).await;
         }
     }
 }
@@ -2598,9 +2944,18 @@ fn remaining_steps_after_issue(plan: &BenchmarkStepPlan) -> usize {
     remaining_steps_in_current_scenario(plan)
 }
 
-async fn sleep_before_benchmark_retry(retry_delay_ms: u64) {
-    if retry_delay_ms > 0 {
-        tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
+async fn sleep_before_benchmark_retry(
+    retry_delay_ms: u64,
+    interrupt_rx: &mut watch::Receiver<bool>,
+) -> bool {
+    if retry_delay_ms == 0 {
+        return benchmark_interrupted(interrupt_rx);
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_millis(retry_delay_ms)) => {
+            benchmark_interrupted(interrupt_rx)
+        }
+        was_interrupted = wait_for_benchmark_interrupt(interrupt_rx) => was_interrupted,
     }
 }
 
@@ -2723,6 +3078,10 @@ fn next_benchmark_step(
 
 fn benchmark_issues(summary: &SyntheticSummary, args: &SyntheticBenchmarkArgs) -> Vec<String> {
     let mut issues = Vec::new();
+    if summary.interrupted {
+        issues.push(BENCHMARK_INTERRUPT_ISSUE.to_string());
+        return issues;
+    }
     if summary.torrents_added < summary.torrents {
         issues.push(format!(
             "torrent_add_lag: added {}/{}",
@@ -3161,6 +3520,7 @@ fn benchmark_report(
     profiles: &[BenchmarkProfileSummary],
     planned_steps: usize,
     runtime_secs: f64,
+    interrupted: bool,
 ) -> BenchmarkReport {
     let steps_run = profiles
         .iter()
@@ -3192,6 +3552,7 @@ fn benchmark_report(
         .collect();
 
     BenchmarkReport {
+        interrupted,
         runtime_secs,
         runtime: format_duration_secs(runtime_secs),
         planned_steps,
@@ -3278,6 +3639,14 @@ fn benchmark_scenario_report(
 }
 
 fn benchmark_verdict(profile: &BenchmarkProfileSummary) -> String {
+    if profile
+        .first_issue
+        .as_ref()
+        .map(step_was_interrupted)
+        .unwrap_or(false)
+    {
+        return "interrupted".to_string();
+    }
     match (&profile.last_clean, &profile.first_issue) {
         (Some(clean), None) if clean.step >= profile.planned_steps => {
             "clean_to_configured_limit".to_string()
@@ -3290,6 +3659,20 @@ fn benchmark_verdict(profile: &BenchmarkProfileSummary) -> String {
 }
 
 fn benchmark_capacity_estimate(profile: &BenchmarkProfileSummary) -> String {
+    if profile
+        .first_issue
+        .as_ref()
+        .map(step_was_interrupted)
+        .unwrap_or(false)
+    {
+        return match &profile.last_clean {
+            Some(clean) => format!(
+                "clean through {} torrents / {} peers before Ctrl+C",
+                clean.torrents, clean.peers
+            ),
+            None => "interrupted before a clean step completed".to_string(),
+        };
+    }
     match (&profile.last_clean, &profile.first_issue) {
         (Some(clean), None) if clean.step >= profile.planned_steps => format!(
             "at least {} torrents / {} peers; configured limit reached without benchmark issues",
@@ -3311,11 +3694,20 @@ fn benchmark_capacity_estimate(profile: &BenchmarkProfileSummary) -> String {
     }
 }
 
+fn step_was_interrupted(step: &BenchmarkStepSummary) -> bool {
+    step.issues
+        .iter()
+        .any(|issue| issue == BENCHMARK_INTERRUPT_ISSUE)
+}
+
 fn likely_bottleneck(profile: &BenchmarkProfileSummary) -> String {
     let issue = match profile.first_issue.as_ref() {
         Some(issue) => issue,
         None => return "none detected within configured benchmark limits".to_string(),
     };
+    if step_was_interrupted(issue) {
+        return "interrupted by user".to_string();
+    }
     let joined = issue.issues.join("; ");
     if joined.contains("sample_delay") {
         "scheduler or event-loop lag".to_string()
@@ -3367,119 +3759,161 @@ async fn remove_run_data_dir(output_dir: &Path) -> Result<bool, DynError> {
 }
 
 fn print_benchmark_report(summary: &BenchmarkSummary, summary_path: &Path) {
+    if summary.interrupted {
+        print_interrupted_benchmark_report(summary, summary_path);
+        return;
+    }
+
     println!();
-    println!("Benchmark Report");
-    println!("================");
+    println!("Benchmark Summary");
+    println!("=================");
     println!(
-        "Runtime: {} | attempts: {} across {} planned steps, {} clean, {} issue, {} retry attempts, {} recovered",
+        "Finished in {}. Ran {}/{} steps: {} passed, {} stopped.",
         summary.report.runtime,
         summary.report.steps_run,
         summary.report.planned_steps,
         summary.report.clean_steps,
-        summary.report.issue_steps,
-        summary.report.retry_attempts,
-        summary.report.recovered_after_retry_steps
+        summary.report.issue_steps
     );
     println!(
-        "Configured target: up to {} torrents / {} peers | disk budget={} | preferred torrent size={} | piece size={}",
+        "Target: up to {} torrents / {} peers | disk budget={} | torrent size={} | piece size={}",
         summary.report.configured_max_torrents,
         summary.report.configured_max_peers,
         format_bytes(summary.report.disk_budget_bytes),
         format_bytes(summary.report.preferred_size_per_torrent_bytes),
         format_bytes(summary.report.piece_size_bytes)
     );
-    println!(
-        "Resource limits: peer connections={} | disk permits read/write={}/{}",
-        summary.report.peer_connection_limit_policy,
-        summary
-            .report
-            .scenarios
-            .first()
-            .map(|scenario| scenario.disk_read_permits)
-            .unwrap_or_default(),
-        summary
-            .report
-            .scenarios
-            .first()
-            .map(|scenario| scenario.disk_write_permits)
-            .unwrap_or_default()
-    );
-    println!(
-        "Retry policy: {} additional attempts per issue, delay {}",
-        summary.report.issue_retries,
-        format_duration_secs(summary.report.retry_delay_ms as f64 / 1000.0)
-    );
-    println!("OS limit note: {}", summary.report.os_limit_note);
-    println!("Report JSON: {}", summary_path.display());
+    if summary.report.retry_attempts > 0 || summary.report.recovered_after_retry_steps > 0 {
+        println!(
+            "Retries: {} attempts, {} recovered",
+            summary.report.retry_attempts, summary.report.recovered_after_retry_steps
+        );
+    }
+    println!("Details JSON: {}", summary_path.display());
 
     println!();
-    println!("Capacity Estimates");
-    println!("------------------");
+    println!("Results");
+    println!("-------");
     for scenario in &summary.report.scenarios {
         print_benchmark_scenario_report(scenario);
     }
+}
 
-    println!("Interpretation");
-    println!("--------------");
+fn print_interrupted_benchmark_report(summary: &BenchmarkSummary, summary_path: &Path) {
+    println!();
+    println!("Benchmark Report (interrupted)");
+    println!("==============================");
     println!(
-        "A clean-to-limit result is a lower bound: this machine handled at least that many torrents and peers under this harness configuration."
+        "Stopped by Ctrl+C after {}. Ran {}/{} steps: {} passed, {} stopped.",
+        summary.report.runtime,
+        summary.report.steps_run,
+        summary.report.planned_steps,
+        summary.report.clean_steps,
+        summary.report.issue_steps
     );
-    println!(
-        "A bounded result means the capacity estimate is between the last clean step and the final issue step after retries; inspect samples.jsonl for that scenario before treating it as a hard product limit."
-    );
-    println!(
-        "Transient issue attempts are retried before a scenario is stopped, so a single noisy sample no longer defines capacity."
-    );
-    println!(
-        "Disk read/write rates are inferred from payload bytes moved during the synthetic run, not a standalone raw disk benchmark."
-    );
+    println!("Partial JSON: {}", summary_path.display());
+    println!();
+    println!("Partial Results");
+    println!("---------------");
+    for scenario in &summary.report.scenarios {
+        println!(
+            "{}: {} | torrent capacity {} | peer capacity {} | down {} | up {} | reason {}",
+            scenario.mode,
+            human_benchmark_verdict(&scenario.verdict),
+            human_benchmark_torrent_capacity(scenario),
+            human_benchmark_peer_capacity(scenario),
+            format_bps(scenario.peak_download_bps),
+            format_bps(scenario.peak_upload_bps),
+            scenario.first_issue.as_deref().unwrap_or("none")
+        );
+    }
 }
 
 fn print_benchmark_scenario_report(scenario: &BenchmarkScenarioReport) {
-    println!("{}:", scenario.mode);
-    println!("  Verdict: {}", scenario.verdict);
-    println!("  Capacity: {}", scenario.capacity_estimate);
-    if let Some(issue) = &scenario.first_issue {
-        println!(
-            "  First issue: {} torrents / {} peers -> {}",
-            scenario.first_issue_torrents.unwrap_or_default(),
-            scenario.first_issue_peers.unwrap_or_default(),
-            issue
-        );
-    }
     println!(
-        "  Throughput: peak down={} peak up={}",
+        "{}: {}",
+        scenario.mode,
+        human_benchmark_verdict(&scenario.verdict)
+    );
+    println!("  Estimate");
+    println!(
+        "    Torrent capacity  {}",
+        human_benchmark_torrent_capacity(scenario)
+    );
+    println!(
+        "    Peer capacity     {}",
+        human_benchmark_peer_capacity(scenario)
+    );
+    println!("  Peak speed");
+    println!(
+        "    Download          {}",
         format_bps(scenario.peak_download_bps),
+    );
+    println!(
+        "    Upload            {}",
         format_bps(scenario.peak_upload_bps)
     );
-    println!(
-        "  Disk payload rate: read={} write={} | disk ops read/write={:.1}/{:.1}/s",
-        format_bytes_per_second(scenario.observed_disk_read_bytes_per_sec),
-        format_bytes_per_second(scenario.observed_disk_write_bytes_per_sec),
-        scenario.disk_read_ops_per_sec,
-        scenario.disk_write_ops_per_sec
-    );
-    println!(
-        "  Working set: clean={} at {} per torrent | peer permit limit={}",
-        format_bytes(scenario.clean_disk_working_set_bytes),
-        format_bytes(scenario.clean_size_per_torrent_bytes),
-        scenario.peer_connection_limit
-    );
-    println!(
-        "  Health: runtime={} attempts={} planned_steps={} retries={} transient_issues={} recovered={} max_tick_lag={}ms protocol_errors={} outbound_failed={} permit_timeouts={}",
-        format_duration_secs(scenario.runtime_secs),
-        scenario.steps_run,
-        scenario.planned_steps,
-        scenario.retry_attempts,
-        scenario.transient_issue_attempts,
-        scenario.recovered_after_retry_steps,
-        scenario.max_sample_delay_ms,
-        scenario.protocol_errors,
-        scenario.outbound_failed,
-        scenario.outbound_permit_timeout
-    );
-    println!("  Bottleneck signal: {}", scenario.likely_bottleneck);
+    if let Some(issue) = &scenario.first_issue {
+        println!("  First issue");
+        println!(
+            "    At                {}",
+            human_benchmark_issue_at(scenario)
+        );
+        println!("    Reason            {}", truncate_issue(issue, 120));
+        println!("    Cause             {}", scenario.likely_bottleneck);
+    } else if scenario.max_sample_delay_ms > 0 {
+        println!(
+            "  Max sample lag      {}ms",
+            format_count(scenario.max_sample_delay_ms)
+        );
+    }
     println!();
+}
+
+fn human_benchmark_verdict(verdict: &str) -> &'static str {
+    match verdict {
+        "clean_to_configured_limit" => "passed target",
+        "clean_until_stopped" => "passed until stopped",
+        "bounded_by_first_issue" => "found a limit",
+        "failed_first_step" => "stopped early",
+        "interrupted" => "interrupted",
+        "no_steps" => "no steps ran",
+        _ => "finished",
+    }
+}
+
+fn human_benchmark_torrent_capacity(scenario: &BenchmarkScenarioReport) -> String {
+    if scenario.clean_torrents > 0 {
+        human_count(scenario.clean_torrents, "torrent", "torrents")
+    } else if let Some(torrents) = scenario.first_issue_torrents {
+        format!(
+            "unknown (first issue at {})",
+            human_count(torrents, "torrent", "torrents")
+        )
+    } else {
+        "unknown; no completed step".to_string()
+    }
+}
+
+fn human_benchmark_peer_capacity(scenario: &BenchmarkScenarioReport) -> String {
+    if scenario.clean_peers > 0 {
+        human_count(scenario.clean_peers, "peer", "peers")
+    } else if let Some(peers) = scenario.first_issue_peers {
+        format!(
+            "unknown (first issue at {})",
+            human_count(peers, "peer", "peers")
+        )
+    } else {
+        "unknown; no completed step".to_string()
+    }
+}
+
+fn human_benchmark_issue_at(scenario: &BenchmarkScenarioReport) -> String {
+    format!(
+        "{} / {}",
+        human_optional_count(scenario.first_issue_torrents, "torrent", "torrents"),
+        human_optional_count(scenario.first_issue_peers, "peer", "peers")
+    )
 }
 
 fn print_benchmark_step_result(step: &BenchmarkStepSummary) {
@@ -3488,45 +3922,139 @@ fn print_benchmark_step_result(step: &BenchmarkStepSummary) {
     } else if step.will_retry {
         "retry"
     } else {
-        "issue"
+        "stop"
     };
     println!(
-        "  -> step {}/{} attempt {}/{} {}: down={} up={} bytes={}/{} pieces={}/{} torrents={}/{} peers={}/{} tick_lag={}ms protocol_errors={} outbound_failed={} disk_rw={}/{} data_removed={} eta_scenario={} eta_benchmark={} remaining={}/{} wall={}",
+        "  -> step {}/{} {}{}: {} | down {} | up {} | lag {}ms | wall {}",
         step.step,
         step.planned_steps,
-        step.attempt,
-        step.max_attempts,
         status,
+        benchmark_attempt_suffix(step),
+        benchmark_step_topology(step),
         format_bps(step.avg_download_bps),
         format_bps(step.avg_upload_bps),
-        format_bytes(step.download_bytes),
-        format_bytes(step.upload_bytes),
-        step.completed_pieces,
-        step.total_pieces,
-        step.torrents_added,
-        step.torrents,
-        step.peers_added,
-        step.requested_peers,
-        step.max_sample_delay_ms,
-        step.protocol_errors,
-        step.outbound_failed,
-        step.disk_read_finished,
-        step.disk_write_finished,
-        step.data_removed,
-        format_duration_secs(step.eta.current_scenario_eta_secs),
-        format_duration_secs(step.eta.full_benchmark_eta_secs),
-        step.eta.current_scenario_remaining_steps,
-        step.eta.full_benchmark_remaining_steps,
-        format_duration_secs(step.wall_secs)
+        format_count(step.max_sample_delay_ms),
+        format_duration_secs(step.wall_secs),
     );
+    println!("     eta: {}", benchmark_eta_summary(step));
     if !step.issues.is_empty() {
-        println!("     issues: {}", step.issues.join("; "));
+        println!("     reason: {}", compact_issue_list(&step.issues));
         if step.will_retry {
             println!(
-                "     retrying after {}",
+                "     retrying in {}",
                 format_duration_secs(step.retry_delay_ms as f64 / 1000.0)
             );
         }
+    }
+}
+
+fn benchmark_eta_summary(step: &BenchmarkStepSummary) -> String {
+    let mode_steps = step.eta.current_scenario_remaining_steps;
+    let full_steps = step.eta.full_benchmark_remaining_steps;
+    if mode_steps == 0 && full_steps == 0 {
+        return "done".to_string();
+    }
+
+    let mode_eta = if mode_steps == 0 {
+        "this mode done".to_string()
+    } else {
+        format!(
+            "this mode {} ({})",
+            format_duration_secs(step.eta.current_scenario_eta_secs),
+            format_step_count(mode_steps)
+        )
+    };
+    let full_eta = if full_steps == 0 {
+        "full run done".to_string()
+    } else {
+        format!(
+            "full run {} ({})",
+            format_duration_secs(step.eta.full_benchmark_eta_secs),
+            format_step_count(full_steps)
+        )
+    };
+    format!("{mode_eta}, {full_eta}")
+}
+
+fn format_step_count(steps: usize) -> String {
+    if steps == 1 {
+        "1 step".to_string()
+    } else {
+        format!("{steps} steps")
+    }
+}
+
+fn benchmark_attempt_suffix(step: &BenchmarkStepSummary) -> String {
+    if step.max_attempts > 1 {
+        format!(" attempt {}/{}", step.attempt, step.max_attempts)
+    } else {
+        String::new()
+    }
+}
+
+fn benchmark_step_topology(step: &BenchmarkStepSummary) -> String {
+    format!(
+        "torrents {} | peers {}",
+        benchmark_progress_count(step.torrents_added, step.torrents),
+        benchmark_progress_count(step.peers_added, step.requested_peers)
+    )
+}
+
+fn benchmark_progress_count(added: usize, target: usize) -> String {
+    if added == target {
+        format_count(target)
+    } else {
+        format!("{}/{}", format_count(added), format_count(target))
+    }
+}
+
+fn human_optional_count(count: Option<usize>, singular: &str, plural: &str) -> String {
+    count
+        .map(|count| human_count(count, singular, plural))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn human_count(count: usize, singular: &str, plural: &str) -> String {
+    let noun = if count == 1 { singular } else { plural };
+    format!("{} {noun}", format_count(count))
+}
+
+fn format_count(count: impl std::fmt::Display) -> String {
+    let digits = count.to_string();
+    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            formatted.push(',');
+        }
+        formatted.push(ch);
+    }
+    formatted.chars().rev().collect()
+}
+
+fn compact_issue_list(issues: &[String]) -> String {
+    let shown = issues
+        .iter()
+        .take(2)
+        .map(|issue| truncate_issue(issue, 120))
+        .collect::<Vec<_>>();
+    if issues.len() > shown.len() {
+        format!(
+            "{} (+{} more)",
+            shown.join("; "),
+            issues.len() - shown.len()
+        )
+    } else {
+        shown.join("; ")
+    }
+}
+
+fn truncate_issue(issue: &str, max_chars: usize) -> String {
+    let mut chars = issue.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
     }
 }
 
@@ -3890,10 +4418,6 @@ fn format_bps(bits_per_second: u64) -> String {
     }
 }
 
-fn format_bytes_per_second(bytes_per_second: u64) -> String {
-    format!("{}/s", format_bytes(bytes_per_second))
-}
-
 fn format_bytes(bytes: u64) -> String {
     let value = bytes as f64;
     if value >= 1024.0 * 1024.0 * 1024.0 {
@@ -4061,6 +4585,78 @@ mod tests {
             keep_output: false,
             out: PathBuf::from("tmp/synthetic-benchmark-test"),
         }
+    }
+
+    fn benchmark_scenario_report_stub(
+        clean_torrents: usize,
+        clean_peers: usize,
+        first_issue_torrents: Option<usize>,
+        first_issue_peers: Option<usize>,
+    ) -> BenchmarkScenarioReport {
+        BenchmarkScenarioReport {
+            mode: "download".to_string(),
+            verdict: "bounded_by_first_issue".to_string(),
+            capacity_estimate: String::new(),
+            clean_torrents,
+            clean_peers,
+            clean_disk_working_set_bytes: 0,
+            clean_size_per_torrent_bytes: 0,
+            first_issue_torrents,
+            first_issue_peers,
+            first_issue: None,
+            likely_bottleneck: String::new(),
+            runtime_secs: 0.0,
+            steps_run: 0,
+            retry_attempts: 0,
+            transient_issue_attempts: 0,
+            recovered_after_retry_steps: 0,
+            planned_steps: 0,
+            peak_download_bps: 0,
+            peak_upload_bps: 0,
+            observed_disk_read_bytes_per_sec: 0,
+            observed_disk_write_bytes_per_sec: 0,
+            disk_read_ops_per_sec: 0.0,
+            disk_write_ops_per_sec: 0.0,
+            max_sample_delay_ms: 0,
+            protocol_errors: 0,
+            outbound_failed: 0,
+            outbound_permit_timeout: 0,
+            peer_connection_limit: 0,
+            disk_read_permits: 0,
+            disk_write_permits: 0,
+        }
+    }
+
+    #[test]
+    fn benchmark_capacity_helpers_report_explicit_clean_capacity() {
+        let report = benchmark_scenario_report_stub(1000, 2000, Some(1000), Some(4000));
+
+        assert_eq!(human_benchmark_torrent_capacity(&report), "1,000 torrents");
+        assert_eq!(human_benchmark_peer_capacity(&report), "2,000 peers");
+        assert_eq!(
+            human_benchmark_issue_at(&report),
+            "1,000 torrents / 4,000 peers"
+        );
+    }
+
+    #[test]
+    fn benchmark_capacity_helpers_explain_missing_clean_step() {
+        let report = benchmark_scenario_report_stub(0, 0, Some(10), Some(100));
+
+        assert_eq!(
+            human_benchmark_torrent_capacity(&report),
+            "unknown (first issue at 10 torrents)"
+        );
+        assert_eq!(
+            human_benchmark_peer_capacity(&report),
+            "unknown (first issue at 100 peers)"
+        );
+    }
+
+    #[test]
+    fn benchmark_progress_count_formats_partial_counts_without_abbreviations() {
+        assert_eq!(benchmark_progress_count(1000, 1000), "1,000");
+        assert_eq!(benchmark_progress_count(400, 1000), "400/1,000");
     }
 
     #[test]
