@@ -164,6 +164,7 @@ const NORMAL_IDLE_FRAME_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 const NORMAL_ANIMATION_RECENT_BLOCK_ROWS: usize = 64;
 const NORMAL_ANIMATION_RECENT_PEER_EVENTS: usize = 120;
 const NORMAL_ANIMATION_FILE_ACTIVITY_WINDOW: Duration = Duration::from_secs(4);
+const SWARM_AVAILABILITY_FLASH_DURATION: Duration = Duration::from_millis(350);
 const DISK_IDLE_WOBBLE_PHASE_SPEED: f64 = 0.45;
 const DISK_MIN_TRANSFER_PHASE_SPEED: f64 = 0.80;
 const DISK_MAX_TRANSFER_PHASE_SPEED: f64 = 5.20;
@@ -878,6 +879,21 @@ pub struct PeerInfo {
     pub last_action: String,
 }
 
+pub fn swarm_availability_counts(peers: &[PeerInfo], total_pieces: u32) -> Vec<u32> {
+    let total_pieces_usize = total_pieces as usize;
+    let mut availability = vec![0; total_pieces_usize];
+
+    for peer in peers {
+        for (i, has_piece) in peer.bitfield.iter().enumerate().take(total_pieces_usize) {
+            if *has_piece {
+                availability[i] += 1;
+            }
+        }
+    }
+
+    availability
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TorrentMetrics {
     pub torrent_control_state: TorrentControlState,
@@ -1004,6 +1020,194 @@ pub struct RecentFileActivity {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct SwarmAvailabilityFlashState {
+    pub info_hash: Vec<u8>,
+    pub previous_availability: Vec<u32>,
+    pub flash_until: Vec<Option<Instant>>,
+    previous_peer_bitfields: HashMap<String, Vec<bool>>,
+}
+
+impl SwarmAvailabilityFlashState {
+    #[cfg(test)]
+    pub fn update(
+        &mut self,
+        info_hash: &[u8],
+        current_availability: Vec<u32>,
+        now: Instant,
+        flash_duration: Duration,
+    ) {
+        self.previous_peer_bitfields.clear();
+        self.update_from_availability(
+            info_hash,
+            current_availability.clone(),
+            current_availability,
+            now,
+            flash_duration,
+        );
+    }
+
+    #[cfg(test)]
+    pub fn update_from_peers(
+        &mut self,
+        info_hash: &[u8],
+        peers: &[PeerInfo],
+        total_pieces: u32,
+        now: Instant,
+        flash_duration: Duration,
+    ) {
+        let current_availability = swarm_availability_counts(peers, total_pieces);
+        let current_peer_bitfields =
+            swarm_availability_peer_bitfields(peers, current_availability.len());
+        self.update_from_peer_availability(
+            info_hash,
+            current_availability,
+            current_peer_bitfields,
+            now,
+            flash_duration,
+        );
+    }
+
+    fn update_from_peer_availability(
+        &mut self,
+        info_hash: &[u8],
+        current_availability: Vec<u32>,
+        current_peer_bitfields: HashMap<String, Vec<bool>>,
+        now: Instant,
+        flash_duration: Duration,
+    ) {
+        if self.info_hash.as_slice() != info_hash
+            || self.previous_availability.len() != current_availability.len()
+        {
+            self.info_hash = info_hash.to_vec();
+            self.previous_availability = current_availability;
+            self.flash_until = vec![None; self.previous_availability.len()];
+            self.previous_peer_bitfields = current_peer_bitfields;
+            return;
+        }
+
+        let mut known_peer_availability = vec![0; current_availability.len()];
+        for (peer_key, bitfield) in &current_peer_bitfields {
+            if !self.previous_peer_bitfields.contains_key(peer_key) {
+                continue;
+            }
+
+            for (idx, has_piece) in bitfield.iter().enumerate() {
+                if *has_piece {
+                    known_peer_availability[idx] += 1;
+                }
+            }
+        }
+
+        self.update_from_availability(
+            info_hash,
+            current_availability,
+            known_peer_availability,
+            now,
+            flash_duration,
+        );
+        self.previous_peer_bitfields = current_peer_bitfields;
+    }
+
+    fn update_from_availability(
+        &mut self,
+        info_hash: &[u8],
+        current_availability: Vec<u32>,
+        flashable_availability: Vec<u32>,
+        now: Instant,
+        flash_duration: Duration,
+    ) {
+        if self.info_hash.as_slice() != info_hash
+            || self.previous_availability.len() != current_availability.len()
+        {
+            self.info_hash = info_hash.to_vec();
+            self.previous_availability = current_availability;
+            self.flash_until = vec![None; self.previous_availability.len()];
+            self.previous_peer_bitfields.clear();
+            return;
+        }
+
+        if self.flash_until.len() != current_availability.len() {
+            self.flash_until.resize(current_availability.len(), None);
+        }
+
+        let increased_count = self
+            .previous_availability
+            .iter()
+            .zip(flashable_availability.iter())
+            .filter(|&(&previous, &current)| current > previous)
+            .count();
+        let suppress_full_map_flash =
+            !flashable_availability.is_empty() && increased_count == flashable_availability.len();
+
+        for (idx, (&previous, &current)) in self
+            .previous_availability
+            .iter()
+            .zip(flashable_availability.iter())
+            .enumerate()
+        {
+            if current > previous && !suppress_full_map_flash {
+                self.flash_until[idx] = Some(now + flash_duration);
+            }
+        }
+
+        self.previous_availability = current_availability;
+        self.clear_expired(now);
+    }
+
+    pub fn is_piece_flashing(&self, info_hash: &[u8], piece_index: usize, now: Instant) -> bool {
+        self.info_hash.as_slice() == info_hash
+            && self
+                .flash_until
+                .get(piece_index)
+                .copied()
+                .flatten()
+                .is_some_and(|deadline| deadline > now)
+    }
+
+    pub fn has_active_flash(&self, now: Instant) -> bool {
+        self.flash_until
+            .iter()
+            .flatten()
+            .any(|&deadline| deadline > now)
+    }
+
+    fn clear_expired(&mut self, now: Instant) {
+        for deadline in &mut self.flash_until {
+            if deadline.is_some_and(|deadline| deadline <= now) {
+                *deadline = None;
+            }
+        }
+    }
+}
+
+fn swarm_availability_peer_bitfields(
+    peers: &[PeerInfo],
+    total_pieces: usize,
+) -> HashMap<String, Vec<bool>> {
+    let mut bitfields = HashMap::with_capacity(peers.len());
+    for (idx, peer) in peers.iter().enumerate() {
+        let mut bitfield = vec![false; total_pieces];
+        for (piece_idx, has_piece) in peer.bitfield.iter().enumerate().take(total_pieces) {
+            bitfield[piece_idx] = *has_piece;
+        }
+        bitfields.insert(swarm_availability_peer_key(peer, idx), bitfield);
+    }
+    bitfields
+}
+
+fn swarm_availability_peer_key(peer: &PeerInfo, fallback_index: usize) -> String {
+    if !peer.address.is_empty() {
+        return format!("addr:{}", peer.address);
+    }
+
+    if !peer.peer_id.is_empty() {
+        return format!("peer:{}", hex::encode(&peer.peer_id));
+    }
+
+    format!("slot:{fallback_index}")
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct DhtWaveUiState {
     pub phase: f64,
     pub amplitude: f64,
@@ -1029,6 +1233,7 @@ pub struct UiState {
     pub fps_sample_frames: u32,
     pub file_activity_download_phase: f64,
     pub file_activity_upload_phase: f64,
+    pub swarm_availability_flash: SwarmAvailabilityFlashState,
     pub dht_wave: DhtWaveUiState,
     pub selected_header: SelectedHeader,
     pub selected_torrent_index: usize,
@@ -3381,6 +3586,10 @@ impl App {
             return true;
         }
 
+        if app_state.ui.swarm_availability_flash.has_active_flash(now) {
+            return true;
+        }
+
         app_state
             .torrent_list_order
             .get(app_state.ui.selected_torrent_index)
@@ -3574,11 +3783,52 @@ impl App {
             .unwrap_or_else(|| file_activity_wave_steps_per_second(0));
         self.app_state.ui.file_activity_download_phase += frame_dt * download_steps_per_second;
         self.app_state.ui.file_activity_upload_phase += frame_dt * upload_steps_per_second;
+        self.update_swarm_availability_flash(now);
 
         let disk_phase_speed = Self::disk_health_phase_speed(&self.app_state);
         self.app_state.disk_health_phase = (self.app_state.disk_health_phase
             + frame_dt * disk_phase_speed)
             .rem_euclid(std::f64::consts::TAU);
+    }
+
+    fn update_swarm_availability_flash(&mut self, now: Instant) {
+        let selected = self
+            .app_state
+            .torrent_list_order
+            .get(self.app_state.ui.selected_torrent_index)
+            .and_then(|info_hash| {
+                self.app_state.torrents.get(info_hash).map(|torrent| {
+                    let current_availability = swarm_availability_counts(
+                        &torrent.latest_state.peers,
+                        torrent.latest_state.number_of_pieces_total,
+                    );
+                    let current_peer_bitfields = swarm_availability_peer_bitfields(
+                        &torrent.latest_state.peers,
+                        current_availability.len(),
+                    );
+                    (
+                        info_hash.clone(),
+                        current_availability,
+                        current_peer_bitfields,
+                    )
+                })
+            });
+
+        let Some((info_hash, current_availability, current_peer_bitfields)) = selected else {
+            self.app_state.ui.swarm_availability_flash = SwarmAvailabilityFlashState::default();
+            return;
+        };
+
+        self.app_state
+            .ui
+            .swarm_availability_flash
+            .update_from_peer_availability(
+                &info_hash,
+                current_availability,
+                current_peer_bitfields,
+                now,
+                SWARM_AVAILABILITY_FLASH_DURATION,
+            );
     }
 
     fn refresh_system_warning(&mut self) {
@@ -7493,17 +7743,18 @@ mod tests {
         persisted_validation_status_from_metrics, prune_rss_feed_errors, queue_persistence_payload,
         refresh_autosort_after_stats, resolve_magnet_torrent_name, rss_settings_changed,
         should_load_persisted_torrent, should_persist_network_history_on_interval,
-        sort_and_filter_torrent_list_state, torrent_completion_percent,
+        sort_and_filter_torrent_list_state, swarm_availability_counts, torrent_completion_percent,
         torrent_is_effectively_incomplete, App, AppClusterRole, AppCommand, AppMode,
         AppRuntimeMode, AppState, ColumnId, CommandIngestResult, DataRate, DhtWaveTargets,
         DhtWaveUiState, DiskBackpressureDecision, DiskBackpressureDownloadThrottle,
         DiskBackpressureSample, FilePriority, IngestSource, ListenerSet, PeerInfo, PeerSortColumn,
-        PersistPayload, SelectedHeader, SortDirection, TorrentControlState, TorrentDisplayState,
-        TorrentMetrics, TorrentPreviewPayload, TorrentSortColumn, UiState, BITTORRENT_PROTOCOL_STR,
-        DHT_WAVE_PHASE_WRAP_PERIOD, DISK_WRITE_THROTTLE_MIN_BYTES_PER_SEC,
-        DISK_WRITE_THROTTLE_START_BYTES_PER_SEC, DISK_WRITE_THROTTLE_STEP_MAX,
-        DISK_WRITE_THROTTLE_STEP_MIN, DISK_WRITE_THROTTLE_TARGET_LATENCY_SECS,
-        DISK_WRITE_THROTTLE_WINDOW_TICKS,
+        PersistPayload, SelectedHeader, SortDirection, SwarmAvailabilityFlashState,
+        TorrentControlState, TorrentDisplayState, TorrentMetrics, TorrentPreviewPayload,
+        TorrentSortColumn, UiState, BITTORRENT_PROTOCOL_STR, DHT_WAVE_PHASE_WRAP_PERIOD,
+        DISK_WRITE_THROTTLE_MIN_BYTES_PER_SEC, DISK_WRITE_THROTTLE_START_BYTES_PER_SEC,
+        DISK_WRITE_THROTTLE_STEP_MAX, DISK_WRITE_THROTTLE_STEP_MIN,
+        DISK_WRITE_THROTTLE_TARGET_LATENCY_SECS, DISK_WRITE_THROTTLE_WINDOW_TICKS,
+        SWARM_AVAILABILITY_FLASH_DURATION,
     };
     use crate::config::{
         clear_shared_config_state_for_tests, set_app_paths_override_for_tests, TorrentSettings,
@@ -8084,6 +8335,160 @@ mod tests {
     }
 
     #[test]
+    fn swarm_availability_counts_pieces_across_peers() {
+        let peers = vec![
+            PeerInfo {
+                bitfield: vec![true, false, true],
+                ..Default::default()
+            },
+            PeerInfo {
+                bitfield: vec![false, true, true, true],
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(swarm_availability_counts(&peers, 3), vec![1, 1, 2]);
+    }
+
+    #[test]
+    fn swarm_availability_flash_tracks_newly_added_pieces() {
+        let now = Instant::now();
+        let duration = Duration::from_millis(350);
+        let mut state = SwarmAvailabilityFlashState::default();
+
+        state.update(b"torrent-a", vec![0, 1, 0], now, duration);
+
+        assert!(!state.is_piece_flashing(b"torrent-a", 1, now));
+        assert!(!state.has_active_flash(now));
+
+        let next = now + Duration::from_millis(10);
+        state.update(b"torrent-a", vec![1, 1, 2], next, duration);
+
+        assert!(state.is_piece_flashing(b"torrent-a", 0, next));
+        assert!(!state.is_piece_flashing(b"torrent-a", 1, next));
+        assert!(state.is_piece_flashing(b"torrent-a", 2, next));
+        assert!(state.has_active_flash(next));
+        assert!(!state.has_active_flash(next + duration + Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn swarm_availability_flash_suppresses_full_map_increase() {
+        let now = Instant::now();
+        let duration = Duration::from_millis(350);
+        let mut state = SwarmAvailabilityFlashState::default();
+
+        state.update(b"torrent-a", vec![0, 0, 0], now, duration);
+        state.update(
+            b"torrent-a",
+            vec![1, 1, 1],
+            now + Duration::from_millis(10),
+            duration,
+        );
+
+        assert!(!state.has_active_flash(now + Duration::from_millis(10)));
+        assert!(!state.is_piece_flashing(b"torrent-a", 0, now + Duration::from_millis(10)));
+        assert!(!state.is_piece_flashing(b"torrent-a", 1, now + Duration::from_millis(10)));
+        assert!(!state.is_piece_flashing(b"torrent-a", 2, now + Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn swarm_availability_flash_keeps_partial_increase_after_complete_baseline() {
+        let now = Instant::now();
+        let duration = Duration::from_millis(350);
+        let mut state = SwarmAvailabilityFlashState::default();
+
+        state.update(b"torrent-a", vec![4, 4, 4], now, duration);
+        state.update(
+            b"torrent-a",
+            vec![5, 4, 4],
+            now + Duration::from_millis(10),
+            duration,
+        );
+
+        assert!(state.is_piece_flashing(b"torrent-a", 0, now + Duration::from_millis(10)));
+        assert!(!state.is_piece_flashing(b"torrent-a", 1, now + Duration::from_millis(10)));
+        assert!(!state.is_piece_flashing(b"torrent-a", 2, now + Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn swarm_availability_flash_suppresses_new_peer_initial_bitfield() {
+        let now = Instant::now();
+        let duration = Duration::from_millis(350);
+        let mut state = SwarmAvailabilityFlashState::default();
+
+        state.update_from_peers(b"torrent-a", &[], 3, now, duration);
+
+        let peers = vec![PeerInfo {
+            address: "127.0.0.1:7001".to_string(),
+            bitfield: vec![true, false, true],
+            ..Default::default()
+        }];
+        let next = now + Duration::from_millis(10);
+        state.update_from_peers(b"torrent-a", &peers, 3, next, duration);
+
+        assert!(!state.has_active_flash(next));
+        assert!(!state.is_piece_flashing(b"torrent-a", 0, next));
+        assert!(!state.is_piece_flashing(b"torrent-a", 2, next));
+    }
+
+    #[test]
+    fn swarm_availability_flash_tracks_known_peer_new_piece() {
+        let now = Instant::now();
+        let duration = Duration::from_millis(350);
+        let mut state = SwarmAvailabilityFlashState::default();
+
+        let peers = vec![PeerInfo {
+            address: "127.0.0.1:7001".to_string(),
+            bitfield: vec![true, false, false],
+            ..Default::default()
+        }];
+        state.update_from_peers(b"torrent-a", &peers, 3, now, duration);
+
+        let peers = vec![PeerInfo {
+            address: "127.0.0.1:7001".to_string(),
+            bitfield: vec![true, true, false],
+            ..Default::default()
+        }];
+        let next = now + Duration::from_millis(10);
+        state.update_from_peers(b"torrent-a", &peers, 3, next, duration);
+
+        assert!(!state.is_piece_flashing(b"torrent-a", 0, next));
+        assert!(state.is_piece_flashing(b"torrent-a", 1, next));
+        assert!(!state.is_piece_flashing(b"torrent-a", 2, next));
+    }
+
+    #[test]
+    fn swarm_availability_flash_ignores_later_new_peer_bitfield() {
+        let now = Instant::now();
+        let duration = Duration::from_millis(350);
+        let mut state = SwarmAvailabilityFlashState::default();
+
+        let peers = vec![PeerInfo {
+            address: "127.0.0.1:7001".to_string(),
+            bitfield: vec![false, false, false],
+            ..Default::default()
+        }];
+        state.update_from_peers(b"torrent-a", &peers, 3, now, duration);
+
+        let peers = vec![
+            PeerInfo {
+                address: "127.0.0.1:7001".to_string(),
+                bitfield: vec![false, false, false],
+                ..Default::default()
+            },
+            PeerInfo {
+                address: "127.0.0.1:7002".to_string(),
+                bitfield: vec![true, true, false],
+                ..Default::default()
+            },
+        ];
+        let next = now + Duration::from_millis(10);
+        state.update_from_peers(b"torrent-a", &peers, 3, next, duration);
+
+        assert!(!state.has_active_flash(next));
+    }
+
+    #[test]
     fn should_draw_every_frame_in_welcome_mode() {
         assert!(App::should_draw_this_frame(&AppMode::Welcome, false, false));
         assert!(App::should_draw_this_frame(&AppMode::Welcome, true, false));
@@ -8111,6 +8516,30 @@ mod tests {
             &app_state,
             None,
             Instant::now()
+        ));
+    }
+
+    #[test]
+    fn normal_animation_gate_detects_active_swarm_availability_flash() {
+        let now = Instant::now();
+        let mut app_state = AppState::default();
+        app_state.ui.swarm_availability_flash.update(
+            b"torrent-a",
+            vec![0, 0],
+            now,
+            SWARM_AVAILABILITY_FLASH_DURATION,
+        );
+        app_state.ui.swarm_availability_flash.update(
+            b"torrent-a",
+            vec![1, 0],
+            now + Duration::from_millis(1),
+            SWARM_AVAILABILITY_FLASH_DURATION,
+        );
+
+        assert!(App::normal_mode_animation_active(
+            &app_state,
+            None,
+            now + Duration::from_millis(2)
         ));
     }
 

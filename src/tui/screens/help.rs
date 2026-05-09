@@ -385,6 +385,13 @@ fn draw_help_table(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &ThemeC
                 ]),
                 Row::new(vec![
                     Cell::from(Span::styled(
+                        "f",
+                        ctx.apply(Style::default().fg(ctx.accent_teal())),
+                    )),
+                    Cell::from("Focus files when the peer/files stack cannot fit"),
+                ]),
+                Row::new(vec![
+                    Cell::from(Span::styled(
                         "[ / ]",
                         ctx.apply(Style::default().fg(ctx.accent_teal())),
                     )),
