@@ -1861,6 +1861,7 @@ async fn spawn_synthetic_seeder_hub(
 
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = peer_slots;
         let listener = TcpListener::bind(synthetic_listener_bind_addr()).await?;
         let port = listener.local_addr()?.port();
         let handle = spawn_synthetic_seeder_accept_loop(
