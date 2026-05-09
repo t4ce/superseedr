@@ -160,6 +160,49 @@ def test_qbittorrent_add_torrent_posts_to_api(monkeypatch: pytest.MonkeyPatch, t
     assert "multipart/form-data" in str(captured["headers"]["Content-Type"])
 
 
+def test_qbittorrent_add_torrent_accepts_json_success(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    torrent = tmp_path / "sample.torrent"
+    torrent.write_bytes(b"fake-torrent")
+    adapter = QBittorrentAdapter()
+    adapter._authenticated = True
+
+    monkeypatch.setattr(
+        adapter,
+        "_request",
+        lambda _path, **_kwargs: (
+            200,
+            b'{"added_torrent_ids":["abc"],"failure_count":0,"pending_count":0,"success_count":1}',
+        ),
+    )
+
+    adapter.add_torrent(str(torrent), "/downloads/leech")
+
+
+def test_qbittorrent_add_torrent_rejects_json_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    torrent = tmp_path / "sample.torrent"
+    torrent.write_bytes(b"fake-torrent")
+    adapter = QBittorrentAdapter()
+    adapter._authenticated = True
+
+    monkeypatch.setattr(
+        adapter,
+        "_request",
+        lambda _path, **_kwargs: (
+            200,
+            b'{"added_torrent_ids":[],"failure_count":1,"pending_count":0,"success_count":0}',
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="Failed to add torrent"):
+        adapter.add_torrent(str(torrent), "/downloads/leech")
+
+
 def test_qbittorrent_wait_for_download_success(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter = QBittorrentAdapter()
     adapter._authenticated = True
