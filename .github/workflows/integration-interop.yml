@@ -35,7 +35,7 @@ jobs:
         run: cargo test --all-targets --all-features
 
   interop:
-    name: Interop (${{ matrix.scenario }} / ${{ matrix.mode }})
+    name: Interop (${{ matrix.lane }})
     needs: rust_checks
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -43,28 +43,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - scenario: superseedr_to_superseedr
-            mode: v1
-          - scenario: superseedr_to_superseedr
-            mode: v2
-          - scenario: superseedr_to_superseedr
-            mode: hybrid
-          - scenario: superseedr_to_qbittorrent
-            mode: v1
-          - scenario: superseedr_to_qbittorrent
-            mode: v2
-          - scenario: superseedr_to_qbittorrent
-            mode: hybrid
-          - scenario: qbittorrent_to_superseedr
-            mode: v1
-          - scenario: qbittorrent_to_superseedr
-            mode: v2
-          - scenario: qbittorrent_to_superseedr
-            mode: hybrid
-          - scenario: superseedr_to_transmission
-            mode: v1
-          - scenario: transmission_to_superseedr
-            mode: v1
+          - lane: superseedr
+            commands: |
+              ./integration_tests/run_interop.sh all superseedr_to_superseedr
+          - lane: qbittorrent
+            commands: |
+              ./integration_tests/run_interop.sh all superseedr_to_qbittorrent
+              ./integration_tests/run_interop.sh all qbittorrent_to_superseedr
+          - lane: transmission
+            commands: |
+              ./integration_tests/run_interop.sh v1 superseedr_to_transmission
+              ./integration_tests/run_interop.sh v1 transmission_to_superseedr
 
     steps:
       - uses: actions/checkout@v4
@@ -85,23 +74,15 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Decide mode for this matrix shard
-        id: select_mode
-        run: |
-          echo "scenario=${{ matrix.scenario }}" >> "$GITHUB_OUTPUT"
-          echo "mode=${{ matrix.mode }}" >> "$GITHUB_OUTPUT"
-          echo "run=true" >> "$GITHUB_OUTPUT"
-
       - name: Run interop harness
-        if: steps.select_mode.outputs.run == 'true'
         env:
           INTEROP_TIMEOUT_SECS: "300"
         run: |
-          ./integration_tests/run_interop.sh "${{ steps.select_mode.outputs.mode }}" "${{ steps.select_mode.outputs.scenario }}"
+          ${{ matrix.commands }}
 
       - name: Upload interop artifacts
-        if: always() && steps.select_mode.outputs.run == 'true'
+        if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: interop-artifacts-${{ matrix.scenario }}-${{ matrix.mode }}-${{ github.run_id }}
+          name: interop-artifacts-${{ matrix.lane }}-${{ github.run_id }}
           path: integration_tests/artifacts/
