@@ -1023,6 +1023,7 @@ pub struct RecentFileActivity {
 pub struct SwarmAvailabilityFlashState {
     pub info_hash: Vec<u8>,
     pub previous_availability: Vec<u32>,
+    pub flash_start: Vec<Option<Instant>>,
     pub flash_until: Vec<Option<Instant>>,
     previous_peer_bitfields: HashMap<String, Vec<bool>>,
 }
@@ -1080,6 +1081,7 @@ impl SwarmAvailabilityFlashState {
         {
             self.info_hash = info_hash.to_vec();
             self.previous_availability = current_availability;
+            self.flash_start = vec![None; self.previous_availability.len()];
             self.flash_until = vec![None; self.previous_availability.len()];
             self.previous_peer_bitfields = current_peer_bitfields;
             return;
@@ -1121,11 +1123,15 @@ impl SwarmAvailabilityFlashState {
         {
             self.info_hash = info_hash.to_vec();
             self.previous_availability = current_availability;
+            self.flash_start = vec![None; self.previous_availability.len()];
             self.flash_until = vec![None; self.previous_availability.len()];
             self.previous_peer_bitfields.clear();
             return;
         }
 
+        if self.flash_start.len() != current_availability.len() {
+            self.flash_start.resize(current_availability.len(), None);
+        }
         if self.flash_until.len() != current_availability.len() {
             self.flash_until.resize(current_availability.len(), None);
         }
@@ -1139,6 +1145,7 @@ impl SwarmAvailabilityFlashState {
         let suppress_full_map_flash =
             !flashable_availability.is_empty() && increased_count == flashable_availability.len();
 
+        let mut rank = 0usize;
         for (idx, (&previous, &current)) in self
             .previous_availability
             .iter()
@@ -1146,7 +1153,12 @@ impl SwarmAvailabilityFlashState {
             .enumerate()
         {
             if current > previous && !suppress_full_map_flash {
-                self.flash_until[idx] = Some(now + flash_duration);
+                let delay =
+                    swarm_availability_flash_rollout_delay(rank, increased_count, flash_duration);
+                let start = now + delay;
+                self.flash_start[idx] = Some(start);
+                self.flash_until[idx] = Some(start + flash_duration);
+                rank += 1;
             }
         }
 
@@ -1156,6 +1168,12 @@ impl SwarmAvailabilityFlashState {
 
     pub fn is_piece_flashing(&self, info_hash: &[u8], piece_index: usize, now: Instant) -> bool {
         self.info_hash.as_slice() == info_hash
+            && self
+                .flash_start
+                .get(piece_index)
+                .copied()
+                .flatten()
+                .is_some_and(|start| start <= now)
             && self
                 .flash_until
                 .get(piece_index)
@@ -1172,12 +1190,33 @@ impl SwarmAvailabilityFlashState {
     }
 
     fn clear_expired(&mut self, now: Instant) {
-        for deadline in &mut self.flash_until {
-            if deadline.is_some_and(|deadline| deadline <= now) {
-                *deadline = None;
+        for idx in 0..self.flash_until.len() {
+            if self.flash_until[idx].is_some_and(|deadline| deadline <= now) {
+                self.flash_until[idx] = None;
+                if let Some(start) = self.flash_start.get_mut(idx) {
+                    *start = None;
+                }
             }
         }
     }
+}
+
+fn swarm_availability_flash_rollout_delay(
+    rank: usize,
+    flash_count: usize,
+    flash_duration: Duration,
+) -> Duration {
+    if rank == 0 || flash_count <= 1 || flash_duration.is_zero() {
+        return Duration::ZERO;
+    }
+
+    let steps = flash_count.saturating_sub(1) as u128;
+    let delay_nanos = flash_duration
+        .as_nanos()
+        .saturating_mul(rank as u128)
+        .checked_div(steps)
+        .unwrap_or(0);
+    Duration::from_nanos(delay_nanos.min(u64::MAX as u128) as u64)
 }
 
 fn swarm_availability_peer_bitfields(
@@ -8420,9 +8459,35 @@ mod tests {
 
         assert!(state.is_piece_flashing(b"torrent-a", 0, next));
         assert!(!state.is_piece_flashing(b"torrent-a", 1, next));
-        assert!(state.is_piece_flashing(b"torrent-a", 2, next));
+        assert!(!state.is_piece_flashing(b"torrent-a", 2, next));
         assert!(state.has_active_flash(next));
-        assert!(!state.has_active_flash(next + duration + Duration::from_millis(1)));
+        assert!(!state.is_piece_flashing(b"torrent-a", 0, next + duration));
+        assert!(state.is_piece_flashing(b"torrent-a", 2, next + duration));
+        assert!(!state.has_active_flash(next + duration * 2 + Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn swarm_availability_flash_rolls_batch_by_piece_index() {
+        let now = Instant::now();
+        let duration = Duration::from_millis(300);
+        let mut state = SwarmAvailabilityFlashState::default();
+
+        state.update(b"torrent-a", vec![0, 0, 0, 0], now, duration);
+
+        let next = now + Duration::from_millis(10);
+        state.update(b"torrent-a", vec![1, 1, 0, 1], next, duration);
+
+        assert!(state.is_piece_flashing(b"torrent-a", 0, next));
+        assert!(!state.is_piece_flashing(b"torrent-a", 1, next));
+        assert!(!state.is_piece_flashing(b"torrent-a", 3, next));
+
+        let second_start = next + Duration::from_millis(150);
+        assert!(state.is_piece_flashing(b"torrent-a", 1, second_start));
+        assert!(!state.is_piece_flashing(b"torrent-a", 3, second_start));
+
+        let third_start = next + duration;
+        assert!(!state.is_piece_flashing(b"torrent-a", 0, third_start));
+        assert!(state.is_piece_flashing(b"torrent-a", 3, third_start));
     }
 
     #[test]
