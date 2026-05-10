@@ -6415,71 +6415,6 @@ fn swarm_heatmap_flash_tone(
     Some(SwarmHeatmapFlashTone::Regular)
 }
 
-#[derive(Clone, Copy)]
-struct SwarmHeatmapGrid {
-    width: usize,
-    height: usize,
-    total_cells: u64,
-    total_pieces: usize,
-}
-
-impl SwarmHeatmapGrid {
-    fn piece_index_for_cell(self, x: usize, y: usize) -> Option<usize> {
-        if self.width == 0
-            || self.height == 0
-            || self.total_cells == 0
-            || self.total_pieces == 0
-            || x >= self.width
-            || y >= self.height
-        {
-            return None;
-        }
-
-        let cell_index = (y * self.width + x) as u64;
-        let piece_index = ((cell_index * self.total_pieces as u64) / self.total_cells) as usize;
-        (piece_index < self.total_pieces).then_some(piece_index)
-    }
-}
-
-fn swarm_heatmap_flash_neighbor_active(
-    flash: Option<SwarmHeatmapFlash<'_>>,
-    grid: SwarmHeatmapGrid,
-    x: usize,
-    y: usize,
-    piece_index: usize,
-) -> bool {
-    let Some(flash) = flash else {
-        return false;
-    };
-
-    let x_start = x.saturating_sub(1);
-    let y_start = y.saturating_sub(1);
-    let x_end = (x + 1).min(grid.width.saturating_sub(1));
-    let y_end = (y + 1).min(grid.height.saturating_sub(1));
-
-    for neighbor_y in y_start..=y_end {
-        for neighbor_x in x_start..=x_end {
-            if neighbor_x == x && neighbor_y == y {
-                continue;
-            }
-            let Some(neighbor_piece) = grid.piece_index_for_cell(neighbor_x, neighbor_y) else {
-                continue;
-            };
-            if neighbor_piece == piece_index {
-                continue;
-            }
-            if flash
-                .state
-                .is_piece_flashing(flash.info_hash, neighbor_piece, flash.now)
-            {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
 fn draw_swarm_heatmap(
     f: &mut Frame,
     ctx: &ThemeContext,
@@ -6602,21 +6537,18 @@ fn draw_swarm_heatmap(
         return;
     }
 
-    let grid = SwarmHeatmapGrid {
-        width: available_width,
-        height: available_height,
-        total_cells,
-        total_pieces: total_pieces_usize,
-    };
     let mut lines = Vec::with_capacity(available_height);
+    let total_pieces_u64 = total_pieces_usize as u64;
 
     for y in 0..available_height {
         let mut spans = Vec::with_capacity(available_width);
         for x in 0..available_width {
-            let Some(piece_index) = grid.piece_index_for_cell(x, y) else {
+            let cell_index = (y * available_width + x) as u64;
+            let piece_index = ((cell_index * total_pieces_u64) / total_cells) as usize;
+            if piece_index >= total_pieces_usize {
                 spans.push(Span::raw(" "));
                 continue;
-            };
+            }
             let display_count = display_availability[piece_index];
             let (piece_char, style) = if display_count == 0 {
                 (
@@ -6644,11 +6576,7 @@ fn draw_swarm_heatmap(
                         SwarmHeatmapLevel::Medium => (shade_medium, color_heatmap_medium),
                         SwarmHeatmapLevel::High => (shade_dark, color_heatmap_high),
                     };
-                    let mut style = Style::default().fg(color);
-                    if swarm_heatmap_flash_neighbor_active(flash, grid, x, y, piece_index) {
-                        style = style.add_modifier(Modifier::DIM);
-                    }
-                    (piece_char, ctx.apply(style))
+                    (piece_char, ctx.apply(Style::default().fg(color)))
                 }
             };
             spans.push(Span::styled(piece_char.to_string(), style));
@@ -7403,43 +7331,6 @@ mod tests {
         let color = swarm_heatmap_flash_color(&ctx, &peers, 2, 0);
 
         assert_eq!(color, ip_to_color(&ctx, "127.0.0.1:7001"));
-    }
-
-    #[test]
-    fn swarm_heatmap_flash_neighbor_detects_adjacent_flash() {
-        let now = Instant::now();
-        let duration = Duration::from_millis(350);
-        let mut state = SwarmAvailabilityFlashState::default();
-        state.update(b"torrent-a", vec![0, 0, 0], now, duration);
-
-        let next = now + Duration::from_millis(10);
-        state.update(b"torrent-a", vec![1, 0, 0], next, duration);
-        let flash = SwarmHeatmapFlash {
-            info_hash: b"torrent-a",
-            state: &state,
-            now: next,
-        };
-        let grid = SwarmHeatmapGrid {
-            width: 3,
-            height: 1,
-            total_cells: 3,
-            total_pieces: 3,
-        };
-
-        assert!(swarm_heatmap_flash_neighbor_active(
-            Some(flash),
-            grid,
-            1,
-            0,
-            1,
-        ));
-        assert!(!swarm_heatmap_flash_neighbor_active(
-            Some(flash),
-            grid,
-            2,
-            0,
-            2,
-        ));
     }
 
     #[test]
