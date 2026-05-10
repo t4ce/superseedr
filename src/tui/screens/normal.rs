@@ -78,6 +78,8 @@ const ASCII_TREE_FILE_ICON: &str = "  ";
 const FILE_ACTIVITY_HIGHLIGHT_WINDOW: Duration = Duration::from_millis(1800);
 const MIN_SWARM_AVAILABILITY_HEIGHT: u16 = 4;
 const FILES_SWARM_SPACER_HEIGHT: u16 = 1;
+const SATURATED_ACTIVE_PEER_FILE_ROWS: u16 = 5;
+const MIN_SATURATED_ACTIVE_PEER_TABLE_HEIGHT: u16 = 2;
 const MAX_INACTIVE_ONLY_PEERS_IN_TABLE: usize = 10;
 const DISK_HEALTH_ORB_SIZE_SCALE: f64 = 1.35;
 const DISK_HEALTH_ORB_CELL_Y_ASPECT: f64 = 2.0;
@@ -808,7 +810,14 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>, plan: &LayoutPlan) {
 struct PeerFilesAreaLayout {
     peer_table: Option<Rect>,
     files: Rect,
-    swarm: Rect,
+    swarm: Option<Rect>,
+    files_mode: TorrentFilesRenderMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TorrentFilesRenderMode {
+    Tree,
+    ActivitySorted,
 }
 
 #[derive(Clone, Copy)]
@@ -851,41 +860,62 @@ fn draw_peer_files_area(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &T
     if let Some(peer_table) = layout.peer_table {
         draw_peers_table_without_swarm(f, app_state, peer_table, ctx);
     }
-    draw_torrent_files_panel_without_swarm(f, app_state, layout.files, ctx);
+    draw_torrent_files_panel_without_swarm(f, app_state, layout.files, ctx, layout.files_mode);
 
-    if let Some((info_hash, torrent)) = selected_torrent_entry(app_state) {
-        draw_swarm_heatmap(
-            f,
-            ctx,
-            &torrent.latest_state.peers,
-            torrent.latest_state.number_of_pieces_total,
-            layout.swarm,
-            Some(swarm_heatmap_flash(app_state, info_hash)),
-        );
-    } else {
-        draw_swarm_heatmap(f, ctx, &[], 0, layout.swarm, None);
+    if let Some(swarm) = layout.swarm {
+        if let Some((info_hash, torrent)) = selected_torrent_entry(app_state) {
+            draw_swarm_heatmap(
+                f,
+                ctx,
+                &torrent.latest_state.peers,
+                torrent.latest_state.number_of_pieces_total,
+                swarm,
+                Some(swarm_heatmap_flash(app_state, info_hash)),
+            );
+        } else {
+            draw_swarm_heatmap(f, ctx, &[], 0, swarm, None);
+        }
     }
 }
 
 fn torrent_peer_files_layout(app_state: &AppState, area: Rect) -> Option<PeerFilesAreaLayout> {
-    if area.height < MIN_SWARM_AVAILABILITY_HEIGHT || area.width < 2 {
+    if area.height < 2 || area.width < 2 {
         return None;
     }
 
     let torrent = selected_torrent(app_state)?;
-    let peer_table_height = peer_table_height_needed(app_state, &torrent.latest_state);
-    let max_files_height = area
-        .height
-        .saturating_sub(peer_table_height)
-        .saturating_sub(FILES_SWARM_SPACER_HEIGHT)
-        .saturating_sub(MIN_SWARM_AVAILABILITY_HEIGHT);
-    let files_height = torrent_files_panel_height_needed(
-        torrent,
-        area.width,
-        app_state.anonymize_torrent_names,
-        max_files_height,
-    )?;
+    let (sort_by, sort_direction) = app_state.peer_sort;
+    let peer_rows = displayed_peers_for_table(&torrent.latest_state, sort_by, sort_direction);
+    let peer_table_height = peer_table_height_for_row_count(peer_rows.len());
 
+    if area.height >= MIN_SWARM_AVAILABILITY_HEIGHT {
+        let max_files_height = area
+            .height
+            .saturating_sub(peer_table_height)
+            .saturating_sub(FILES_SWARM_SPACER_HEIGHT)
+            .saturating_sub(MIN_SWARM_AVAILABILITY_HEIGHT);
+        if let Some(files_height) = torrent_files_panel_height_needed(
+            torrent,
+            area.width,
+            app_state.anonymize_torrent_names,
+            max_files_height,
+        ) {
+            return Some(peer_files_layout_with_swarm(
+                area,
+                peer_table_height,
+                files_height,
+            ));
+        }
+    }
+
+    saturated_active_peer_files_layout(torrent, &peer_rows, peer_table_height, area)
+}
+
+fn peer_files_layout_with_swarm(
+    area: Rect,
+    peer_table_height: u16,
+    files_height: u16,
+) -> PeerFilesAreaLayout {
     let mut y = area.y;
     let peer_table = if peer_table_height > 0 {
         let rect = Rect::new(area.x, y, area.width, peer_table_height);
@@ -903,11 +933,74 @@ fn torrent_peer_files_layout(app_state: &AppState, area: Rect) -> Option<PeerFil
     let swarm_height = area.height.saturating_sub(used_height);
     let swarm = Rect::new(area.x, y, area.width, swarm_height);
 
-    Some(PeerFilesAreaLayout {
+    PeerFilesAreaLayout {
         peer_table,
         files,
-        swarm,
+        swarm: Some(swarm),
+        files_mode: TorrentFilesRenderMode::Tree,
+    }
+}
+
+fn saturated_active_peer_files_layout(
+    torrent: &TorrentDisplayState,
+    peer_rows: &[PeerTableRow],
+    peer_table_height: u16,
+    area: Rect,
+) -> Option<PeerFilesAreaLayout> {
+    if !peer_rows_are_all_active(peer_rows) {
+        return None;
+    }
+
+    let max_files_height = area
+        .height
+        .saturating_sub(MIN_SATURATED_ACTIVE_PEER_TABLE_HEIGHT);
+    let files_height = saturated_active_peer_files_height(torrent, max_files_height)?;
+    let peer_table_height_available = area.height.saturating_sub(files_height);
+    if peer_table_height <= peer_table_height_available {
+        return None;
+    }
+
+    let peer_table = Rect::new(area.x, area.y, area.width, peer_table_height_available);
+    let files = Rect::new(
+        area.x,
+        area.y.saturating_add(peer_table_height_available),
+        area.width,
+        files_height,
+    );
+
+    Some(PeerFilesAreaLayout {
+        peer_table: Some(peer_table),
+        files,
+        swarm: None,
+        files_mode: TorrentFilesRenderMode::ActivitySorted,
     })
+}
+
+fn peer_rows_are_all_active(rows: &[PeerTableRow]) -> bool {
+    !rows.is_empty()
+        && rows.iter().all(|row| match row {
+            PeerTableRow::Peer(peer) => !peer_is_inactive_for_table(peer),
+            PeerTableRow::InactiveSummary { .. } => false,
+        })
+}
+
+fn saturated_active_peer_files_height(
+    torrent: &TorrentDisplayState,
+    max_height: u16,
+) -> Option<u16> {
+    if max_height == 0 {
+        return None;
+    }
+    let file_count = activity_sorted_file_count(torrent);
+    if file_count == 0 {
+        return None;
+    }
+
+    Some(
+        usize_to_u16_saturating(file_count)
+            .min(SATURATED_ACTIVE_PEER_FILE_ROWS)
+            .min(max_height),
+    )
 }
 
 fn selected_torrent(app_state: &AppState) -> Option<&TorrentDisplayState> {
@@ -4919,18 +5012,12 @@ fn draw_peers_table_impl(
     }
 }
 
-fn peer_table_height_needed(app_state: &AppState, state: &crate::app::TorrentMetrics) -> u16 {
-    let row_count = peer_table_row_count(app_state, state);
+fn peer_table_height_for_row_count(row_count: usize) -> u16 {
     if row_count == 0 {
         0
     } else {
         usize_to_u16_saturating(row_count).saturating_add(2)
     }
-}
-
-fn peer_table_row_count(app_state: &AppState, state: &crate::app::TorrentMetrics) -> usize {
-    let (sort_by, sort_direction) = app_state.peer_sort;
-    displayed_peers_for_table(state, sort_by, sort_direction).len()
 }
 
 fn displayed_peers_for_table(
@@ -5069,7 +5156,7 @@ pub fn draw_torrent_files_panel(
     area: Rect,
     ctx: &ThemeContext,
 ) {
-    draw_torrent_files_panel_impl(f, app_state, area, ctx, true);
+    draw_torrent_files_panel_impl(f, app_state, area, ctx, true, TorrentFilesRenderMode::Tree);
 }
 
 fn draw_torrent_files_panel_without_swarm(
@@ -5077,8 +5164,9 @@ fn draw_torrent_files_panel_without_swarm(
     app_state: &AppState,
     area: Rect,
     ctx: &ThemeContext,
+    files_mode: TorrentFilesRenderMode,
 ) {
-    draw_torrent_files_panel_impl(f, app_state, area, ctx, false);
+    draw_torrent_files_panel_impl(f, app_state, area, ctx, false, files_mode);
 }
 
 fn draw_torrent_files_panel_impl(
@@ -5087,6 +5175,7 @@ fn draw_torrent_files_panel_impl(
     area: Rect,
     ctx: &ThemeContext,
     include_swarm: bool,
+    files_mode: TorrentFilesRenderMode,
 ) {
     if area.height < 2 || area.width < 2 {
         return;
@@ -5130,11 +5219,14 @@ fn draw_torrent_files_panel_impl(
         let inner_area = draw_torrent_files_frame(f, layout_chunks[0], ctx);
         let list_items = build_torrent_file_list_items(
             torrent,
-            inner_area.width,
-            inner_area.height,
-            app_state.anonymize_torrent_names,
-            app_state.ui.file_activity_download_phase,
-            app_state.ui.file_activity_upload_phase,
+            TorrentFilesListRenderOptions {
+                width: inner_area.width,
+                height: inner_area.height,
+                anonymize: app_state.anonymize_torrent_names,
+                download_phase: app_state.ui.file_activity_download_phase,
+                upload_phase: app_state.ui.file_activity_upload_phase,
+                mode: files_mode,
+            },
             ctx,
         );
         f.render_widget(List::new(list_items), inner_area);
@@ -5150,11 +5242,14 @@ fn draw_torrent_files_panel_impl(
         let body_area = draw_torrent_files_frame(f, area, ctx);
         let list_items = build_torrent_file_list_items(
             torrent,
-            body_area.width,
-            body_area.height,
-            app_state.anonymize_torrent_names,
-            app_state.ui.file_activity_download_phase,
-            app_state.ui.file_activity_upload_phase,
+            TorrentFilesListRenderOptions {
+                width: body_area.width,
+                height: body_area.height,
+                anonymize: app_state.anonymize_torrent_names,
+                download_phase: app_state.ui.file_activity_download_phase,
+                upload_phase: app_state.ui.file_activity_upload_phase,
+                mode: files_mode,
+            },
             ctx,
         );
         f.render_widget(List::new(list_items), body_area);
@@ -5237,7 +5332,43 @@ fn torrent_file_list_desired_row_count(
     root_rows + visible_rows.min(remaining_rows)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TorrentFilesListRenderOptions {
+    width: u16,
+    height: u16,
+    anonymize: bool,
+    download_phase: f64,
+    upload_phase: f64,
+    mode: TorrentFilesRenderMode,
+}
+
 fn build_torrent_file_list_items(
+    torrent: &TorrentDisplayState,
+    options: TorrentFilesListRenderOptions,
+    ctx: &ThemeContext,
+) -> Vec<ListItem<'static>> {
+    match options.mode {
+        TorrentFilesRenderMode::Tree => build_torrent_file_tree_list_items(
+            torrent,
+            options.width,
+            options.height,
+            options.anonymize,
+            options.download_phase,
+            options.upload_phase,
+            ctx,
+        ),
+        TorrentFilesRenderMode::ActivitySorted => build_activity_sorted_torrent_file_list_items(
+            torrent,
+            options.height,
+            options.anonymize,
+            options.download_phase,
+            options.upload_phase,
+            ctx,
+        ),
+    }
+}
+
+fn build_torrent_file_tree_list_items(
     torrent: &TorrentDisplayState,
     width: u16,
     height: u16,
@@ -5364,40 +5495,8 @@ fn build_torrent_file_list_items(
         };
         let relative_path = normalize_tree_relative_path(item.path.as_path());
 
-        let (name_style, suffix) = match item.node.payload.priority {
-            FilePriority::Skip => (
-                ctx.apply(
-                    Style::default()
-                        .fg(ctx.theme.semantic.surface1)
-                        .add_modifier(Modifier::CROSSED_OUT),
-                ),
-                Some(" [S]".to_string()),
-            ),
-            FilePriority::High => (
-                ctx.apply(
-                    Style::default()
-                        .fg(ctx.state_success())
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Some(" [H]".to_string()),
-            ),
-            FilePriority::Mixed => (
-                ctx.apply(
-                    Style::default()
-                        .fg(ctx.state_warning())
-                        .add_modifier(Modifier::ITALIC),
-                ),
-                Some(" [*]".to_string()),
-            ),
-            FilePriority::Normal => (
-                ctx.apply(Style::default().fg(if item.node.is_dir {
-                    ctx.state_info()
-                } else {
-                    ctx.theme.semantic.text
-                })),
-                None,
-            ),
-        };
+        let (name_style, suffix) =
+            file_priority_style(item.node.payload.priority, item.node.is_dir, ctx);
         let mut spans = vec![
             Span::styled(
                 indent,
@@ -5441,6 +5540,236 @@ fn build_torrent_file_list_items(
     }));
 
     list_items
+}
+
+#[derive(Debug, Clone)]
+struct ActivitySortedFileRow {
+    relative_path: String,
+    size: u64,
+    priority: FilePriority,
+}
+
+fn build_activity_sorted_torrent_file_list_items(
+    torrent: &TorrentDisplayState,
+    height: u16,
+    anonymize: bool,
+    download_phase: f64,
+    upload_phase: f64,
+    ctx: &ThemeContext,
+) -> Vec<ListItem<'static>> {
+    let mut rows = activity_sorted_file_rows(torrent);
+    let height = height as usize;
+    if height == 0 || rows.is_empty() {
+        return Vec::new();
+    }
+
+    rows.sort_by(|a, b| compare_activity_sorted_file_rows(torrent, a, b));
+
+    let total_rows = rows.len();
+    let visible_file_rows = if total_rows > height {
+        height.saturating_sub(1)
+    } else {
+        height
+    };
+
+    let mut items = rows
+        .into_iter()
+        .take(visible_file_rows)
+        .map(|row| {
+            render_activity_sorted_file_row(
+                torrent,
+                row,
+                anonymize,
+                download_phase,
+                upload_phase,
+                ctx,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    if total_rows > height {
+        let hidden_count = total_rows.saturating_sub(visible_file_rows);
+        items.push(render_activity_sorted_overflow_row(hidden_count, ctx));
+    }
+
+    items
+}
+
+fn activity_sorted_file_count(torrent: &TorrentDisplayState) -> usize {
+    activity_sorted_file_rows(torrent).len()
+}
+
+fn activity_sorted_file_rows(torrent: &TorrentDisplayState) -> Vec<ActivitySortedFileRow> {
+    let mut rows = Vec::new();
+    for node in &torrent.file_preview_tree {
+        collect_activity_sorted_file_rows(node, &mut rows);
+    }
+
+    if rows.is_empty() && !torrent.latest_state.torrent_name.is_empty() {
+        rows.push(ActivitySortedFileRow {
+            relative_path: torrent.latest_state.torrent_name.clone(),
+            size: torrent.latest_state.total_size,
+            priority: FilePriority::Normal,
+        });
+    }
+
+    rows
+}
+
+fn collect_activity_sorted_file_rows(
+    node: &crate::tui::tree::RawNode<crate::app::TorrentPreviewPayload>,
+    rows: &mut Vec<ActivitySortedFileRow>,
+) {
+    if node.is_dir {
+        for child in &node.children {
+            collect_activity_sorted_file_rows(child, rows);
+        }
+        return;
+    }
+
+    rows.push(ActivitySortedFileRow {
+        relative_path: normalize_tree_relative_path(node.full_path.as_path()),
+        size: node.payload.size,
+        priority: node.payload.priority,
+    });
+}
+
+fn compare_activity_sorted_file_rows(
+    torrent: &TorrentDisplayState,
+    a: &ActivitySortedFileRow,
+    b: &ActivitySortedFileRow,
+) -> std::cmp::Ordering {
+    let a_activity = file_activity_last_seen(torrent, &a.relative_path);
+    let b_activity = file_activity_last_seen(torrent, &b.relative_path);
+
+    b_activity
+        .cmp(&a_activity)
+        .then_with(|| a.relative_path.cmp(&b.relative_path))
+}
+
+fn file_activity_last_seen(torrent: &TorrentDisplayState, relative_path: &str) -> Option<Instant> {
+    torrent
+        .recent_file_activity
+        .get(relative_path)
+        .and_then(
+            |activity| match (activity.download_at, activity.upload_at) {
+                (Some(download_at), Some(upload_at)) => Some(download_at.max(upload_at)),
+                (Some(download_at), None) => Some(download_at),
+                (None, Some(upload_at)) => Some(upload_at),
+                (None, None) => None,
+            },
+        )
+}
+
+fn render_activity_sorted_file_row(
+    torrent: &TorrentDisplayState,
+    row: ActivitySortedFileRow,
+    anonymize: bool,
+    download_phase: f64,
+    upload_phase: f64,
+    ctx: &ThemeContext,
+) -> ListItem<'static> {
+    let (name_style, suffix) = file_priority_style(row.priority, false, ctx);
+    let display_name = anonymize_tree_name(&row.relative_path, false, anonymize);
+    let mut spans = vec![Span::styled(
+        ASCII_TREE_FILE_ICON,
+        ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
+    )];
+    spans.extend(render_file_tree_name_spans(
+        torrent,
+        &row.relative_path,
+        &display_name,
+        false,
+        FileTreeNameRenderContext {
+            download_phase,
+            upload_phase,
+            row_start_offset: torrent_root_logical_len(torrent).saturating_add(1),
+            base_style: name_style,
+            ctx,
+        },
+    ));
+
+    if row.size > 0 {
+        spans.push(Span::styled(
+            format!(" ({})", format_bytes(row.size)),
+            ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
+        ));
+    }
+
+    if let Some(suffix) = suffix {
+        spans.push(Span::styled(
+            suffix,
+            ctx.apply(Style::default().fg(ctx.theme.semantic.surface1)),
+        ));
+    }
+
+    ListItem::new(Line::from(spans))
+}
+
+fn render_activity_sorted_overflow_row(
+    hidden_count: usize,
+    ctx: &ThemeContext,
+) -> ListItem<'static> {
+    let label = format!(
+        "+ {} more file{}",
+        hidden_count,
+        if hidden_count == 1 { "" } else { "s" }
+    );
+    ListItem::new(Line::from(vec![
+        Span::styled(
+            ASCII_TREE_FILE_ICON,
+            ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
+        ),
+        Span::styled(
+            label,
+            ctx.apply(
+                Style::default()
+                    .fg(ctx.theme.semantic.surface1)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+        ),
+    ]))
+}
+
+fn file_priority_style(
+    priority: FilePriority,
+    is_dir: bool,
+    ctx: &ThemeContext,
+) -> (Style, Option<String>) {
+    match priority {
+        FilePriority::Skip => (
+            ctx.apply(
+                Style::default()
+                    .fg(ctx.theme.semantic.surface1)
+                    .add_modifier(Modifier::CROSSED_OUT),
+            ),
+            Some(" [S]".to_string()),
+        ),
+        FilePriority::High => (
+            ctx.apply(
+                Style::default()
+                    .fg(ctx.state_success())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Some(" [H]".to_string()),
+        ),
+        FilePriority::Mixed => (
+            ctx.apply(
+                Style::default()
+                    .fg(ctx.state_warning())
+                    .add_modifier(Modifier::ITALIC),
+            ),
+            Some(" [*]".to_string()),
+        ),
+        FilePriority::Normal => (
+            ctx.apply(Style::default().fg(if is_dir {
+                ctx.state_info()
+            } else {
+                ctx.theme.semantic.text
+            })),
+            None,
+        ),
+    }
 }
 
 fn file_tree_activity_sort_rank(
@@ -7061,11 +7390,12 @@ mod tests {
 
         let layout = torrent_peer_files_layout(&app_state, Rect::new(0, 0, 80, 20))
             .expect("peers, files, and swarm should fit");
+        let swarm = layout.swarm.expect("swarm visible");
 
         assert_eq!(layout.peer_table.expect("peer table visible").height, 4);
         assert_eq!(layout.files.height, 4);
-        assert_eq!(layout.swarm.y, layout.files.y + layout.files.height + 1);
-        assert_eq!(layout.swarm.height, 11);
+        assert_eq!(swarm.y, layout.files.y + layout.files.height + 1);
+        assert_eq!(swarm.height, 11);
     }
 
     #[test]
@@ -7086,11 +7416,12 @@ mod tests {
 
         let layout = torrent_peer_files_layout(&app_state, Rect::new(0, 0, 80, 20))
             .expect("peers, files, and swarm should fit");
+        let swarm = layout.swarm.expect("swarm visible");
 
         assert_eq!(layout.peer_table.expect("peer table visible").height, 4);
         assert_eq!(layout.files.height, 11);
-        assert_eq!(layout.swarm.y, layout.files.y + layout.files.height + 1);
-        assert_eq!(layout.swarm.height, MIN_SWARM_AVAILABILITY_HEIGHT);
+        assert_eq!(swarm.y, layout.files.y + layout.files.height + 1);
+        assert_eq!(swarm.height, MIN_SWARM_AVAILABILITY_HEIGHT);
     }
 
     #[test]
@@ -7116,6 +7447,38 @@ mod tests {
     }
 
     #[test]
+    fn peer_files_layout_reserves_files_when_active_peers_fill_area() {
+        let mut app_state = create_test_app_state();
+        let torrent = app_state
+            .torrents
+            .get_mut("hash_a".as_bytes())
+            .expect("mock torrent exists");
+        torrent.latest_state.peers = (0..20)
+            .map(|idx| PeerInfo {
+                address: format!("127.0.0.1:{}", 7000 + idx),
+                download_speed_bps: 1_000 + idx as u64,
+                ..Default::default()
+            })
+            .collect();
+        torrent.latest_state.torrent_name = "sample-tree".to_string();
+        torrent.latest_state.download_path = Some(PathBuf::from(r"C:\data\sample-tree"));
+        torrent.file_preview_tree = crate::app::build_torrent_preview_tree(
+            (0..8)
+                .map(|idx| (vec![format!("file_{idx:02}.bin")], 1_u64))
+                .collect(),
+            &Default::default(),
+        );
+
+        let layout = torrent_peer_files_layout(&app_state, Rect::new(0, 0, 80, 12))
+            .expect("active peers should reserve a files strip");
+
+        assert_eq!(layout.files_mode, TorrentFilesRenderMode::ActivitySorted);
+        assert_eq!(layout.swarm, None);
+        assert_eq!(layout.peer_table.expect("peer table visible").height, 7);
+        assert_eq!(layout.files, Rect::new(0, 7, 80, 5));
+    }
+
+    #[test]
     fn peer_files_layout_can_show_files_without_peer_rows() {
         let mut app_state = create_test_app_state();
         app_state.ui.selected_torrent_index = 1;
@@ -7135,7 +7498,7 @@ mod tests {
 
         assert_eq!(layout.peer_table, None);
         assert_eq!(layout.files.height, 2);
-        assert_eq!(layout.swarm.height, 9);
+        assert_eq!(layout.swarm.expect("swarm visible").height, 9);
     }
 
     #[test]
@@ -8668,7 +9031,18 @@ mod tests {
         );
 
         let ctx = ThemeContext::new(Theme::builtin(ThemeName::CatppuccinMocha), 0.0);
-        let items = build_torrent_file_list_items(&torrent, 40, 3, false, 0.0, 0.0, &ctx);
+        let items = build_torrent_file_list_items(
+            &torrent,
+            TorrentFilesListRenderOptions {
+                width: 40,
+                height: 3,
+                anonymize: false,
+                download_phase: 0.0,
+                upload_phase: 0.0,
+                mode: TorrentFilesRenderMode::Tree,
+            },
+            &ctx,
+        );
 
         assert_eq!(items.len(), 3);
     }
@@ -8692,11 +9066,69 @@ mod tests {
         );
 
         let ctx = ThemeContext::new(Theme::builtin(ThemeName::CatppuccinMocha), 0.0);
-        let items = build_torrent_file_list_items(&torrent, 40, 3, false, 0.0, 0.0, &ctx);
+        let items = build_torrent_file_list_items(
+            &torrent,
+            TorrentFilesListRenderOptions {
+                width: 40,
+                height: 3,
+                anonymize: false,
+                download_phase: 0.0,
+                upload_phase: 0.0,
+                mode: TorrentFilesRenderMode::Tree,
+            },
+            &ctx,
+        );
         let lines = render_list_item_plain_lines(items, 40);
 
         assert_eq!(lines.len(), 3);
         assert!(lines[1].contains("file_06.bin"));
+    }
+
+    #[test]
+    fn activity_sorted_file_list_orders_by_recent_activity_and_adds_overflow_row() {
+        let mut torrent = create_mock_display_state(0);
+        torrent.latest_state.torrent_name = "sample-tree".to_string();
+        torrent.file_preview_tree = crate::app::build_torrent_preview_tree(
+            (0..8)
+                .map(|idx| (vec![format!("file_{idx:02}.bin")], 1_u64))
+                .collect(),
+            &Default::default(),
+        );
+        let now = Instant::now();
+        torrent.recent_file_activity.insert(
+            "file_03.bin".to_string(),
+            crate::app::RecentFileActivity {
+                download_at: Some(now - Duration::from_secs(10)),
+                upload_at: None,
+            },
+        );
+        torrent.recent_file_activity.insert(
+            "file_06.bin".to_string(),
+            crate::app::RecentFileActivity {
+                download_at: Some(now),
+                upload_at: None,
+            },
+        );
+
+        let ctx = ThemeContext::new(Theme::builtin(ThemeName::CatppuccinMocha), 0.0);
+        let items = build_torrent_file_list_items(
+            &torrent,
+            TorrentFilesListRenderOptions {
+                width: 40,
+                height: 5,
+                anonymize: false,
+                download_phase: 0.0,
+                upload_phase: 0.0,
+                mode: TorrentFilesRenderMode::ActivitySorted,
+            },
+            &ctx,
+        );
+        let lines = render_list_item_plain_lines(items, 40);
+
+        assert_eq!(lines.len(), 5);
+        assert!(lines[0].contains("file_06.bin"));
+        assert!(lines[1].contains("file_03.bin"));
+        assert!(lines[4].contains("+ 4 more files"));
     }
 
     #[test]
@@ -8718,7 +9150,18 @@ mod tests {
         );
 
         let ctx = ThemeContext::new(Theme::builtin(ThemeName::CatppuccinMocha), 0.0);
-        let items = build_torrent_file_list_items(&torrent, 40, 5, false, 0.0, 0.0, &ctx);
+        let items = build_torrent_file_list_items(
+            &torrent,
+            TorrentFilesListRenderOptions {
+                width: 40,
+                height: 5,
+                anonymize: false,
+                download_phase: 0.0,
+                upload_phase: 0.0,
+                mode: TorrentFilesRenderMode::Tree,
+            },
+            &ctx,
+        );
         let lines = render_list_item_plain_lines(items, 40);
 
         assert!(lines[1].contains("file_00.bin"));
