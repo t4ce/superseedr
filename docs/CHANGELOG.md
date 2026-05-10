@@ -2,7 +2,7 @@
 
 ## Release v1.0.7
 ### New Features
-- **Synthetic Benchmark Harness**: Added feature-gated benchmark tooling for local download, upload, and swarm capacity testing, with adaptive step sizing, JSON summaries, ETA reporting, and generated run artifacts.
+- **Synthetic Benchmark Harness**: Added feature-gated benchmark tooling for local download, upload, and swarm capacity testing, with adaptive step sizing, JSON summaries, ETA reporting, and generated run artifacts; see [`docs/synthetic-benchmark.md`](synthetic-benchmark.md).
 - **Adaptive Disk Backpressure**: Added live download throttling that reacts to disk write pressure so high-throughput sessions can back off when storage latency becomes the bottleneck.
 - **Additional Watch Paths**: Restored support for additional watch folders so operators can ingest torrents from multiple configured locations.
 

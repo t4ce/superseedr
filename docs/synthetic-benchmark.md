@@ -27,6 +27,10 @@ load harness. It runs all three scenarios by default:
 Each profile starts at the requested torrent and peer counts, scales upward, and
 stops when it reaches the configured limits or sees the first issue.
 
+A full benchmark run has been observed to take about 33 minutes on an M1
+MacBook. Runtime varies with hardware, OS connection limits, disk speed, and
+the selected benchmark limits.
+
 Benchmark output is scenario-oriented. For each scenario, text mode prints:
 
 - the planned step count

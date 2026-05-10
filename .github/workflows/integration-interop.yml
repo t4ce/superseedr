@@ -48,12 +48,16 @@ jobs:
               ./integration_tests/run_interop.sh all superseedr_to_superseedr
           - lane: qbittorrent
             commands: |
-              ./integration_tests/run_interop.sh all superseedr_to_qbittorrent
-              ./integration_tests/run_interop.sh all qbittorrent_to_superseedr
+              status=0
+              ./integration_tests/run_interop.sh all superseedr_to_qbittorrent || status=1
+              ./integration_tests/run_interop.sh all qbittorrent_to_superseedr || status=1
+              exit "$status"
           - lane: transmission
             commands: |
-              ./integration_tests/run_interop.sh v1 superseedr_to_transmission
-              ./integration_tests/run_interop.sh v1 transmission_to_superseedr
+              status=0
+              ./integration_tests/run_interop.sh v1 superseedr_to_transmission || status=1
+              ./integration_tests/run_interop.sh v1 transmission_to_superseedr || status=1
+              exit "$status"
 
     steps:
       - uses: actions/checkout@v4
