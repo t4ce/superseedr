@@ -2824,7 +2824,7 @@ async fn collect_manager_events(
             ManagerEvent::DiskWriteStarted { .. } => {
                 counters.disk_write_started.fetch_add(1, Ordering::Relaxed);
             }
-            ManagerEvent::DiskWriteFinished => {
+            ManagerEvent::DiskWriteFinished { .. } => {
                 counters.disk_write_finished.fetch_add(1, Ordering::Relaxed);
             }
             _ => {}

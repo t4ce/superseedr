@@ -1642,7 +1642,10 @@ impl TorrentManager {
                                 info_hash: info_hash.to_vec(),
                                 op,
                             });
-                            let _ = event_tx.try_send(ManagerEvent::DiskWriteFinished);
+                            let _ = event_tx.try_send(ManagerEvent::DiskWriteFinished {
+                                info_hash: info_hash.to_vec(),
+                                piece_index: op.piece_index,
+                            });
                             return Ok(());
                         }
                         Err(e) => {
@@ -1666,7 +1669,10 @@ impl TorrentManager {
 
             attempt += 1;
             if attempt > MAX_PIECE_WRITE_ATTEMPTS {
-                let _ = event_tx.try_send(ManagerEvent::DiskWriteFinished);
+                let _ = event_tx.try_send(ManagerEvent::DiskWriteFinished {
+                    info_hash: info_hash.to_vec(),
+                    piece_index: op.piece_index,
+                });
                 return Err(StorageError::from(std::io::Error::other(
                     "Max write attempts exceeded",
                 )));

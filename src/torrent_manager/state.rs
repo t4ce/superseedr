@@ -1675,7 +1675,10 @@ impl TorrentState {
                 }
                 self.writing_pieces.remove(&piece_index);
                 self.piece_manager.requeue_pending_to_need(piece_index);
-                vec![Effect::EmitManagerEvent(ManagerEvent::DiskWriteFinished)]
+                vec![Effect::EmitManagerEvent(ManagerEvent::DiskWriteFinished {
+                    info_hash: self.info_hash.clone(),
+                    piece_index,
+                })]
             }
 
             Action::RequestUpload {

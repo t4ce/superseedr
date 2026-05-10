@@ -5084,7 +5084,7 @@ impl App {
             | ManagerEvent::DiskReadFinished
             | ManagerEvent::DiskWriteStarted { .. }
             | ManagerEvent::DiskWriteCompleted { .. }
-            | ManagerEvent::DiskWriteFinished
+            | ManagerEvent::DiskWriteFinished { .. }
             | ManagerEvent::DiskIoBackoff { .. }
             | ManagerEvent::PeerDiscovered { .. }
             | ManagerEvent::PeerConnected { .. }

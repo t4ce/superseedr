@@ -86,7 +86,13 @@ impl UiTelemetry {
                 }
                 true
             }
-            ManagerEvent::DiskWriteFinished => {
+            ManagerEvent::DiskWriteFinished {
+                info_hash,
+                piece_index,
+            } => {
+                app_state
+                    .pending_piece_write_start_times
+                    .remove(&(info_hash.clone(), *piece_index));
                 if let Some(start_time) = app_state.write_op_start_times.pop_front() {
                     let duration = start_time.elapsed();
                     const LATENCY_EMA_PERIOD: f64 = 10.0;
@@ -994,6 +1000,40 @@ mod tests {
         assert!(app_state.pending_piece_write_start_times.is_empty());
         assert_eq!(app_state.recv_to_write_latency_samples.len(), 1);
         assert!(app_state.recv_to_write_p95 >= Duration::from_secs(2));
+    }
+
+    #[test]
+    fn disk_write_finished_clears_pending_latency_start_without_completion() {
+        let mut app_state = AppState::default();
+        let info_hash = vec![6; 20];
+
+        assert!(UiTelemetry::on_manager_event_metrics(
+            &mut app_state,
+            &ManagerEvent::DiskWriteStarted {
+                info_hash: info_hash.clone(),
+                op: DiskIoOperation {
+                    piece_index: 9,
+                    offset: 0,
+                    length: 1_024,
+                },
+            }
+        ));
+        assert!(app_state
+            .pending_piece_write_start_times
+            .contains_key(&(info_hash.clone(), 9)));
+
+        assert!(UiTelemetry::on_manager_event_metrics(
+            &mut app_state,
+            &ManagerEvent::DiskWriteFinished {
+                info_hash: info_hash.clone(),
+                piece_index: 9,
+            }
+        ));
+
+        assert!(!app_state
+            .pending_piece_write_start_times
+            .contains_key(&(info_hash, 9)));
+        assert!(app_state.recv_to_write_latency_samples.is_empty());
     }
 
     #[test]

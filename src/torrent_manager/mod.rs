@@ -127,7 +127,10 @@ pub enum ManagerEvent {
         info_hash: Vec<u8>,
         op: DiskIoOperation,
     },
-    DiskWriteFinished,
+    DiskWriteFinished {
+        info_hash: Vec<u8>,
+        piece_index: u32,
+    },
     DiskIoBackoff {
         duration: Duration,
     },
