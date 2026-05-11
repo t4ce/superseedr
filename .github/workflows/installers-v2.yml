@@ -57,7 +57,13 @@ jobs:
 
       - name: Install cargo-wix
         shell: pwsh
-        run: cargo install cargo-wix
+        run: |
+          if (Get-Command cargo-wix -ErrorAction SilentlyContinue) {
+            Write-Host "Using cached cargo-wix"
+            cargo wix --version
+          } else {
+            cargo install cargo-wix
+          }
 
       - name: Install Inno Setup
         shell: pwsh
