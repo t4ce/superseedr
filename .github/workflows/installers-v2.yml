@@ -143,6 +143,8 @@ jobs:
     if: github.ref == 'refs/heads/installers_v2'
     runs-on: macos-latest
     timeout-minutes: 120
+    env:
+      KEYCHAIN_NAME: build.keychain
     strategy:
       fail-fast: false
       matrix:
@@ -178,7 +180,37 @@ jobs:
       - name: Install DMG tooling
         run: brew install create-dmg
 
-      - name: Build unsigned DMG
+      - name: Setup macOS Keychain and Certificate
+        id: setup_keychain
+        env:
+          APPLE_INSTALLER_CERT_P12_BASE64: ${{ secrets.APPLE_INSTALLER_CERT_P12_BASE64 }}
+          APPLE_INSTALLER_CERT_PASSWORD: ${{ secrets.APPLE_INSTALLER_CERT_PASSWORD }}
+        run: |
+          security create-keychain -p "$RUNNER_TEMP" "$KEYCHAIN_NAME"
+          security list-keychains -s "$KEYCHAIN_NAME"
+          security default-keychain -s "$KEYCHAIN_NAME"
+          security unlock-keychain -p "$RUNNER_TEMP" "$KEYCHAIN_NAME"
+
+          echo $APPLE_INSTALLER_CERT_P12_BASE64 | base64 --decode > certificate.p12
+          security import certificate.p12 -k "$KEYCHAIN_NAME" -P "$APPLE_INSTALLER_CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/productsign
+          rm certificate.p12
+
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$RUNNER_TEMP" "$KEYCHAIN_NAME"
+
+          echo "Waiting for keychain to settle..."
+          sleep 2
+
+          CERT_CN=$(security find-identity -v "$KEYCHAIN_NAME" | grep "Developer ID Installer" | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$CERT_CN" ]; then
+            echo "::error:: No valid Developer ID Installer identity found in keychain."
+            security find-identity -v "$KEYCHAIN_NAME"
+            exit 1
+          fi
+
+          echo "Using certificate: $CERT_CN"
+          echo "CERT_NAME=$CERT_CN" >> "$GITHUB_ENV"
+
+      - name: Build signed DMG
         id: build_dmg
         run: |
           script_path="scripts/build_osx_universal_dmg.sh"
@@ -188,7 +220,7 @@ jobs:
           "$script_path" \
             "0.0.0-installers-v2-${{ github.run_number }}" \
             "${{ matrix.suffix }}" \
-            --unsigned \
+            "${{ env.CERT_NAME }}" \
             ${{ matrix.flags }} \
             2>&1 | tee build_log.txt
 
@@ -202,6 +234,26 @@ jobs:
 
       - name: Verify DMG
         run: hdiutil verify "${{ steps.build_dmg.outputs.dmg_path }}"
+
+      - name: Notarize and Staple DMG
+        id: notarize
+        env:
+          APPLE_NOTARY_USERNAME: ${{ secrets.APPLE_NOTARY_USERNAME }}
+          APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          dmg_file_path="${{ steps.build_dmg.outputs.dmg_path }}"
+          echo "Submitting $dmg_file_path for notarization..."
+
+          xcrun notarytool submit "$dmg_file_path" \
+            --apple-id "$APPLE_NOTARY_USERNAME" \
+            --password "$APPLE_NOTARY_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+
+          echo "Notarization successful. Stapling ticket..."
+          xcrun stapler staple "$dmg_file_path"
+          xcrun stapler validate "$dmg_file_path"
 
       - name: Stage DMG artifact
         id: stage
@@ -224,3 +276,7 @@ jobs:
         with:
           name: superseedr-installers-v2-macos-${{ matrix.suffix }}-${{ github.run_number }}
           path: staging/*
+
+      - name: Cleanup Keychain
+        if: always()
+        run: security delete-keychain "$KEYCHAIN_NAME"
