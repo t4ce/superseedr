@@ -673,6 +673,10 @@ fn already_running_message() -> &'static str {
     "superseedr is already running."
 }
 
+fn cli_request_should_launch_tui(cli: &Cli) -> bool {
+    cli.launch_tui && (cli.input.is_some() || matches!(cli.command, Some(Commands::Add { .. })))
+}
+
 #[cfg(all(feature = "dht", feature = "pex"))]
 fn private_client_leak_guard_message(config_path: &str) -> String {
     format!(
@@ -810,6 +814,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shared_mode = is_shared_config_mode();
     let lock_file_handle = try_acquire_app_lock()?;
     let instance_already_running = lock_file_handle.is_none();
+    let launch_tui_after_cli =
+        has_cli_request && cli_request_should_launch_tui(&cli) && !instance_already_running;
 
     if has_cli_request {
         if let Err(error) = process_cli_request(
@@ -826,8 +832,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             std::process::exit(1);
         }
-        tracing::info!("Command processed, exiting temporary instance.");
-        return Ok(());
+        if launch_tui_after_cli {
+            tracing::info!(
+                "Command processed; launching terminal UI because --launch-tui was set."
+            );
+        } else {
+            tracing::info!("Command processed, exiting temporary instance.");
+            return Ok(());
+        }
+    }
+
+    if launch_tui_after_cli {
+        if let Err(e) = config::ensure_watch_directories(&loaded_settings) {
+            tracing::error!("Failed to create watch directories: {}", e);
+        }
     }
 
     let runtime_mode = if shared_mode {
@@ -3364,6 +3382,33 @@ mod tests {
     }
 
     #[test]
+    fn launch_tui_only_applies_to_ingest_requests() {
+        let add_cli = Cli {
+            json: false,
+            launch_tui: true,
+            input: None,
+            command: Some(Commands::Add {
+                inputs: vec![
+                    "magnet:?xt=urn:btih:1111111111111111111111111111111111111111".to_string(),
+                ],
+            }),
+        };
+        let status_cli = Cli {
+            json: false,
+            launch_tui: true,
+            input: None,
+            command: Some(Commands::Status {
+                follow: false,
+                stop: false,
+                interval: None,
+            }),
+        };
+
+        assert!(cli_request_should_launch_tui(&add_cli));
+        assert!(!cli_request_should_launch_tui(&status_cli));
+    }
+
+    #[test]
     #[cfg(all(feature = "dht", feature = "pex"))]
     fn private_client_leak_guard_message_includes_recovery_steps() {
         let message = private_client_leak_guard_message("/tmp/config.toml");
@@ -3524,6 +3569,7 @@ mod tests {
         let loaded = crate::config::load_settings().expect("reload shared settings");
         let cli = Cli {
             json: false,
+            launch_tui: false,
             input: None,
             command: Some(Commands::Pause {
                 targets: vec!["1111111111111111111111111111111111111111".to_string()],

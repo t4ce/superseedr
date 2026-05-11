@@ -26,6 +26,14 @@ pub struct Cli {
     #[arg(long, global = true, help = "Return structured JSON output")]
     pub json: bool,
 
+    #[arg(
+        long,
+        alias = "tui",
+        global = true,
+        help = "After queuing an add request, launch the terminal UI if no instance is running"
+    )]
+    pub launch_tui: bool,
+
     #[arg(help = "Add a torrent file path or magnet link without using a subcommand")]
     pub input: Option<String>,
 
@@ -919,6 +927,20 @@ mod tests {
             expanded,
             vec!["alpha.torrent".to_string(), "beta.torrent".to_string()]
         );
+    }
+
+    #[test]
+    fn launch_tui_alias_parses_for_add_requests() {
+        let parsed = Cli::try_parse_from([
+            "superseedr",
+            "--tui",
+            "add",
+            "magnet:?xt=urn:btih:1111111111111111111111111111111111111111",
+        ])
+        .expect("launch tui add command should parse");
+
+        assert!(parsed.launch_tui);
+        assert!(matches!(parsed.command, Some(Commands::Add { .. })));
     }
 
     #[test]
