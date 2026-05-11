@@ -71,7 +71,7 @@ function Build-WithInno {
     )
 
     $outputVersion = Get-InnoOutputVersion -RawVersion $Version
-    $innoArgs = @("/DAppVersion=`"$Version`"", "/DAppOutputVersion=$outputVersion")
+    $innoArgs = @("/DAppVersion=$Version", "/DAppOutputVersion=$outputVersion")
     if ($Flavor -eq "private") {
         $innoArgs += "/DPrivateBuild"
     }
