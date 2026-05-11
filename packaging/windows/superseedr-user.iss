@@ -90,9 +90,9 @@ Filename: "{app}\{#AppExeName}"; Description: "Launch superseedr"; Flags: nowait
 
 [Code]
 const
-  HWND_BROADCAST = $ffff;
-  WM_SETTINGCHANGE = $001A;
-  SMTO_ABORTIFHUNG = $0002;
+  SuperseedrHwndBroadcast = $ffff;
+  SuperseedrWmSettingChange = $001A;
+  SuperseedrSmtoAbortIfHung = $0002;
   EnvSubKey = 'Environment';
   InstallerSubKey = 'Software\superseedr\Installer';
   PathMarkerName = 'UserPath';
@@ -152,7 +152,7 @@ procedure BroadcastEnvironmentChange();
 var
   ResultCode: Longint;
 begin
-  SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, 0, 'Environment', SMTO_ABORTIFHUNG, 5000, ResultCode);
+  SendMessageTimeout(SuperseedrHwndBroadcast, SuperseedrWmSettingChange, 0, 'Environment', SuperseedrSmtoAbortIfHung, 5000, ResultCode);
 end;
 
 procedure AddToUserPath();
