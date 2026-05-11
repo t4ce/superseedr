@@ -5095,8 +5095,7 @@ impl App {
             ManagerEvent::PeerConnectAttempted
             | ManagerEvent::PeerConnectEstablished
             | ManagerEvent::PeerConnectFailed { .. }
-            | ManagerEvent::PeerSessionFailed
-            | ManagerEvent::SyntheticStateSnapshot { .. } => {}
+            | ManagerEvent::PeerSessionFailed => {}
         }
     }
 

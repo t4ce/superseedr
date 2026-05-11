@@ -192,59 +192,6 @@ pub struct TorrentManager {
 }
 
 impl TorrentManager {
-    #[cfg(feature = "synthetic-load")]
-    pub(crate) fn synthetic_state_sample(&self) -> crate::torrent_manager::SyntheticManagerState {
-        let mut sample = crate::torrent_manager::SyntheticManagerState {
-            peers: self.state.peers.len(),
-            pending_queue_pieces: self.state.piece_manager.pending_queue.len(),
-            pending_queue_owners: self
-                .state
-                .piece_manager
-                .pending_queue
-                .values()
-                .map(Vec::len)
-                .sum(),
-            need_queue_pieces: self.state.piece_manager.need_queue.len(),
-            verifying_pieces: self.state.verifying_pieces.len(),
-            writing_pieces: self.state.writing_pieces.len(),
-            in_flight_upload_peers: self.in_flight_uploads.len(),
-            in_flight_upload_tasks: self.in_flight_uploads.values().map(HashMap::len).sum(),
-            in_flight_write_pieces: self.in_flight_writes.len(),
-            in_flight_write_tasks: self.in_flight_writes.values().map(Vec::len).sum(),
-            torrent_command_len: self.torrent_manager_rx.len(),
-            torrent_command_capacity: self.torrent_manager_rx.capacity(),
-            incoming_peer_queue_len: self.incoming_peer_rx.len(),
-            manager_command_len: self.manager_command_rx.len(),
-            ..Default::default()
-        };
-
-        for peer in self.state.peers.values() {
-            sample.peer_bitfield_bits = sample
-                .peer_bitfield_bits
-                .saturating_add(peer.bitfield.len());
-            sample.peer_pending_pieces = sample
-                .peer_pending_pieces
-                .saturating_add(peer.pending_requests.len());
-            sample.peer_active_blocks = sample
-                .peer_active_blocks
-                .saturating_add(peer.active_blocks.len());
-            sample.peer_inflight_requests = sample
-                .peer_inflight_requests
-                .saturating_add(peer.inflight_requests);
-            sample.peer_command_capacity = sample
-                .peer_command_capacity
-                .saturating_add(peer.peer_tx.max_capacity());
-            sample.peer_command_available = sample
-                .peer_command_available
-                .saturating_add(peer.peer_tx.capacity());
-            sample.peer_upload_slots_available = sample
-                .peer_upload_slots_available
-                .saturating_add(peer.upload_slots_semaphore.available_permits());
-        }
-
-        sample
-    }
-
     fn should_accept_new_peers(&self) -> bool {
         !self.state.is_paused && self.state.accepting_new_peers
     }
@@ -2726,13 +2673,12 @@ impl TorrentManager {
                         }
                     }
 
-                    #[cfg(feature = "synthetic-load")]
-                    {
-                        let _ = self.manager_event_tx.try_send(ManagerEvent::SyntheticStateSnapshot {
-                            info_hash: self.state.info_hash.clone(),
-                            state: self.synthetic_state_sample(),
-                        });
-                    }
+                    let _cmd_len = self.torrent_manager_rx.len();
+                    let _cmd_cap = self.torrent_manager_rx.capacity();
+                    let _write_tasks = self.in_flight_writes.len();
+                    let _upload_tasks = self.in_flight_uploads.len();
+                    let _pending_pieces = self.state.piece_manager.pending_queue.len();
+                    let _need_pieces = self.state.piece_manager.need_queue.len();
 
                     self.apply_action(Action::Tick { dt_ms: actual_ms });
                 }

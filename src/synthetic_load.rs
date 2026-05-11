@@ -13,8 +13,7 @@ use crate::resource_manager::{
 use crate::token_bucket::TokenBucket;
 use crate::torrent_file::{Info, Torrent};
 use crate::torrent_manager::{
-    ManagerCommand, ManagerEvent, SyntheticManagerState, SyntheticPeerConnectFailure,
-    TorrentManager, TorrentParameters,
+    ManagerCommand, ManagerEvent, SyntheticPeerConnectFailure, TorrentManager, TorrentParameters,
 };
 
 use chrono::Local;
@@ -29,7 +28,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use sysinfo::{ProcessesToUpdate, System};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::signal;
@@ -52,8 +50,6 @@ const SYNTHETIC_LOCAL_PORT_BASE: u16 = 10_000;
 #[cfg(not(target_os = "macos"))]
 const SYNTHETIC_LOCAL_PORT_SPAN: usize = 30_000;
 const BENCHMARK_INTERRUPT_ISSUE: &str = "interrupted by Ctrl+C";
-const SYNTHETIC_ACTIVE_SEEDER_PERCENT_ENV: &str = "SUPERSEEDR_SYNTHETIC_ACTIVE_SEEDER_PERCENT";
-const TOKIO_RESPONSIVENESS_PROBE_MS: u64 = 10;
 
 type DynError = Box<dyn Error + Send + Sync>;
 type IncomingPeerTx = mpsc::Sender<(TcpStream, Vec<u8>)>;
@@ -103,22 +99,6 @@ struct SyntheticCounters {
     disk_read_finished: AtomicU64,
     disk_write_started: AtomicU64,
     disk_write_finished: AtomicU64,
-}
-
-#[derive(Default)]
-struct TokioResponsivenessCounters {
-    timer_samples: AtomicU64,
-    timer_last_delay_us: AtomicU64,
-    timer_max_delay_us: AtomicU64,
-    timer_over_10ms: AtomicU64,
-    timer_over_50ms: AtomicU64,
-    timer_over_100ms: AtomicU64,
-    yield_samples: AtomicU64,
-    yield_last_delay_us: AtomicU64,
-    yield_max_delay_us: AtomicU64,
-    yield_over_1ms: AtomicU64,
-    yield_over_10ms: AtomicU64,
-    yield_over_50ms: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -578,9 +558,6 @@ struct SyntheticSample {
     disk_write_started: u64,
     disk_write_finished: u64,
     resources: ResourceSampleSet,
-    process_memory: ProcessMemorySample,
-    manager_state: ManagerStateSample,
-    tokio_responsiveness: TokioResponsivenessSample,
 }
 
 #[derive(Serialize)]
@@ -631,11 +608,6 @@ struct SyntheticSummary {
     disk_read_finished: u64,
     disk_write_started: u64,
     disk_write_finished: u64,
-    peak_process_memory: ProcessMemorySample,
-    final_process_memory: ProcessMemorySample,
-    peak_manager_state: ManagerStateSample,
-    final_manager_state: ManagerStateSample,
-    tokio_responsiveness: TokioResponsivenessSample,
     output_dir: PathBuf,
     interrupted: bool,
 }
@@ -961,299 +933,6 @@ struct ResourceSample {
     max_queue_size: usize,
 }
 
-#[derive(Clone, Copy, Default, Serialize)]
-struct TokioResponsivenessSample {
-    probe_interval_ms: u64,
-    timer_samples: u64,
-    timer_last_delay_us: u64,
-    timer_max_delay_us: u64,
-    timer_over_10ms: u64,
-    timer_over_50ms: u64,
-    timer_over_100ms: u64,
-    yield_samples: u64,
-    yield_last_delay_us: u64,
-    yield_max_delay_us: u64,
-    yield_over_1ms: u64,
-    yield_over_10ms: u64,
-    yield_over_50ms: u64,
-}
-
-fn duration_micros_u64(duration: Duration) -> u64 {
-    duration.as_micros().min(u64::MAX as u128) as u64
-}
-
-fn update_atomic_max(target: &AtomicU64, value: u64) {
-    let mut current = target.load(Ordering::Relaxed);
-    while value > current {
-        match target.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break,
-            Err(next) => current = next,
-        }
-    }
-}
-
-fn record_timer_delay(counters: &TokioResponsivenessCounters, delay_us: u64) {
-    counters.timer_samples.fetch_add(1, Ordering::Relaxed);
-    counters
-        .timer_last_delay_us
-        .store(delay_us, Ordering::Relaxed);
-    update_atomic_max(&counters.timer_max_delay_us, delay_us);
-    if delay_us >= 10_000 {
-        counters.timer_over_10ms.fetch_add(1, Ordering::Relaxed);
-    }
-    if delay_us >= 50_000 {
-        counters.timer_over_50ms.fetch_add(1, Ordering::Relaxed);
-    }
-    if delay_us >= 100_000 {
-        counters.timer_over_100ms.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-fn record_yield_delay(counters: &TokioResponsivenessCounters, delay_us: u64) {
-    counters.yield_samples.fetch_add(1, Ordering::Relaxed);
-    counters
-        .yield_last_delay_us
-        .store(delay_us, Ordering::Relaxed);
-    update_atomic_max(&counters.yield_max_delay_us, delay_us);
-    if delay_us >= 1_000 {
-        counters.yield_over_1ms.fetch_add(1, Ordering::Relaxed);
-    }
-    if delay_us >= 10_000 {
-        counters.yield_over_10ms.fetch_add(1, Ordering::Relaxed);
-    }
-    if delay_us >= 50_000 {
-        counters.yield_over_50ms.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-fn tokio_responsiveness_sample(
-    counters: &TokioResponsivenessCounters,
-) -> TokioResponsivenessSample {
-    TokioResponsivenessSample {
-        probe_interval_ms: TOKIO_RESPONSIVENESS_PROBE_MS,
-        timer_samples: counters.timer_samples.load(Ordering::Relaxed),
-        timer_last_delay_us: counters.timer_last_delay_us.load(Ordering::Relaxed),
-        timer_max_delay_us: counters.timer_max_delay_us.load(Ordering::Relaxed),
-        timer_over_10ms: counters.timer_over_10ms.load(Ordering::Relaxed),
-        timer_over_50ms: counters.timer_over_50ms.load(Ordering::Relaxed),
-        timer_over_100ms: counters.timer_over_100ms.load(Ordering::Relaxed),
-        yield_samples: counters.yield_samples.load(Ordering::Relaxed),
-        yield_last_delay_us: counters.yield_last_delay_us.load(Ordering::Relaxed),
-        yield_max_delay_us: counters.yield_max_delay_us.load(Ordering::Relaxed),
-        yield_over_1ms: counters.yield_over_1ms.load(Ordering::Relaxed),
-        yield_over_10ms: counters.yield_over_10ms.load(Ordering::Relaxed),
-        yield_over_50ms: counters.yield_over_50ms.load(Ordering::Relaxed),
-    }
-}
-
-async fn run_tokio_responsiveness_probe(
-    counters: Arc<TokioResponsivenessCounters>,
-    mut shutdown_rx: broadcast::Receiver<()>,
-) {
-    let period = Duration::from_millis(TOKIO_RESPONSIVENESS_PROBE_MS);
-    let mut previous = Instant::now();
-
-    loop {
-        tokio::select! {
-            _ = shutdown_rx.recv() => break,
-            _ = tokio::time::sleep(period) => {
-                let woke = Instant::now();
-                let delay = woke.duration_since(previous).saturating_sub(period);
-                record_timer_delay(&counters, duration_micros_u64(delay));
-                previous = woke;
-
-                let yield_started = Instant::now();
-                tokio::task::yield_now().await;
-                record_yield_delay(&counters, duration_micros_u64(yield_started.elapsed()));
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy, Default, Serialize)]
-struct ProcessMemorySample {
-    rss_bytes: u64,
-    virtual_bytes: u64,
-}
-
-impl ProcessMemorySample {
-    fn max_with(self, other: Self) -> Self {
-        Self {
-            rss_bytes: self.rss_bytes.max(other.rss_bytes),
-            virtual_bytes: self.virtual_bytes.max(other.virtual_bytes),
-        }
-    }
-}
-
-struct ProcessMemorySampler {
-    system: System,
-    pid: Option<sysinfo::Pid>,
-}
-
-impl ProcessMemorySampler {
-    fn new() -> Self {
-        Self {
-            system: System::new(),
-            pid: sysinfo::get_current_pid().ok(),
-        }
-    }
-
-    fn sample(&mut self) -> ProcessMemorySample {
-        let Some(pid) = self.pid else {
-            return ProcessMemorySample::default();
-        };
-
-        self.system
-            .refresh_processes(ProcessesToUpdate::Some(&[pid]), false);
-        self.system
-            .process(pid)
-            .map(|process| ProcessMemorySample {
-                rss_bytes: process.memory(),
-                virtual_bytes: process.virtual_memory(),
-            })
-            .unwrap_or_default()
-    }
-}
-
-#[derive(Clone, Copy, Default, Serialize)]
-struct ManagerStateSample {
-    managers: usize,
-    peers: usize,
-    peer_bitfield_bits: usize,
-    peer_pending_pieces: usize,
-    peer_active_blocks: usize,
-    peer_inflight_requests: usize,
-    peer_command_capacity: usize,
-    peer_command_available: usize,
-    peer_command_queued_est: usize,
-    peer_upload_slots_available: usize,
-    pending_queue_pieces: usize,
-    pending_queue_owners: usize,
-    need_queue_pieces: usize,
-    verifying_pieces: usize,
-    writing_pieces: usize,
-    in_flight_upload_peers: usize,
-    in_flight_upload_tasks: usize,
-    in_flight_write_pieces: usize,
-    in_flight_write_tasks: usize,
-    torrent_command_len: usize,
-    torrent_command_capacity: usize,
-    incoming_peer_queue_len: usize,
-    manager_command_len: usize,
-}
-
-impl ManagerStateSample {
-    fn add_manager(&mut self, state: SyntheticManagerState) {
-        self.managers = self.managers.saturating_add(1);
-        self.peers = self.peers.saturating_add(state.peers);
-        self.peer_bitfield_bits = self
-            .peer_bitfield_bits
-            .saturating_add(state.peer_bitfield_bits);
-        self.peer_pending_pieces = self
-            .peer_pending_pieces
-            .saturating_add(state.peer_pending_pieces);
-        self.peer_active_blocks = self
-            .peer_active_blocks
-            .saturating_add(state.peer_active_blocks);
-        self.peer_inflight_requests = self
-            .peer_inflight_requests
-            .saturating_add(state.peer_inflight_requests);
-        self.peer_command_capacity = self
-            .peer_command_capacity
-            .saturating_add(state.peer_command_capacity);
-        self.peer_command_available = self
-            .peer_command_available
-            .saturating_add(state.peer_command_available);
-        self.peer_upload_slots_available = self
-            .peer_upload_slots_available
-            .saturating_add(state.peer_upload_slots_available);
-        self.pending_queue_pieces = self
-            .pending_queue_pieces
-            .saturating_add(state.pending_queue_pieces);
-        self.pending_queue_owners = self
-            .pending_queue_owners
-            .saturating_add(state.pending_queue_owners);
-        self.need_queue_pieces = self
-            .need_queue_pieces
-            .saturating_add(state.need_queue_pieces);
-        self.verifying_pieces = self.verifying_pieces.saturating_add(state.verifying_pieces);
-        self.writing_pieces = self.writing_pieces.saturating_add(state.writing_pieces);
-        self.in_flight_upload_peers = self
-            .in_flight_upload_peers
-            .saturating_add(state.in_flight_upload_peers);
-        self.in_flight_upload_tasks = self
-            .in_flight_upload_tasks
-            .saturating_add(state.in_flight_upload_tasks);
-        self.in_flight_write_pieces = self
-            .in_flight_write_pieces
-            .saturating_add(state.in_flight_write_pieces);
-        self.in_flight_write_tasks = self
-            .in_flight_write_tasks
-            .saturating_add(state.in_flight_write_tasks);
-        self.torrent_command_len = self
-            .torrent_command_len
-            .saturating_add(state.torrent_command_len);
-        self.torrent_command_capacity = self
-            .torrent_command_capacity
-            .saturating_add(state.torrent_command_capacity);
-        self.incoming_peer_queue_len = self
-            .incoming_peer_queue_len
-            .saturating_add(state.incoming_peer_queue_len);
-        self.manager_command_len = self
-            .manager_command_len
-            .saturating_add(state.manager_command_len);
-        self.peer_command_queued_est = self
-            .peer_command_capacity
-            .saturating_sub(self.peer_command_available);
-    }
-
-    fn max_with(self, other: Self) -> Self {
-        Self {
-            managers: self.managers.max(other.managers),
-            peers: self.peers.max(other.peers),
-            peer_bitfield_bits: self.peer_bitfield_bits.max(other.peer_bitfield_bits),
-            peer_pending_pieces: self.peer_pending_pieces.max(other.peer_pending_pieces),
-            peer_active_blocks: self.peer_active_blocks.max(other.peer_active_blocks),
-            peer_inflight_requests: self
-                .peer_inflight_requests
-                .max(other.peer_inflight_requests),
-            peer_command_capacity: self.peer_command_capacity.max(other.peer_command_capacity),
-            peer_command_available: self
-                .peer_command_available
-                .max(other.peer_command_available),
-            peer_command_queued_est: self
-                .peer_command_queued_est
-                .max(other.peer_command_queued_est),
-            peer_upload_slots_available: self
-                .peer_upload_slots_available
-                .max(other.peer_upload_slots_available),
-            pending_queue_pieces: self.pending_queue_pieces.max(other.pending_queue_pieces),
-            pending_queue_owners: self.pending_queue_owners.max(other.pending_queue_owners),
-            need_queue_pieces: self.need_queue_pieces.max(other.need_queue_pieces),
-            verifying_pieces: self.verifying_pieces.max(other.verifying_pieces),
-            writing_pieces: self.writing_pieces.max(other.writing_pieces),
-            in_flight_upload_peers: self
-                .in_flight_upload_peers
-                .max(other.in_flight_upload_peers),
-            in_flight_upload_tasks: self
-                .in_flight_upload_tasks
-                .max(other.in_flight_upload_tasks),
-            in_flight_write_pieces: self
-                .in_flight_write_pieces
-                .max(other.in_flight_write_pieces),
-            in_flight_write_tasks: self.in_flight_write_tasks.max(other.in_flight_write_tasks),
-            torrent_command_len: self.torrent_command_len.max(other.torrent_command_len),
-            torrent_command_capacity: self
-                .torrent_command_capacity
-                .max(other.torrent_command_capacity),
-            incoming_peer_queue_len: self
-                .incoming_peer_queue_len
-                .max(other.incoming_peer_queue_len),
-            manager_command_len: self.manager_command_len.max(other.manager_command_len),
-        }
-    }
-}
-
 pub async fn run(args: &SyntheticLoadArgs, json_output: bool) -> Result<(), DynError> {
     let (summary, samples_path, summary_path) = run_once(args, json_output, None).await?;
 
@@ -1323,25 +1002,13 @@ async fn run_once(
     let resource_handle = tokio::spawn(resource_manager.0.run());
 
     let (event_tx, event_rx) = mpsc::channel::<ManagerEvent>(EVENT_CHANNEL_SIZE);
-    let manager_state = Arc::new(Mutex::new(ManagerStateSample::default()));
-    let tokio_responsiveness = Arc::new(TokioResponsivenessCounters::default());
-    let event_handle = tokio::spawn(collect_manager_events(
-        event_rx,
-        counters.clone(),
-        manager_state.clone(),
-    ));
+    let event_handle = tokio::spawn(collect_manager_events(event_rx, counters.clone()));
     let mut cleanup = SyntheticRunCleanup::new(
         harness_shutdown_tx.clone(),
         resource_shutdown_tx.clone(),
         resource_handle,
         event_handle,
     );
-    cleanup
-        .peer_handles
-        .push(tokio::spawn(run_tokio_responsiveness_probe(
-            tokio_responsiveness.clone(),
-            harness_shutdown_tx.subscribe(),
-        )));
 
     let rate_limit = args
         .target_gbps
@@ -1455,8 +1122,6 @@ async fn run_once(
             run_id: &run_id,
             output_dir: &output_dir,
             counters: counters.clone(),
-            manager_state: manager_state.clone(),
-            tokio_responsiveness: tokio_responsiveness.clone(),
             resource_client: &resource_client,
             managers: &mut cleanup.managers,
             peer_handles: &mut cleanup.peer_handles,
@@ -2226,11 +1891,9 @@ fn spawn_synthetic_seeder_accept_loop(
                     match accepted {
                         Ok((mut stream, _)) => {
                             counters.connections.fetch_add(1, Ordering::Relaxed);
-                            let peer_index =
-                                next_peer_id.fetch_add(1, Ordering::Relaxed) as usize;
                             let peer_id = synthetic_peer_id(
                                 b'S',
-                                peer_index,
+                                next_peer_id.fetch_add(1, Ordering::Relaxed) as usize,
                             );
                             let counters = counters.clone();
                             let specs_by_hash = specs_by_hash.clone();
@@ -2250,7 +1913,6 @@ fn spawn_synthetic_seeder_accept_loop(
                                         handshake,
                                         spec,
                                         peer_id,
-                                        peer_index,
                                         counters.clone(),
                                         &mut child_shutdown,
                                     )
@@ -2428,7 +2090,6 @@ async fn run_seeder_connection(
     handshake: Vec<u8>,
     spec: &SyntheticTorrentSpec,
     peer_id: Vec<u8>,
-    peer_index: usize,
     counters: Arc<SyntheticCounters>,
     shutdown_rx: &mut broadcast::Receiver<()>,
 ) -> Result<(), DynError> {
@@ -2448,14 +2109,8 @@ async fn run_seeder_connection(
             spec.piece_count,
         )))?)
         .await?;
-
-    let active = synthetic_seeder_is_active(peer_index);
     writer
-        .write_all(&generate_message(if active {
-            Message::Unchoke
-        } else {
-            Message::Choke
-        })?)
+        .write_all(&generate_message(Message::Unchoke)?)
         .await?;
 
     let mut socket_buf = vec![0u8; 64 * 1024];
@@ -2474,16 +2129,9 @@ async fn run_seeder_connection(
                 while let Some(frame) = take_frame(&mut parse_buf) {
                     match frame_message_id(&frame) {
                         Some(2) => {
-                            writer.write_all(&generate_message(if active {
-                                Message::Unchoke
-                            } else {
-                                Message::Choke
-                            })?).await?;
+                            writer.write_all(&generate_message(Message::Unchoke)?).await?;
                         }
                         Some(6) => {
-                            if !active {
-                                continue;
-                            }
                             if let Some((index, begin, length)) = parse_request_payload(&frame) {
                                 let len = length as usize;
                                 if data_block.len() < len {
@@ -2502,15 +2150,6 @@ async fn run_seeder_connection(
     }
 
     Ok(())
-}
-
-fn synthetic_seeder_is_active(peer_index: usize) -> bool {
-    let percent = std::env::var(SYNTHETIC_ACTIVE_SEEDER_PERCENT_ENV)
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(100)
-        .min(100);
-    percent == 100 || (percent > 0 && peer_index % 100 < percent)
 }
 
 async fn spawn_incoming_hub(
@@ -2678,8 +2317,6 @@ struct SampleContext<'a> {
     run_id: &'a str,
     output_dir: &'a Path,
     counters: Arc<SyntheticCounters>,
-    manager_state: Arc<Mutex<ManagerStateSample>>,
-    tokio_responsiveness: Arc<TokioResponsivenessCounters>,
     resource_client: &'a ResourceManagerClient,
     managers: &'a mut Vec<ManagerRuntime>,
     peer_handles: &'a mut Vec<JoinHandle<()>>,
@@ -2808,23 +2445,6 @@ async fn wait_for_orchestrator(
     Ok(())
 }
 
-fn snapshot_manager_state(manager_state: &Arc<Mutex<ManagerStateSample>>) -> ManagerStateSample {
-    match manager_state.lock() {
-        Ok(guard) => *guard,
-        Err(poisoned) => *poisoned.into_inner(),
-    }
-}
-
-fn store_manager_state(manager_state: &Arc<Mutex<ManagerStateSample>>, state: ManagerStateSample) {
-    match manager_state.lock() {
-        Ok(mut guard) => *guard = state,
-        Err(poisoned) => {
-            let mut guard = poisoned.into_inner();
-            *guard = state;
-        }
-    }
-}
-
 async fn sample_loop(
     context: SampleContext<'_>,
     sample_writer: &mut BufWriter<File>,
@@ -2838,8 +2458,6 @@ async fn sample_loop(
         run_id,
         output_dir,
         counters,
-        manager_state,
-        tokio_responsiveness,
         resource_client,
         managers,
         peer_handles,
@@ -2869,11 +2487,6 @@ async fn sample_loop(
     let mut max_peer_add_lag = 0usize;
     let mut max_sample_delay_ms = 0u64;
     let mut interrupted = benchmark_interrupt_requested(interrupt_rx.as_ref());
-    let mut memory_sampler = ProcessMemorySampler::new();
-    let mut final_process_memory = memory_sampler.sample();
-    let mut peak_process_memory = final_process_memory;
-    let mut final_manager_state = snapshot_manager_state(&manager_state);
-    let mut peak_manager_state = final_manager_state;
 
     while start.elapsed() < total {
         if interrupted {
@@ -2944,11 +2557,6 @@ async fn sample_loop(
             .await
             .map(resource_samples)
             .unwrap_or_default();
-        let process_memory = memory_sampler.sample();
-        let manager_state_sample = snapshot_manager_state(&manager_state);
-        let tokio_responsiveness_sample = tokio_responsiveness_sample(&tokio_responsiveness);
-        peak_process_memory = peak_process_memory.max_with(process_memory);
-        peak_manager_state = peak_manager_state.max_with(manager_state_sample);
 
         let sample = SyntheticSample {
             elapsed_ms: elapsed.as_millis(),
@@ -2986,9 +2594,6 @@ async fn sample_loop(
             disk_write_started: counters.disk_write_started.load(Ordering::Relaxed),
             disk_write_finished: counters.disk_write_finished.load(Ordering::Relaxed),
             resources,
-            process_memory,
-            manager_state: manager_state_sample,
-            tokio_responsiveness: tokio_responsiveness_sample,
         };
         writeln!(sample_writer, "{}", serde_json::to_string(&sample)?)?;
 
@@ -3036,11 +2641,6 @@ async fn sample_loop(
     let avg_download_bps = bytes_to_bits_per_second(download_bytes, measured_secs);
     let avg_upload_bps = bytes_to_bits_per_second(upload_bytes, measured_secs);
     let manager_totals = manager_totals(managers);
-    final_process_memory = memory_sampler.sample();
-    peak_process_memory = peak_process_memory.max_with(final_process_memory);
-    final_manager_state = snapshot_manager_state(&manager_state);
-    peak_manager_state = peak_manager_state.max_with(final_manager_state);
-    let tokio_responsiveness = tokio_responsiveness_sample(&tokio_responsiveness);
 
     Ok(SyntheticSummary {
         run_id: run_id.to_string(),
@@ -3089,11 +2689,6 @@ async fn sample_loop(
         disk_read_finished: counters.disk_read_finished.load(Ordering::Relaxed),
         disk_write_started: counters.disk_write_started.load(Ordering::Relaxed),
         disk_write_finished: counters.disk_write_finished.load(Ordering::Relaxed),
-        peak_process_memory,
-        final_process_memory,
-        peak_manager_state,
-        final_manager_state,
-        tokio_responsiveness,
         output_dir: output_dir.to_path_buf(),
         interrupted,
     })
@@ -3126,9 +2721,7 @@ async fn shutdown_managers(managers: &mut [ManagerRuntime]) {
 async fn collect_manager_events(
     mut event_rx: mpsc::Receiver<ManagerEvent>,
     counters: Arc<SyntheticCounters>,
-    manager_state: Arc<Mutex<ManagerStateSample>>,
 ) {
-    let mut manager_states: HashMap<Vec<u8>, SyntheticManagerState> = HashMap::new();
     while let Some(event) = event_rx.recv().await {
         match event {
             ManagerEvent::PeerConnected { .. } => {
@@ -3213,14 +2806,6 @@ async fn collect_manager_events(
                 counters
                     .outbound_session_failed
                     .fetch_add(1, Ordering::Relaxed);
-            }
-            ManagerEvent::SyntheticStateSnapshot { info_hash, state } => {
-                manager_states.insert(info_hash, state);
-                let mut aggregate = ManagerStateSample::default();
-                for state in manager_states.values() {
-                    aggregate.add_manager(*state);
-                }
-                store_manager_state(&manager_state, aggregate);
             }
             ManagerEvent::BlockReceived { .. } => {
                 counters

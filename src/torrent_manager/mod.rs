@@ -153,11 +153,6 @@ pub enum ManagerEvent {
     },
     #[cfg(feature = "synthetic-load")]
     PeerSessionFailed,
-    #[cfg(feature = "synthetic-load")]
-    SyntheticStateSnapshot {
-        info_hash: Vec<u8>,
-        state: SyntheticManagerState,
-    },
 
     BlockReceived {
         info_hash: Vec<u8>,
@@ -189,32 +184,6 @@ pub enum SyntheticPeerConnectFailure {
     AddrNotAvailable,
     TimedOut,
     OtherIo,
-}
-
-#[cfg(feature = "synthetic-load")]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SyntheticManagerState {
-    pub peers: usize,
-    pub peer_bitfield_bits: usize,
-    pub peer_pending_pieces: usize,
-    pub peer_active_blocks: usize,
-    pub peer_inflight_requests: usize,
-    pub peer_command_capacity: usize,
-    pub peer_command_available: usize,
-    pub peer_upload_slots_available: usize,
-    pub pending_queue_pieces: usize,
-    pub pending_queue_owners: usize,
-    pub need_queue_pieces: usize,
-    pub verifying_pieces: usize,
-    pub writing_pieces: usize,
-    pub in_flight_upload_peers: usize,
-    pub in_flight_upload_tasks: usize,
-    pub in_flight_write_pieces: usize,
-    pub in_flight_write_tasks: usize,
-    pub torrent_command_len: usize,
-    pub torrent_command_capacity: usize,
-    pub incoming_peer_queue_len: usize,
-    pub manager_command_len: usize,
 }
 
 #[derive(Debug, Clone)]
