@@ -33,15 +33,10 @@ Superseedr is a modern Rust BitTorrent client featuring a high-performance termi
 
 ## Installation
 
-Download platform-specific releases from the [releases page](https://github.com/Jagalite/superseedr/releases) **(includes browser magnet link support)**:
+Download platform-specific installers from the [releases page](https://github.com/Jagalite/superseedr/releases) **(includes browser magnet link support)**:
 - Windows: `.msi` installer
-- macOS: `.dmg` app bundle
+- macOS: `.pkg` installer  
 - Debian/Ubuntu: `.deb` package
-
-The macOS DMG installs `superseedr.app` for drag-and-drop registration of
-magnet links and `.torrent` files. It does not install a global `superseedr`
-command; double-clicking the app shows a Terminal launch hint. Install with
-Brew/Cargo if you want the command available in your shell.
 
 ### Package Managers
 - **Cargo:** `cargo install superseedr`
@@ -51,12 +46,10 @@ Brew/Cargo if you want the command available in your shell.
 [![Packaging status](https://repology.org/badge/vertical-allrepos/superseedr.svg)](https://repology.org/project/superseedr/versions)
 
 ## Usage
-Open a terminal if you installed with a package manager:
+Open a terminal
 ```bash
 superseedr
 ```
-For the macOS DMG, drag `superseedr.app` to Applications to register file/link
-handlers. Install with Brew/Cargo to launch the TUI as `superseedr`.
 ### ⌨️ Key Controls
 | Key | Action |
 | :--- | :--- |
@@ -462,6 +455,8 @@ Superseedr implements the following BitTorrent Enhancement Proposals (BEPs):
 * **BEP 52:** The BitTorrent Protocol v2
 
 </details>
+
+
 
 
 
