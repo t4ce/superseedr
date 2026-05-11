@@ -5,6 +5,10 @@
 #define AppVersion "dev"
 #endif
 
+#ifndef AppOutputVersion
+#define AppOutputVersion "dev"
+#endif
+
 #ifndef PrivateBuild
 #define PrivateBuild 0
 #endif
@@ -16,11 +20,9 @@
 #if PrivateBuild
 #define AppName "superseedr private"
 #define AppId "superseedr-private-user"
-#define OutputBase "superseedr-private-" + AppVersion + "-x64-setup"
 #else
 #define AppName "superseedr"
 #define AppId "superseedr-user"
-#define OutputBase "superseedr-" + AppVersion + "-x64-setup"
 #endif
 
 #define Publisher "The superseedr Contributors"
@@ -40,7 +42,11 @@ DefaultDirName={localappdata}\Programs\superseedr
 DefaultGroupName=superseedr
 DisableProgramGroupPage=yes
 OutputDir={#OutputDir}
-OutputBaseFilename={#OutputBase}
+#if PrivateBuild
+OutputBaseFilename=superseedr-private-{#AppOutputVersion}-x64-setup
+#else
+OutputBaseFilename=superseedr-{#AppOutputVersion}-x64-setup
+#endif
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern

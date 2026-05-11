@@ -32,6 +32,19 @@ function Get-ManifestVersion {
     return "dev"
 }
 
+function Get-InnoOutputVersion {
+    param(
+        [Parameter(Mandatory = $true)][string]$RawVersion
+    )
+
+    $safe = $RawVersion -replace '[^A-Za-z0-9_-]', '-'
+    $safe = $safe.Trim('-')
+    if (-not $safe) {
+        return "dev"
+    }
+    return $safe
+}
+
 function Find-InnoCompiler {
     $isccCandidates = @()
     $command = Get-Command "ISCC.exe" -ErrorAction SilentlyContinue
@@ -58,8 +71,9 @@ function Build-WithInno {
     )
 
     $privateBuild = if ($Flavor -eq "private") { "1" } else { "0" }
-    Write-Host "Running: $Iscc /DAppVersion=`"$Version`" /DPrivateBuild=$privateBuild /DOutputDir=`"$OutputDir`" $InstallerScript"
-    & $Iscc "/DAppVersion=`"$Version`"" "/DPrivateBuild=$privateBuild" "/DOutputDir=`"$OutputDir`"" $InstallerScript
+    $outputVersion = Get-InnoOutputVersion -RawVersion $Version
+    Write-Host "Running: $Iscc /DAppVersion=`"$Version`" /DAppOutputVersion=$outputVersion /DPrivateBuild=$privateBuild /DOutputDir=`"$OutputDir`" $InstallerScript"
+    & $Iscc "/DAppVersion=`"$Version`"" "/DAppOutputVersion=$outputVersion" "/DPrivateBuild=$privateBuild" "/DOutputDir=`"$OutputDir`"" $InstallerScript
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }
