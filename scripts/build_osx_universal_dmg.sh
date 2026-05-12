@@ -104,6 +104,41 @@ echo "Unsigned Build: ${UNSIGNED_BUILD}"
 echo "DMG Output: ${DMG_OUTPUT_PATH}"
 echo "-------------------------------------------"
 
+verify_code_signature() {
+    local path="$1"
+    local verify_flags=("${@:2}")
+
+    echo "Verifying code signature: ${path}"
+    codesign --verify "${verify_flags[@]}" --strict --verbose=4 "${path}"
+    codesign -dv --verbose=4 "${path}"
+}
+
+verify_dmg_app_signature() {
+    local dmg_path="$1"
+    local mount_dir="$2"
+    local mounted_app_path="${mount_dir}/${HANDLER_APP_NAME}.app"
+    local verify_status=0
+
+    echo "Verifying signed app inside DMG..."
+    rm -rf "${mount_dir}"
+    mkdir -p "${mount_dir}"
+    hdiutil attach \
+      -readonly \
+      -nobrowse \
+      -noautoopen \
+      -mountpoint "${mount_dir}" \
+      "${dmg_path}"
+
+    codesign --verify --deep --strict --verbose=4 "${mounted_app_path}" || verify_status=$?
+    hdiutil detach "${mount_dir}" >/dev/null || true
+    rm -rf "${mount_dir}"
+
+    if [ "${verify_status}" -ne 0 ]; then
+        echo "::error:: App signature inside DMG failed verification."
+        exit "${verify_status}"
+    fi
+}
+
 echo "Building main TUI binary for Apple Silicon (aarch64)..."
 cargo build --target aarch64-apple-darwin --release $CARGO_FLAGS
 
@@ -244,6 +279,7 @@ else
       "${CODESIGN_TIMESTAMP_ARGS[@]}" \
       --entitlements "${ENTITLEMENTS_PATH}" \
       "${BUNDLED_BINARY_PATH}"
+    verify_code_signature "${BUNDLED_BINARY_PATH}"
 
     echo "Signing ${HANDLER_APP_NAME}.app with Developer ID and Hardened Runtime..."
     codesign -s "${APP_CERT_NAME}" \
@@ -252,6 +288,7 @@ else
       "${CODESIGN_TIMESTAMP_ARGS[@]}" \
       --entitlements "${ENTITLEMENTS_PATH}" \
       "${HANDLER_APP_PATH}"
+    verify_code_signature "${HANDLER_APP_PATH}" --deep
 fi
 
 echo "Creating DMG staging folder..."
@@ -350,6 +387,8 @@ else
       -v --force \
       "${CODESIGN_TIMESTAMP_ARGS[@]}" \
       "${DMG_OUTPUT_PATH}"
+    verify_code_signature "${DMG_OUTPUT_PATH}"
+    verify_dmg_app_signature "${DMG_OUTPUT_PATH}" "${DMG_MOUNT_DIR}"
 fi
 
 rm -rf "${HANDLER_STAGING_DIR}"
