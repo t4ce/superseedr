@@ -14,7 +14,6 @@ on:
         options:
           - normal
           - private
-          - unsigned
           - all
       include_windows:
         description: Build Windows installers too
@@ -167,7 +166,7 @@ jobs:
       KEYCHAIN_NAME: build.keychain
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(github.event_name == 'push' && '{"include":[{"suffix":"normal","flags":"","signing_mode":"signed"}]}' || inputs.macos_suffix == 'normal' && '{"include":[{"suffix":"normal","flags":"","signing_mode":"signed"}]}' || inputs.macos_suffix == 'private' && '{"include":[{"suffix":"private","flags":"--no-default-features","signing_mode":"signed"}]}' || inputs.macos_suffix == 'unsigned' && '{"include":[{"suffix":"unsigned","flags":"","signing_mode":"unsigned"}]}' || '{"include":[{"suffix":"normal","flags":"","signing_mode":"signed"},{"suffix":"private","flags":"--no-default-features","signing_mode":"signed"},{"suffix":"unsigned","flags":"","signing_mode":"unsigned"}]}') }}
+      matrix: ${{ fromJSON(github.event_name == 'push' && '{"include":[{"suffix":"normal","flags":""}]}' || inputs.macos_suffix == 'normal' && '{"include":[{"suffix":"normal","flags":""}]}' || inputs.macos_suffix == 'private' && '{"include":[{"suffix":"private","flags":"--no-default-features"}]}' || '{"include":[{"suffix":"normal","flags":""},{"suffix":"private","flags":"--no-default-features"}]}') }}
 
     steps:
       - name: Checkout
@@ -196,7 +195,6 @@ jobs:
         run: brew install create-dmg
 
       - name: Setup macOS Keychain and Certificate
-        if: matrix.signing_mode == 'signed'
         id: setup_keychain
         env:
           APPLE_INSTALLER_CERT_P12_BASE64: ${{ secrets.APPLE_INSTALLER_CERT_P12_BASE64 }}
@@ -210,12 +208,6 @@ jobs:
           echo $APPLE_INSTALLER_CERT_P12_BASE64 | base64 --decode > certificate.p12
           security import certificate.p12 -k "$KEYCHAIN_NAME" -P "$APPLE_INSTALLER_CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/productsign
           rm certificate.p12
-
-          curl --fail --location --retry 3 --output DeveloperIDG2CA.cer https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
-          curl --fail --location --retry 3 --output DeveloperIDCA.cer https://www.apple.com/certificateauthority/DeveloperIDCA.cer
-          security import DeveloperIDG2CA.cer -k "$KEYCHAIN_NAME"
-          security import DeveloperIDCA.cer -k "$KEYCHAIN_NAME"
-          rm DeveloperIDG2CA.cer DeveloperIDCA.cer
 
           security set-key-partition-list -S apple-tool:,apple: -s -k "$RUNNER_TEMP" "$KEYCHAIN_NAME"
 
@@ -237,16 +229,11 @@ jobs:
         run: |
           script_path="scripts/build_osx_universal_dmg.sh"
           chmod +x "$script_path"
-          cert_name="${{ env.CERT_NAME }}"
-          if [ "${{ matrix.signing_mode }}" = "unsigned" ]; then
-            cert_name="--unsigned"
-          fi
-
           set -o pipefail
           "$script_path" \
             "0.0.0-installers-v2-${{ github.run_number }}" \
             "${{ matrix.suffix }}" \
-            "$cert_name" \
+            "${{ env.CERT_NAME }}" \
             ${{ matrix.flags }} \
             2>&1 | tee build_log.txt
 
@@ -262,7 +249,6 @@ jobs:
         run: hdiutil verify "${{ steps.build_dmg.outputs.dmg_path }}"
 
       - name: Notarize and Staple DMG
-        if: matrix.signing_mode == 'signed'
         id: notarize
         env:
           APPLE_NOTARY_USERNAME: ${{ secrets.APPLE_NOTARY_USERNAME }}
@@ -295,19 +281,16 @@ jobs:
             dmg_name="${{ env.APP_NAME }}-$version-$suffix-universal-macos.dmg"
           fi
 
-          dmg_zip_name="$dmg_name.zip"
-          ditto -c -k --sequesterRsrc --keepParent "${{ steps.build_dmg.outputs.dmg_path }}" "staging/$dmg_zip_name"
-          shasum -a 256 "staging/$dmg_zip_name"
+          cp "${{ steps.build_dmg.outputs.dmg_path }}" "staging/$dmg_name"
           ls -lh staging
-          echo "artifact_path=staging/$dmg_zip_name" >> "$GITHUB_OUTPUT"
+          echo "artifact_path=staging/$dmg_name" >> "$GITHUB_OUTPUT"
 
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v7
         with:
           name: superseedr-installers-v2-macos-${{ matrix.suffix }}-${{ github.run_number }}
           path: ${{ steps.stage.outputs.artifact_path }}
-          archive: false
 
       - name: Cleanup Keychain
-        if: always() && matrix.signing_mode == 'signed'
+        if: always()
         run: security delete-keychain "$KEYCHAIN_NAME"

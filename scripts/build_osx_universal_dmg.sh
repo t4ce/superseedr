@@ -92,9 +92,6 @@ fi
 DMG_OUTPUT_DIR="target/release"
 DMG_OUTPUT_PATH="${DMG_OUTPUT_DIR}/${DMG_NAME}"
 DMG_STAGING_DIR="target/dmg_staging_${NAME_SUFFIX}"
-DMG_TEMP_PATH="${DMG_OUTPUT_DIR}/${APP_NAME}-${VERSION}-${NAME_SUFFIX}-rw.dmg"
-DMG_LAYOUT_PATH="${DMG_OUTPUT_DIR}/${APP_NAME}-${VERSION}-${NAME_SUFFIX}-layout.dmg"
-DMG_MOUNT_DIR="target/dmg_mount_${NAME_SUFFIX}"
 DMG_BACKGROUND_PATH="target/dmg_background_${NAME_SUFFIX}.png"
 
 echo "--- Build Configuration (Universal DMG) ---"
@@ -104,113 +101,6 @@ echo "App Signer: ${APP_CERT_NAME}"
 echo "Unsigned Build: ${UNSIGNED_BUILD}"
 echo "DMG Output: ${DMG_OUTPUT_PATH}"
 echo "-------------------------------------------"
-
-verify_code_signature() {
-    local path="$1"
-    local verify_flags=("${@:2}")
-
-    echo "Verifying code signature: ${path}"
-    codesign --verify "${verify_flags[@]}" --strict --verbose=4 "${path}"
-    codesign -dv --verbose=4 "${path}"
-}
-
-sign_app_bundle() {
-    local app_path="$1"
-    local binary_path="${app_path}/Contents/Resources/${BINARY_NAME}"
-
-    echo "Signing bundled binary with Developer ID and Hardened Runtime: ${binary_path}"
-    codesign -s "${APP_CERT_NAME}" \
-      -v --force \
-      --options runtime \
-      "${CODESIGN_TIMESTAMP_ARGS[@]}" \
-      --entitlements "${ENTITLEMENTS_PATH}" \
-      "${binary_path}"
-    verify_code_signature "${binary_path}"
-
-    echo "Signing ${HANDLER_APP_NAME}.app with Developer ID and Hardened Runtime: ${app_path}"
-    codesign -s "${APP_CERT_NAME}" \
-      -v --force --deep \
-      --options runtime \
-      "${CODESIGN_TIMESTAMP_ARGS[@]}" \
-      --entitlements "${ENTITLEMENTS_PATH}" \
-      "${app_path}"
-    verify_code_signature "${app_path}" --deep
-}
-
-sign_app_bundle_ad_hoc() {
-    local app_path="$1"
-    local binary_path="${app_path}/Contents/Resources/${BINARY_NAME}"
-
-    echo "Applying ad-hoc signature to bundled binary: ${binary_path}"
-    codesign -s - -v --force "${binary_path}"
-    verify_code_signature "${binary_path}"
-
-    echo "Applying ad-hoc signature to ${HANDLER_APP_NAME}.app: ${app_path}"
-    codesign -s - -v --force --deep "${app_path}"
-    verify_code_signature "${app_path}" --deep
-}
-
-sign_app_bundle_for_build() {
-    local app_path="$1"
-
-    if [ "${UNSIGNED_BUILD}" = true ]; then
-        sign_app_bundle_ad_hoc "${app_path}"
-    else
-        sign_app_bundle "${app_path}"
-    fi
-}
-
-sign_app_inside_readwrite_dmg() {
-    local dmg_path="$1"
-    local mount_dir="$2"
-    local mounted_app_path="${mount_dir}/${HANDLER_APP_NAME}.app"
-    local sign_status=0
-
-    echo "Signing app inside finalized read-write DMG..."
-    rm -rf "${mount_dir}"
-    mkdir -p "${mount_dir}"
-    hdiutil attach \
-      -readwrite \
-      -nobrowse \
-      -noautoopen \
-      -mountpoint "${mount_dir}" \
-      "${dmg_path}"
-
-    sign_app_bundle_for_build "${mounted_app_path}" || sign_status=$?
-    hdiutil detach "${mount_dir}" >/dev/null || true
-    rm -rf "${mount_dir}"
-
-    if [ "${sign_status}" -ne 0 ]; then
-        echo "::error:: App signing inside DMG failed."
-        exit "${sign_status}"
-    fi
-}
-
-verify_dmg_app_signature() {
-    local dmg_path="$1"
-    local mount_dir="$2"
-    local mounted_app_path="${mount_dir}/${HANDLER_APP_NAME}.app"
-    local verify_status=0
-
-    echo "Verifying signed app inside DMG..."
-    rm -rf "${mount_dir}"
-    mkdir -p "${mount_dir}"
-    hdiutil attach \
-      -readonly \
-      -nobrowse \
-      -noautoopen \
-      -mountpoint "${mount_dir}" \
-      "${dmg_path}"
-
-    codesign --verify --deep --strict --verbose=4 "${mounted_app_path}" || verify_status=$?
-    hdiutil detach "${mount_dir}" >/dev/null || true
-    rm -rf "${mount_dir}"
-
-    if [ "${verify_status}" -ne 0 ]; then
-        echo "::error:: App signature inside DMG failed verification."
-        exit "${verify_status}"
-    fi
-}
 
 echo "Building main TUI binary for Apple Silicon (aarch64)..."
 cargo build --target aarch64-apple-darwin --release $CARGO_FLAGS
@@ -241,7 +131,7 @@ cat > "${HANDLER_SCRIPT_PATH}" << EOF
 use scripting additions
 
 on run
-    display dialog "${HANDLER_APP_NAME} runs in Terminal." & return & return & "Open Terminal and type:" & return & return & "superseedr" buttons {"OK"} default button "OK" with title "${HANDLER_APP_NAME}"
+    display dialog ("${HANDLER_APP_NAME} runs in Terminal." & return & return & "Open Terminal and type:" & return & return & "superseedr") buttons {"OK"} default button "OK" with title "${HANDLER_APP_NAME}"
 end run
 
 on open location thisURL
@@ -262,7 +152,7 @@ on processLink(theLink)
             set fullCommand to (quoted form of binaryPathPosix) & " " & (quoted form of linkToProcess)
             do shell script (fullCommand & " > /dev/null 2>&1 &")
         on error errMsg
-            display dialog "${HANDLER_APP_NAME} Error: " & errMsg
+            display dialog ("${HANDLER_APP_NAME} Error: " & errMsg)
         end try
     end if
 end processLink
@@ -343,11 +233,28 @@ PLIST_PATH="${HANDLER_APP_PATH}/Contents/Info.plist"
 touch "${HANDLER_APP_PATH}"
 
 if [ "${UNSIGNED_BUILD}" = true ]; then
-    echo "Skipping Developer ID signing for unsigned build; applying ad-hoc local signature."
+    echo "Applying ad-hoc local signature to bundled binary..."
+    codesign -s - -v --force "${BUNDLED_BINARY_PATH}"
+
+    echo "Applying ad-hoc local signature to ${HANDLER_APP_NAME}.app..."
+    codesign -s - -v --force --deep "${HANDLER_APP_PATH}"
 else
-    echo "Signing staged app before DMG layout."
+    echo "Signing bundled binary with Developer ID and Hardened Runtime..."
+    codesign -s "${APP_CERT_NAME}" \
+      -v --force \
+      --options runtime \
+      "${CODESIGN_TIMESTAMP_ARGS[@]}" \
+      --entitlements "${ENTITLEMENTS_PATH}" \
+      "${BUNDLED_BINARY_PATH}"
+
+    echo "Signing ${HANDLER_APP_NAME}.app with Developer ID and Hardened Runtime..."
+    codesign -s "${APP_CERT_NAME}" \
+      -v --force --deep \
+      --options runtime \
+      "${CODESIGN_TIMESTAMP_ARGS[@]}" \
+      --entitlements "${ENTITLEMENTS_PATH}" \
+      "${HANDLER_APP_PATH}"
 fi
-sign_app_bundle_for_build "${HANDLER_APP_PATH}"
 
 echo "Creating DMG staging folder..."
 rm -rf "${DMG_STAGING_DIR}"
@@ -402,12 +309,10 @@ else
 fi
 
 mkdir -p "${DMG_OUTPUT_DIR}"
-rm -f "${DMG_OUTPUT_PATH}" "${DMG_TEMP_PATH}" "${DMG_LAYOUT_PATH}"
-rm -rf "${DMG_MOUNT_DIR}"
+rm -f "${DMG_OUTPUT_PATH}"
 
 if command -v create-dmg >/dev/null 2>&1; then
     echo "Creating drag-to-Applications DMG with create-dmg..."
-
     create-dmg \
       --volname "${APP_NAME}" \
       --volicon "${ICON_FILE_PATH}" \
@@ -420,26 +325,8 @@ if command -v create-dmg >/dev/null 2>&1; then
       --icon "Applications" 610 225 \
       --no-internet-enable \
       --format UDZO \
-      "${DMG_LAYOUT_PATH}" \
+      "${DMG_OUTPUT_PATH}" \
       "${DMG_STAGING_DIR}"
-
-    echo "Converting layout DMG to read-write image..."
-    hdiutil convert \
-      "${DMG_LAYOUT_PATH}" \
-      -format UDRW \
-      -ov \
-      -o "${DMG_TEMP_PATH}"
-
-    sign_app_inside_readwrite_dmg "${DMG_TEMP_PATH}" "${DMG_MOUNT_DIR}"
-
-    echo "Compressing finalized read-write DMG at ${DMG_OUTPUT_PATH}..."
-    hdiutil convert \
-      "${DMG_TEMP_PATH}" \
-      -format UDZO \
-      -imagekey zlib-level=9 \
-      -ov \
-      -o "${DMG_OUTPUT_PATH}"
-    rm -f "${DMG_LAYOUT_PATH}" "${DMG_TEMP_PATH}"
 else
     echo "create-dmg is unavailable; falling back to a plain hdiutil DMG."
     if [ ! -e "${DMG_STAGING_DIR}/Applications" ]; then
@@ -458,23 +345,17 @@ fi
 
 if [ "${UNSIGNED_BUILD}" = true ]; then
     echo "Skipping DMG signing for local unsigned build."
-    verify_dmg_app_signature "${DMG_OUTPUT_PATH}" "${DMG_MOUNT_DIR}"
 else
     echo "Signing DMG with Developer ID Application certificate..."
     codesign -s "${APP_CERT_NAME}" \
       -v --force \
       "${CODESIGN_TIMESTAMP_ARGS[@]}" \
       "${DMG_OUTPUT_PATH}"
-    verify_code_signature "${DMG_OUTPUT_PATH}"
-    verify_dmg_app_signature "${DMG_OUTPUT_PATH}" "${DMG_MOUNT_DIR}"
 fi
 
 rm -rf "${HANDLER_STAGING_DIR}"
 rm -rf "${DMG_STAGING_DIR}"
-rm -rf "${DMG_MOUNT_DIR}"
 rm -rf "${UNIVERSAL_STAGING_DIR}"
-rm -f "${DMG_LAYOUT_PATH}"
-rm -f "${DMG_TEMP_PATH}"
 rm -f "${ENTITLEMENTS_PATH}"
 rm -f "${DMG_BACKGROUND_PATH}"
 
