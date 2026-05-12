@@ -93,6 +93,7 @@ DMG_OUTPUT_DIR="target/release"
 DMG_OUTPUT_PATH="${DMG_OUTPUT_DIR}/${DMG_NAME}"
 DMG_STAGING_DIR="target/dmg_staging_${NAME_SUFFIX}"
 DMG_TEMP_PATH="${DMG_OUTPUT_DIR}/${APP_NAME}-${VERSION}-${NAME_SUFFIX}-rw.dmg"
+DMG_LAYOUT_PATH="${DMG_OUTPUT_DIR}/${APP_NAME}-${VERSION}-${NAME_SUFFIX}-layout.dmg"
 DMG_MOUNT_DIR="target/dmg_mount_${NAME_SUFFIX}"
 DMG_BACKGROUND_PATH="target/dmg_background_${NAME_SUFFIX}.png"
 
@@ -377,16 +378,14 @@ else
 fi
 
 mkdir -p "${DMG_OUTPUT_DIR}"
-rm -f "${DMG_OUTPUT_PATH}" "${DMG_TEMP_PATH}"
+rm -f "${DMG_OUTPUT_PATH}" "${DMG_TEMP_PATH}" "${DMG_LAYOUT_PATH}"
 rm -rf "${DMG_MOUNT_DIR}"
 
 if command -v create-dmg >/dev/null 2>&1; then
     echo "Creating drag-to-Applications DMG with create-dmg..."
     CREATE_DMG_OUTPUT_PATH="${DMG_OUTPUT_PATH}"
-    CREATE_DMG_FORMAT="UDZO"
     if [ "${UNSIGNED_BUILD}" = false ]; then
-        CREATE_DMG_OUTPUT_PATH="${DMG_TEMP_PATH}"
-        CREATE_DMG_FORMAT="UDRW"
+        CREATE_DMG_OUTPUT_PATH="${DMG_LAYOUT_PATH}"
     fi
 
     create-dmg \
@@ -400,11 +399,18 @@ if command -v create-dmg >/dev/null 2>&1; then
       --icon "${HANDLER_APP_NAME}.app" 160 225 \
       --icon "Applications" 610 225 \
       --no-internet-enable \
-      --format "${CREATE_DMG_FORMAT}" \
+      --format UDZO \
       "${CREATE_DMG_OUTPUT_PATH}" \
       "${DMG_STAGING_DIR}"
 
     if [ "${UNSIGNED_BUILD}" = false ]; then
+        echo "Converting layout DMG to read-write image..."
+        hdiutil convert \
+          "${DMG_LAYOUT_PATH}" \
+          -format UDRW \
+          -ov \
+          -o "${DMG_TEMP_PATH}"
+
         sign_app_inside_readwrite_dmg "${DMG_TEMP_PATH}" "${DMG_MOUNT_DIR}"
 
         echo "Compressing signed read-write DMG at ${DMG_OUTPUT_PATH}..."
@@ -414,7 +420,7 @@ if command -v create-dmg >/dev/null 2>&1; then
           -imagekey zlib-level=9 \
           -ov \
           -o "${DMG_OUTPUT_PATH}"
-        rm -f "${DMG_TEMP_PATH}"
+        rm -f "${DMG_LAYOUT_PATH}" "${DMG_TEMP_PATH}"
     fi
 else
     echo "create-dmg is unavailable; falling back to a plain hdiutil DMG."
@@ -448,6 +454,8 @@ rm -rf "${HANDLER_STAGING_DIR}"
 rm -rf "${DMG_STAGING_DIR}"
 rm -rf "${DMG_MOUNT_DIR}"
 rm -rf "${UNIVERSAL_STAGING_DIR}"
+rm -f "${DMG_LAYOUT_PATH}"
+rm -f "${DMG_TEMP_PATH}"
 rm -f "${ENTITLEMENTS_PATH}"
 rm -f "${DMG_BACKGROUND_PATH}"
 
