@@ -5,6 +5,26 @@ on:
     branches:
       - installers_v2
   workflow_dispatch:
+    inputs:
+      macos_suffix:
+        description: macOS DMG variant to build
+        required: true
+        default: normal
+        type: choice
+        options:
+          - normal
+          - private
+          - unsigned
+          - all
+      include_windows:
+        description: Build Windows installers too
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: installers-v2-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -16,7 +36,7 @@ env:
 jobs:
   windows_installers:
     name: Windows installers v2 (${{ matrix.suffix }})
-    if: github.ref == 'refs/heads/installers_v2'
+    if: ${{ github.ref == 'refs/heads/installers_v2' && github.event_name == 'workflow_dispatch' && inputs.include_windows }}
     runs-on: windows-latest
     timeout-minutes: 120
     strategy:
@@ -147,17 +167,7 @@ jobs:
       KEYCHAIN_NAME: build.keychain
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - suffix: normal
-            flags: ""
-            signing_mode: signed
-          - suffix: private
-            flags: "--no-default-features"
-            signing_mode: signed
-          - suffix: unsigned
-            flags: ""
-            signing_mode: unsigned
+      matrix: ${{ fromJSON(github.event_name == 'push' && '{"include":[{"suffix":"normal","flags":"","signing_mode":"signed"}]}' || inputs.macos_suffix == 'normal' && '{"include":[{"suffix":"normal","flags":"","signing_mode":"signed"}]}' || inputs.macos_suffix == 'private' && '{"include":[{"suffix":"private","flags":"--no-default-features","signing_mode":"signed"}]}' || inputs.macos_suffix == 'unsigned' && '{"include":[{"suffix":"unsigned","flags":"","signing_mode":"unsigned"}]}' || '{"include":[{"suffix":"normal","flags":"","signing_mode":"signed"},{"suffix":"private","flags":"--no-default-features","signing_mode":"signed"},{"suffix":"unsigned","flags":"","signing_mode":"unsigned"}]}') }}
 
     steps:
       - name: Checkout
