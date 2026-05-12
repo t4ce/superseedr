@@ -194,6 +194,14 @@ jobs:
       - name: Install DMG tooling
         run: brew install create-dmg
 
+      - name: Pre-compile Rust Binaries
+        run: |
+          echo "Starting pre-compilation to separate build time from signing time..."
+          echo "Building x86_64..."
+          cargo build --release --target x86_64-apple-darwin ${{ matrix.flags }}
+          echo "Building aarch64..."
+          cargo build --release --target aarch64-apple-darwin ${{ matrix.flags }}
+
       - name: Setup macOS Keychain and Certificate
         id: setup_keychain
         env:
