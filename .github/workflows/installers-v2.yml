@@ -151,8 +151,13 @@ jobs:
         include:
           - suffix: normal
             flags: ""
+            signing_mode: signed
           - suffix: private
             flags: "--no-default-features"
+            signing_mode: signed
+          - suffix: unsigned
+            flags: ""
+            signing_mode: unsigned
 
     steps:
       - name: Checkout
@@ -181,6 +186,7 @@ jobs:
         run: brew install create-dmg
 
       - name: Setup macOS Keychain and Certificate
+        if: matrix.signing_mode == 'signed'
         id: setup_keychain
         env:
           APPLE_INSTALLER_CERT_P12_BASE64: ${{ secrets.APPLE_INSTALLER_CERT_P12_BASE64 }}
@@ -216,17 +222,21 @@ jobs:
           echo "Using certificate: $CERT_CN"
           echo "CERT_NAME=$CERT_CN" >> "$GITHUB_ENV"
 
-      - name: Build signed DMG
+      - name: Build DMG
         id: build_dmg
         run: |
           script_path="scripts/build_osx_universal_dmg.sh"
           chmod +x "$script_path"
+          cert_name="${{ env.CERT_NAME }}"
+          if [ "${{ matrix.signing_mode }}" = "unsigned" ]; then
+            cert_name="--unsigned"
+          fi
 
           set -o pipefail
           "$script_path" \
             "0.0.0-installers-v2-${{ github.run_number }}" \
             "${{ matrix.suffix }}" \
-            "${{ env.CERT_NAME }}" \
+            "$cert_name" \
             ${{ matrix.flags }} \
             2>&1 | tee build_log.txt
 
@@ -242,6 +252,7 @@ jobs:
         run: hdiutil verify "${{ steps.build_dmg.outputs.dmg_path }}"
 
       - name: Notarize and Staple DMG
+        if: matrix.signing_mode == 'signed'
         id: notarize
         env:
           APPLE_NOTARY_USERNAME: ${{ secrets.APPLE_NOTARY_USERNAME }}
@@ -288,5 +299,5 @@ jobs:
           archive: false
 
       - name: Cleanup Keychain
-        if: always()
+        if: always() && matrix.signing_mode == 'signed'
         run: security delete-keychain "$KEYCHAIN_NAME"

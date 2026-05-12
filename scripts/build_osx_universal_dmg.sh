@@ -83,10 +83,10 @@ BUNDLED_BINARY_PATH="${HANDLER_APP_PATH}/Contents/Resources/${BINARY_NAME}"
 UNIVERSAL_STAGING_DIR="target/universal_staging_${NAME_SUFFIX}"
 UNIVERSAL_BINARY_PATH="${UNIVERSAL_STAGING_DIR}/${BINARY_NAME}"
 
-if [ "$NAME_SUFFIX" == "private" ]; then
-  DMG_NAME="${APP_NAME}-${VERSION}-private-universal-macos.dmg"
-else
+if [ "$NAME_SUFFIX" == "normal" ]; then
   DMG_NAME="${APP_NAME}-${VERSION}-universal-macos.dmg"
+else
+  DMG_NAME="${APP_NAME}-${VERSION}-${NAME_SUFFIX}-universal-macos.dmg"
 fi
 
 DMG_OUTPUT_DIR="target/release"
@@ -137,6 +137,29 @@ sign_app_bundle() {
     verify_code_signature "${app_path}" --deep
 }
 
+sign_app_bundle_ad_hoc() {
+    local app_path="$1"
+    local binary_path="${app_path}/Contents/Resources/${BINARY_NAME}"
+
+    echo "Applying ad-hoc signature to bundled binary: ${binary_path}"
+    codesign -s - -v --force "${binary_path}"
+    verify_code_signature "${binary_path}"
+
+    echo "Applying ad-hoc signature to ${HANDLER_APP_NAME}.app: ${app_path}"
+    codesign -s - -v --force --deep "${app_path}"
+    verify_code_signature "${app_path}" --deep
+}
+
+sign_app_bundle_for_build() {
+    local app_path="$1"
+
+    if [ "${UNSIGNED_BUILD}" = true ]; then
+        sign_app_bundle_ad_hoc "${app_path}"
+    else
+        sign_app_bundle "${app_path}"
+    fi
+}
+
 sign_app_inside_readwrite_dmg() {
     local dmg_path="$1"
     local mount_dir="$2"
@@ -153,7 +176,7 @@ sign_app_inside_readwrite_dmg() {
       -mountpoint "${mount_dir}" \
       "${dmg_path}"
 
-    sign_app_bundle "${mounted_app_path}" || sign_status=$?
+    sign_app_bundle_for_build "${mounted_app_path}" || sign_status=$?
     hdiutil detach "${mount_dir}" >/dev/null || true
     rm -rf "${mount_dir}"
 
@@ -320,10 +343,11 @@ PLIST_PATH="${HANDLER_APP_PATH}/Contents/Info.plist"
 touch "${HANDLER_APP_PATH}"
 
 if [ "${UNSIGNED_BUILD}" = true ]; then
-    echo "Skipping app signing for local unsigned build."
+    echo "Skipping Developer ID signing for unsigned build; applying ad-hoc local signature."
 else
-    sign_app_bundle "${HANDLER_APP_PATH}"
+    echo "Signing staged app before DMG layout."
 fi
+sign_app_bundle_for_build "${HANDLER_APP_PATH}"
 
 echo "Creating DMG staging folder..."
 rm -rf "${DMG_STAGING_DIR}"
@@ -383,10 +407,6 @@ rm -rf "${DMG_MOUNT_DIR}"
 
 if command -v create-dmg >/dev/null 2>&1; then
     echo "Creating drag-to-Applications DMG with create-dmg..."
-    CREATE_DMG_OUTPUT_PATH="${DMG_OUTPUT_PATH}"
-    if [ "${UNSIGNED_BUILD}" = false ]; then
-        CREATE_DMG_OUTPUT_PATH="${DMG_LAYOUT_PATH}"
-    fi
 
     create-dmg \
       --volname "${APP_NAME}" \
@@ -400,28 +420,26 @@ if command -v create-dmg >/dev/null 2>&1; then
       --icon "Applications" 610 225 \
       --no-internet-enable \
       --format UDZO \
-      "${CREATE_DMG_OUTPUT_PATH}" \
+      "${DMG_LAYOUT_PATH}" \
       "${DMG_STAGING_DIR}"
 
-    if [ "${UNSIGNED_BUILD}" = false ]; then
-        echo "Converting layout DMG to read-write image..."
-        hdiutil convert \
-          "${DMG_LAYOUT_PATH}" \
-          -format UDRW \
-          -ov \
-          -o "${DMG_TEMP_PATH}"
+    echo "Converting layout DMG to read-write image..."
+    hdiutil convert \
+      "${DMG_LAYOUT_PATH}" \
+      -format UDRW \
+      -ov \
+      -o "${DMG_TEMP_PATH}"
 
-        sign_app_inside_readwrite_dmg "${DMG_TEMP_PATH}" "${DMG_MOUNT_DIR}"
+    sign_app_inside_readwrite_dmg "${DMG_TEMP_PATH}" "${DMG_MOUNT_DIR}"
 
-        echo "Compressing signed read-write DMG at ${DMG_OUTPUT_PATH}..."
-        hdiutil convert \
-          "${DMG_TEMP_PATH}" \
-          -format UDZO \
-          -imagekey zlib-level=9 \
-          -ov \
-          -o "${DMG_OUTPUT_PATH}"
-        rm -f "${DMG_LAYOUT_PATH}" "${DMG_TEMP_PATH}"
-    fi
+    echo "Compressing finalized read-write DMG at ${DMG_OUTPUT_PATH}..."
+    hdiutil convert \
+      "${DMG_TEMP_PATH}" \
+      -format UDZO \
+      -imagekey zlib-level=9 \
+      -ov \
+      -o "${DMG_OUTPUT_PATH}"
+    rm -f "${DMG_LAYOUT_PATH}" "${DMG_TEMP_PATH}"
 else
     echo "create-dmg is unavailable; falling back to a plain hdiutil DMG."
     if [ ! -e "${DMG_STAGING_DIR}/Applications" ]; then
@@ -440,6 +458,7 @@ fi
 
 if [ "${UNSIGNED_BUILD}" = true ]; then
     echo "Skipping DMG signing for local unsigned build."
+    verify_dmg_app_signature "${DMG_OUTPUT_PATH}" "${DMG_MOUNT_DIR}"
 else
     echo "Signing DMG with Developer ID Application certificate..."
     codesign -s "${APP_CERT_NAME}" \
