@@ -132,7 +132,6 @@ cat > "${HANDLER_SOURCE_PATH}" << EOF
 
 @interface AppDelegate : NSObject <NSApplicationDelegate>
 @property(nonatomic) BOOL handledOpenEvent;
-@property(nonatomic, strong) NSWindow *launchWindow;
 @end
 
 @implementation AppDelegate
@@ -167,58 +166,14 @@ cat > "${HANDLER_SOURCE_PATH}" << EOF
 }
 
 - (void)showLaunchAlert {
-    NSRect frame = NSMakeRect(0, 0, 430, 318);
-    self.launchWindow = [[NSWindow alloc] initWithContentRect:frame
-                                                    styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskFullSizeContentView)
-                                                      backing:NSBackingStoreBuffered
-                                                        defer:NO];
-    self.launchWindow.title = @"";
-    self.launchWindow.titleVisibility = NSWindowTitleHidden;
-    self.launchWindow.titlebarAppearsTransparent = YES;
-    self.launchWindow.movableByWindowBackground = YES;
-    self.launchWindow.releasedWhenClosed = NO;
-    self.launchWindow.backgroundColor = NSColor.windowBackgroundColor;
-
-    NSView *contentView = self.launchWindow.contentView;
-
-    NSImageView *iconView = [[NSImageView alloc] initWithFrame:NSMakeRect(34, 206, 82, 82)];
-    iconView.image = NSApp.applicationIconImage;
-    iconView.imageScaling = NSImageScaleProportionallyUpOrDown;
-    [contentView addSubview:iconView];
-
-    NSTextField *titleField = [NSTextField labelWithString:@"${HANDLER_APP_NAME} runs in Terminal."];
-    titleField.frame = NSMakeRect(34, 156, 362, 32);
-    titleField.font = [NSFont systemFontOfSize:20 weight:NSFontWeightSemibold];
-    titleField.textColor = NSColor.labelColor;
-    [contentView addSubview:titleField];
-
-    NSTextField *messageField = [NSTextField labelWithString:@"Open Terminal and type:"];
-    messageField.frame = NSMakeRect(34, 112, 362, 30);
-    messageField.font = [NSFont systemFontOfSize:18 weight:NSFontWeightRegular];
-    messageField.textColor = NSColor.labelColor;
-    [contentView addSubview:messageField];
-
-    NSTextField *commandField = [NSTextField labelWithString:@"superseedr"];
-    commandField.frame = NSMakeRect(34, 76, 362, 30);
-    commandField.font = [NSFont systemFontOfSize:18 weight:NSFontWeightSemibold];
-    commandField.textColor = NSColor.labelColor;
-    [contentView addSubview:commandField];
-
-    NSButton *okButton = [NSButton buttonWithTitle:@"OK" target:self action:@selector(closeLaunchWindow:)];
-    okButton.frame = NSMakeRect(34, 26, 362, 40);
-    okButton.bezelStyle = NSBezelStyleRounded;
-    okButton.keyEquivalent = @"\r";
-    [contentView addSubview:okButton];
-    self.launchWindow.defaultButtonCell = okButton.cell;
-
-    [self.launchWindow center];
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.icon = NSApp.applicationIconImage;
+    alert.messageText = @"${HANDLER_APP_NAME} runs in Terminal.";
+    alert.informativeText = @"Open Terminal and type:\n\nsuperseedr";
+    alert.alertStyle = NSAlertStyleInformational;
+    [alert addButtonWithTitle:@"OK"];
     [NSApp activateIgnoringOtherApps:YES];
-    [self.launchWindow makeKeyAndOrderFront:nil];
-}
-
-- (void)closeLaunchWindow:(id)sender {
-    [self.launchWindow close];
-    self.launchWindow = nil;
+    [alert runModal];
     [self terminateSoon];
 }
 
