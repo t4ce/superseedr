@@ -256,6 +256,33 @@ jobs:
       - name: Verify DMG
         run: hdiutil verify "${{ steps.build_dmg.outputs.dmg_path }}"
 
+      - name: Verify mounted app signatures
+        run: |
+          set -euo pipefail
+
+          dmg_path="${{ steps.build_dmg.outputs.dmg_path }}"
+          mount_dir="$(mktemp -d "$RUNNER_TEMP/dmg-mount.XXXXXX")"
+
+          cleanup() {
+            hdiutil detach "$mount_dir" -quiet || true
+            rm -rf "$mount_dir"
+          }
+          trap cleanup EXIT
+
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount_dir" "$dmg_path"
+
+          app_path="$mount_dir/${{ env.APP_NAME }}.app"
+          if [ ! -d "$app_path" ]; then
+            echo "::error::Expected app bundle not found at $app_path"
+            ls -la "$mount_dir"
+            exit 1
+          fi
+
+          codesign --verify --deep --strict --verbose=4 "$app_path"
+          codesign --verify --strict --verbose=4 "$app_path/Contents/MacOS/${{ env.APP_NAME }}"
+          codesign --verify --strict --verbose=4 "$app_path/Contents/Resources/${{ env.APP_NAME }}"
+          /usr/libexec/PlistBuddy -c "Print :LSUIElement" "$app_path/Contents/Info.plist"
+
       - name: Notarize and Staple DMG
         id: notarize
         env:
