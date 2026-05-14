@@ -47,19 +47,21 @@ If work expands into UDP ownership, uTP, QUIC, certificate policy, or public-swa
 
 ## Implementation Status
 
-Last updated: 2026-05-13
+Last updated: 2026-05-14
 
-Overall status: TCP-only peer transport abstraction is implemented for the production app-to-manager inbound peer boundary and outbound manager connect path. A follow-up pass added an env-gated homegrown outbound uTP probe with TCP fallback. Inbound uTP, shared UDP demux, congestion control, and QUIC remain future work.
+Overall status: TCP-only peer transport abstraction is implemented for the production app-to-manager inbound peer boundary and outbound manager connect path. Follow-up passes added an env-gated homegrown outbound uTP path with TCP fallback, uTP-only test mode, transport metrics, selective ACK handling, adaptive retransmit timeouts, and LEDBAT-style delay-based congestion control. Inbound uTP, shared UDP demux, default-on uTP, and QUIC remain future work.
 
 ## Follow-up Status: Homegrown uTP Outbound Probe
 
-Last updated: 2026-05-13
+Last updated: 2026-05-14
 
 Status: implemented as an experimental outbound path behind `SUPERSEEDR_ENABLE_UTP`.
 
 ### What Changed
 
-- Added `src/networking/utp.rs` with a homegrown BEP 29/uTP packet layer, outbound SYN/STATE handshake, DATA/STATE reliability, retransmission, FIN/RESET handling, and extension-chain skipping.
+- Added `src/networking/utp.rs` with a homegrown BEP 29/uTP packet layer, outbound SYN/STATE handshake, DATA/STATE reliability, retransmission, FIN/RESET handling, extension-chain parsing, and selective ACK extension support.
+- Added out-of-order receive buffering with selective ACK responses and selective ACK processing for outbound packet acknowledgement.
+- Added adaptive retransmit timeout tracking and LEDBAT-style delay-based congestion control using remote timestamp differences, base-delay history, loss response, remote receive window limits, and packet-size adaptation.
 - Added `UtpPeerTransport::connect` returning the same `PeerConnection` abstraction used by TCP.
 - Kept default production behavior TCP-only. Outbound uTP is attempted only when `SUPERSEEDR_ENABLE_UTP` is truthy (`1`, `true`, `yes`, or `on`).
 - If the uTP probe fails or times out, the manager falls back to TCP for the same peer.
@@ -78,7 +80,7 @@ Status: implemented as an experimental outbound path behind `SUPERSEEDR_ENABLE_U
 - Do not enable uTP by default until it has real-world soak evidence against public uTP peers.
 - Do not add external transport dependencies for this pass.
 - Use an outbound ephemeral UDP socket for the first implementation. This avoids interfering with the DHT-owned client UDP port, but it does not solve inbound reachability.
-- Keep TCP fallback mandatory while uTP is experimental.
+- Keep TCP fallback mandatory while uTP is experimental, except when `SUPERSEEDR_UTP_ONLY=1` is used for isolated transport testing.
 - Allow `SUPERSEEDR_UTP_ONLY=1` only as a test switch; it is expected to fail against peers that do not answer uTP, and it does not add inbound uTP support.
 - Treat BitTorrent session success over the selected transport as the proof point, not just a uTP SYN/STATE transport connect.
 - Keep `ip:port` peer state keys for this pass because only one transport is selected per outbound peer attempt. A future simultaneous TCP/uTP identity migration still needs transport-qualified peer keys.
@@ -86,7 +88,7 @@ Status: implemented as an experimental outbound path behind `SUPERSEEDR_ENABLE_U
 ### Remaining Work
 
 - Add shared UDP ownership and demux before inbound uTP or same-port outbound uTP.
-- Add LEDBAT-style congestion control before default-on uTP.
+- Run longer public-swarm soak tests before default-on uTP.
 - Add broader interoperability tests against real public uTP peers.
 - Decide how, if at all, to expose transport counts in the TUI; status JSON has the first observable surface.
 - QUIC still requires a separate compatibility and protocol decision.
@@ -101,6 +103,9 @@ Status: implemented as an experimental outbound path behind `SUPERSEEDR_ENABLE_U
 - `cargo test integrations::status::tests::test_serialize_torrents_hex_keys`
 - `cargo test --features synthetic-load outbound_connect_sample_tracks_transport_breakdown`
 - `cargo test`
+- `cargo test utp_only_mode_disables_tcp_fallback -- --nocapture`
+- `cargo test enabled_utp_mode_keeps_tcp_fallback -- --nocapture`
+- `cargo build`
 - `SUPERSEEDR_ENABLE_UTP=1 cargo run --release --features synthetic-load -- benchmark --start-torrents 2 --start-peers 8 --max-torrents 2 --max-peers 16 --max-steps 1 --disk-budget 64MiB --size-per-torrent 4MiB --piece-size 256KiB --duration-secs 8 --warmup-secs 1 --metrics-interval-ms 1000 --peer-add-burst-size 8 --target-gbps 1 --out tmp/utp-transport-synthetic`
   - Result: 3/3 benchmark steps passed.
   - Artifact: `tmp/utp-transport-synthetic/benchmark_20260513_153649/benchmark_summary.json`.
@@ -108,6 +113,10 @@ Status: implemented as an experimental outbound path behind `SUPERSEEDR_ENABLE_U
 - Launched `target/release/superseedr.exe` with isolated shared config at `tmp/utp-client-root`, host id `utp-branch-client`, port `16682`, and `SUPERSEEDR_ENABLE_UTP=1`.
   - Status verified via `target/release/superseedr.exe status --json`.
   - Runtime evidence: DHT bound to `0.0.0.0:16682` and `[::]:16682`; no stderr output; branch process stopped cleanly through `stop-client --json`.
+- Launched debug client against the normal public-swarm test environment with `SUPERSEEDR_UTP_ONLY=1` and `SUPERSEEDR_LOG_UTP_CONNECT=1`.
+  - Runtime evidence: uTP-only mode produced uTP connects and BitTorrent sessions, zero TCP sessions in the inspected log window, no fallback lines, and the process stopped cleanly.
+- Launched debug client against the normal public-swarm test environment with `SUPERSEEDR_ENABLE_UTP=1` and `SUPERSEEDR_LOG_UTP_CONNECT=1`.
+  - Runtime evidence: fallback mode produced both uTP and TCP BitTorrent sessions in the inspected log window, preserving TCP fallback while exercising the uTP path.
 
 ### Completed Milestones
 
