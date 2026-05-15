@@ -184,6 +184,147 @@ fn synthetic_peer_connect_failure(error: &std::io::Error) -> SyntheticPeerConnec
     }
 }
 
+async fn connect_outbound_peer(
+    peer_addr: SocketAddr,
+    local_udp_port: u16,
+    mode: OutboundTransportMode,
+    peer_label: &str,
+) -> Result<PeerConnection, (PeerTransportKind, Option<std::io::Error>)> {
+    match (mode.try_utp, mode.allow_tcp) {
+        (true, true) => race_utp_and_tcp(peer_addr, local_udp_port, peer_label).await,
+        (true, false) => match attempt_utp_connect(peer_addr, local_udp_port).await {
+            Ok(connection) => {
+                log_utp_connect_established(peer_label);
+                Ok(connection)
+            }
+            Err(error) => {
+                log_utp_connect_failure(
+                    peer_label,
+                    error.as_ref(),
+                    "uTP outbound connect failed in uTP-only mode",
+                );
+                Err((PeerTransportKind::Utp, error))
+            }
+        },
+        (false, _) => attempt_tcp_connect(peer_addr)
+            .await
+            .map_err(|error| (PeerTransportKind::Tcp, error)),
+    }
+}
+
+async fn race_utp_and_tcp(
+    peer_addr: SocketAddr,
+    local_udp_port: u16,
+    peer_label: &str,
+) -> Result<PeerConnection, (PeerTransportKind, Option<std::io::Error>)> {
+    let utp_attempt = attempt_utp_connect(peer_addr, local_udp_port);
+    let tcp_attempt = attempt_tcp_connect(peer_addr);
+    tokio::pin!(utp_attempt);
+    tokio::pin!(tcp_attempt);
+
+    let (first_transport, first_result) = tokio::select! {
+        result = &mut tcp_attempt => (PeerTransportKind::Tcp, result),
+        result = &mut utp_attempt => (PeerTransportKind::Utp, result),
+    };
+
+    match (first_transport, first_result) {
+        (_, Ok(connection)) => {
+            if connection.endpoint.kind == PeerTransportKind::Utp {
+                log_utp_connect_established(peer_label);
+            }
+            Ok(connection)
+        }
+        (PeerTransportKind::Utp, Err(utp_error)) => {
+            log_utp_connect_failure(
+                peer_label,
+                utp_error.as_ref(),
+                "uTP outbound connect failed while racing TCP fallback",
+            );
+            match tcp_attempt.await {
+                Ok(connection) => Ok(connection),
+                Err(tcp_error) => Err((PeerTransportKind::Tcp, tcp_error)),
+            }
+        }
+        (PeerTransportKind::Tcp, Err(tcp_error)) => match utp_attempt.await {
+            Ok(connection) => {
+                log_utp_connect_established(peer_label);
+                Ok(connection)
+            }
+            Err(utp_error) => {
+                log_utp_connect_failure(
+                    peer_label,
+                    utp_error.as_ref(),
+                    "uTP outbound connect failed after TCP fallback failed",
+                );
+                Err((PeerTransportKind::Tcp, tcp_error))
+            }
+        },
+        (PeerTransportKind::Quic, Err(error)) => Err((PeerTransportKind::Quic, error)),
+    }
+}
+
+async fn attempt_utp_connect(
+    peer_addr: SocketAddr,
+    local_udp_port: u16,
+) -> Result<PeerConnection, Option<std::io::Error>> {
+    match timeout(
+        UTP_CONNECT_TIMEOUT,
+        UtpPeerTransport::connect_from_port(peer_addr, local_udp_port),
+    )
+    .await
+    {
+        Ok(Ok(connection)) => Ok(connection),
+        Ok(Err(error)) => Err(Some(error)),
+        Err(_) => Err(None),
+    }
+}
+
+async fn attempt_tcp_connect(
+    peer_addr: SocketAddr,
+) -> Result<PeerConnection, Option<std::io::Error>> {
+    match timeout(TCP_CONNECT_TIMEOUT, TcpPeerTransport::connect(peer_addr)).await {
+        Ok(Ok(connection)) => Ok(connection),
+        Ok(Err(error)) => Err(Some(error)),
+        Err(_) => Err(None),
+    }
+}
+
+fn log_utp_connect_established(peer_label: &str) {
+    if utp_connect_log_enabled() {
+        event!(
+            Level::INFO,
+            peer = %peer_label,
+            "uTP outbound connect established"
+        );
+    }
+}
+
+fn log_utp_connect_failure(
+    peer_label: &str,
+    error: Option<&std::io::Error>,
+    message: &'static str,
+) {
+    if !utp_connect_log_enabled() {
+        return;
+    }
+
+    match error {
+        Some(error) => event!(
+            Level::INFO,
+            peer = %peer_label,
+            error = %error,
+            "{}",
+            message
+        ),
+        None => event!(
+            Level::INFO,
+            peer = %peer_label,
+            "{}",
+            message
+        ),
+    }
+}
+
 struct PreparedFileProbeEntry {
     relative_path: std::path::PathBuf,
     absolute_path: std::path::PathBuf,
@@ -2008,6 +2149,7 @@ impl TorrentManager {
         let info_hash_clone = self.state.info_hash.clone();
         let torrent_metadata_length_clone = self.state.torrent_metadata_length;
         let peer_ip_port_clone = peer_ip_port.clone();
+        let local_udp_port = self.settings.client_port;
 
         let mut shutdown_rx_permit = self.shutdown_tx.subscribe();
         let mut shutdown_rx_session = self.shutdown_tx.subscribe();
@@ -2082,127 +2224,29 @@ impl TorrentManager {
             };
 
             if let Some(session_permit) = session_permit {
-                let mut utp_failure = None;
-                let utp_connection = if outbound_transport_mode.try_utp {
-                    #[cfg(feature = "synthetic-load")]
-                    let _ = manager_event_tx_clone.try_send(ManagerEvent::PeerConnectAttempted {
-                        transport: PeerTransportKind::Utp,
-                    });
-
-                    match timeout(UTP_CONNECT_TIMEOUT, UtpPeerTransport::connect(peer_addr)).await {
-                        Ok(Ok(connection)) => {
-                            if utp_connect_log_enabled() {
-                                event!(
-                                    Level::INFO,
-                                    peer = %peer_ip_port_clone,
-                                    "uTP outbound connect established"
-                                );
-                            }
-                            Some(connection)
-                        }
-                        Ok(Err(error)) => {
-                            #[cfg(feature = "synthetic-load")]
-                            if outbound_transport_mode.allow_tcp {
-                                let _ = manager_event_tx_clone.try_send(
-                                    ManagerEvent::PeerConnectFailed {
-                                        transport: PeerTransportKind::Utp,
-                                        reason: synthetic_peer_connect_failure(&error),
-                                    },
-                                );
-                            }
-                            if !outbound_transport_mode.allow_tcp {
-                                if utp_connect_log_enabled() {
-                                    event!(
-                                        Level::INFO,
-                                        peer = %peer_ip_port_clone,
-                                        error = %error,
-                                        "uTP outbound connect failed in uTP-only mode"
-                                    );
-                                }
-                                utp_failure = Some(error);
-                            } else {
-                                if utp_connect_log_enabled() {
-                                    event!(
-                                        Level::INFO,
-                                        peer = %peer_ip_port_clone,
-                                        error = %error,
-                                        "uTP outbound connect failed; falling back to TCP"
-                                    );
-                                }
-                                event!(
-                                    Level::TRACE,
-                                    peer = %peer_ip_port_clone,
-                                    error = %error,
-                                    "uTP outbound connect failed; falling back to TCP"
-                                );
-                            }
-                            None
-                        }
-                        Err(_) => {
-                            #[cfg(feature = "synthetic-load")]
-                            if outbound_transport_mode.allow_tcp {
-                                let _ = manager_event_tx_clone.try_send(
-                                    ManagerEvent::PeerConnectFailed {
-                                        transport: PeerTransportKind::Utp,
-                                        reason: SyntheticPeerConnectFailure::ConnectTimeout,
-                                    },
-                                );
-                            }
-                            if !outbound_transport_mode.allow_tcp {
-                                if utp_connect_log_enabled() {
-                                    event!(
-                                        Level::INFO,
-                                        peer = %peer_ip_port_clone,
-                                        "uTP outbound connect timed out in uTP-only mode"
-                                    );
-                                }
-                                utp_failure = Some(std::io::Error::new(
-                                    std::io::ErrorKind::TimedOut,
-                                    "uTP connect timed out",
-                                ));
-                            } else {
-                                if utp_connect_log_enabled() {
-                                    event!(
-                                        Level::INFO,
-                                        peer = %peer_ip_port_clone,
-                                        "uTP outbound connect timed out; falling back to TCP"
-                                    );
-                                }
-                                event!(
-                                    Level::TRACE,
-                                    peer = %peer_ip_port_clone,
-                                    "uTP outbound connect timed out; falling back to TCP"
-                                );
-                            }
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                let connection_result = if let Some(connection) = utp_connection {
-                    Ok(connection)
-                } else if !outbound_transport_mode.allow_tcp {
-                    let error = utp_failure.unwrap_or_else(|| {
-                        std::io::Error::other("uTP-only mode did not produce a uTP connection")
-                    });
-                    Err((PeerTransportKind::Utp, Some(error)))
-                } else {
-                    #[cfg(feature = "synthetic-load")]
+                #[cfg(feature = "synthetic-load")]
+                {
                     if outbound_transport_mode.try_utp {
+                        let _ =
+                            manager_event_tx_clone.try_send(ManagerEvent::PeerConnectAttempted {
+                                transport: PeerTransportKind::Utp,
+                            });
+                    }
+                    if outbound_transport_mode.try_utp && outbound_transport_mode.allow_tcp {
                         let _ =
                             manager_event_tx_clone.try_send(ManagerEvent::PeerConnectAttempted {
                                 transport: PeerTransportKind::Tcp,
                             });
                     }
+                }
 
-                    match timeout(TCP_CONNECT_TIMEOUT, TcpPeerTransport::connect(peer_addr)).await {
-                        Ok(Ok(connection)) => Ok(connection),
-                        Ok(Err(error)) => Err((PeerTransportKind::Tcp, Some(error))),
-                        Err(_) => Err((PeerTransportKind::Tcp, None)),
-                    }
-                };
+                let connection_result = connect_outbound_peer(
+                    peer_addr,
+                    local_udp_port,
+                    outbound_transport_mode,
+                    &peer_ip_port_clone,
+                )
+                .await;
 
                 match connection_result {
                     Ok(connection) => {
@@ -3088,6 +3132,10 @@ impl TorrentManager {
                             peer_id: peer_ip_port.clone(),
                             tx: peer_session_tx,
                         });
+                        self.apply_action(Action::PeerTransportSelected {
+                            peer_id: peer_ip_port.clone(),
+                            transport: connection.endpoint.kind,
+                        });
 
                         let bitfield = match self.state.torrent {
                             None => None,
@@ -3487,6 +3535,38 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn enabled_utp_mode_races_tcp_fallback() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let accept_task = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let started_at = Instant::now();
+        let connection = connect_outbound_peer(
+            peer_addr,
+            0,
+            OutboundTransportMode {
+                try_utp: true,
+                allow_tcp: true,
+            },
+            "127.0.0.1:0",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(connection.endpoint.kind, PeerTransportKind::Tcp);
+        assert!(
+            started_at.elapsed() < Duration::from_secs(1),
+            "TCP fallback should not wait for the uTP connect timeout"
+        );
+
+        drop(connection);
+        accept_task.await.unwrap();
+    }
+
     #[test]
     fn counts_transport_peers_and_payload_movers() {
         let (tx, _rx) = mpsc::channel(1);
@@ -3778,6 +3858,86 @@ mod resource_tests {
             global_ul_bucket: Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY)),
             file_priorities: HashMap::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn incoming_utp_connection_counts_as_utp_peer() {
+        let (incoming_tx, incoming_peer_rx) = mpsc::channel(4);
+        let (manager_command_tx, manager_command_rx) = mpsc::channel(4);
+        let (manager_event_tx, _manager_event_rx) = mpsc::channel(16);
+        let (metrics_tx, mut metrics_rx) = watch::channel(TorrentMetrics::default());
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let settings = Arc::new(Settings::default());
+        let temp_dir =
+            std::env::temp_dir().join(format!("superseedr_incoming_utp_{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let mut limits = HashMap::new();
+        limits.insert(ResourceType::PeerConnection, (1000, 1000));
+        limits.insert(ResourceType::DiskRead, (1000, 1000));
+        limits.insert(ResourceType::DiskWrite, (1000, 1000));
+        limits.insert(ResourceType::Reserve, (0, 0));
+
+        let (_resource_manager, resource_manager_client) =
+            ResourceManager::new(limits, shutdown_tx.clone());
+        let params = TorrentParameters {
+            dht_handle: build_test_dht_handle(),
+            incoming_peer_rx,
+            metrics_tx,
+            torrent_validation_status: false,
+            torrent_data_path: Some(temp_dir.clone()),
+            container_name: None,
+            manager_command_rx,
+            manager_event_tx,
+            settings,
+            resource_manager: resource_manager_client,
+            global_dl_bucket: Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY)),
+            global_ul_bucket: Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY)),
+            file_priorities: HashMap::new(),
+        };
+
+        let manager =
+            TorrentManager::from_torrent(params, create_dummy_torrent(1)).expect("manager");
+        let info_hash = manager.state.info_hash.clone();
+        let run_task = tokio::spawn(async move { manager.run(false).await });
+        manager_command_tx
+            .send(ManagerCommand::SetDataRate(10))
+            .await
+            .unwrap();
+
+        let peer_addr: SocketAddr = "127.0.0.1:50123".parse().unwrap();
+        let (stream, _peer_side) = tokio::io::duplex(128);
+        let mut handshake_response = vec![0_u8; 68];
+        handshake_response[28..48].copy_from_slice(&info_hash);
+        let connection = PeerConnection::new(
+            stream,
+            crate::networking::transport::PeerEndpoint::utp(peer_addr),
+            peer_addr,
+            crate::networking::transport::PeerConnectionDirection::Incoming,
+        );
+        incoming_tx
+            .send((connection, handshake_response))
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                metrics_rx.changed().await.unwrap();
+                let metrics = metrics_rx.borrow().clone();
+                if metrics.utp_peer_count == 1 && metrics.tcp_peer_count == 0 {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("inbound uTP peer should be counted as uTP");
+
+        manager_command_tx
+            .send(ManagerCommand::Shutdown)
+            .await
+            .unwrap();
+        run_task.await.unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[cfg(feature = "dht")]

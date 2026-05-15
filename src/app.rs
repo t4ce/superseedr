@@ -76,7 +76,7 @@ use crate::integrity_scheduler::{
     IntegrityScheduler, ProbeBatchOutcome, TorrentIntegritySnapshot,
     INTEGRITY_SCHEDULER_TICK_INTERVAL,
 };
-use crate::networking::{PeerConnection, TcpPeerTransport};
+use crate::networking::{PeerConnection, TcpPeerTransport, UtpListenerSet, UtpPeerTransport};
 use crate::torrent_file::parser::from_bytes;
 use crate::torrent_identity::info_hash_from_torrent_source;
 use crate::torrent_manager::data_availability_from_file_probe_result;
@@ -181,6 +181,7 @@ const BITTORRENT_PROTOCOL_STR: &[u8] = b"BitTorrent protocol";
 pub struct ListenerSet {
     ipv4: Option<TcpListener>,
     ipv6: Option<TcpListener>,
+    utp: Option<UtpListenerSet>,
 }
 
 const UTP_ONLY_ENV: &str = "SUPERSEEDR_UTP_ONLY";
@@ -191,6 +192,10 @@ fn tcp_peer_listener_enabled_from_env() -> bool {
 
 fn tcp_peer_listener_enabled(utp_only: bool) -> bool {
     !utp_only
+}
+
+fn utp_peer_listener_enabled_from_env() -> bool {
+    app_env_flag("SUPERSEEDR_ENABLE_UTP") || app_env_flag(UTP_ONLY_ENV)
 }
 
 fn app_env_flag(name: &str) -> bool {
@@ -205,68 +210,87 @@ fn app_env_flag(name: &str) -> bool {
 }
 
 async fn bind_peer_listener(port: u16) -> io::Result<Option<ListenerSet>> {
-    if !tcp_peer_listener_enabled_from_env() {
+    let tcp_enabled = tcp_peer_listener_enabled_from_env();
+    let utp_enabled = utp_peer_listener_enabled_from_env();
+    if !tcp_enabled && !utp_enabled {
         tracing_event!(
             Level::INFO,
-            "TCP peer listener disabled by SUPERSEEDR_UTP_ONLY"
+            "Peer listener disabled because TCP is disabled and uTP is not enabled"
         );
         return Ok(None);
     }
 
-    ListenerSet::bind(port).await.map(Some)
+    ListenerSet::bind(port, tcp_enabled, utp_enabled)
+        .await
+        .map(Some)
 }
 
 impl ListenerSet {
-    async fn bind(port: u16) -> io::Result<Self> {
-        let ipv6 = match TcpListener::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port))
-            .await
-        {
-            Ok(listener) => Some(listener),
-            Err(error) => {
-                tracing_event!(
-                    Level::WARN,
-                    error = %error,
-                    "IPv6 listener bind failed; continuing without IPv6 listener."
-                );
-                None
-            }
+    async fn bind(port: u16, tcp_enabled: bool, utp_enabled: bool) -> io::Result<Self> {
+        let (ipv4, ipv6) = if tcp_enabled {
+            bind_tcp_peer_listeners(port).await?
+        } else {
+            tracing_event!(
+                Level::INFO,
+                "TCP peer listener disabled by SUPERSEEDR_UTP_ONLY"
+            );
+            (None, None)
         };
 
-        let ipv4_port = match (port, ipv6.as_ref()) {
-            (0, Some(listener)) => listener.local_addr()?.port(),
+        let udp_port = match (
+            port,
+            ipv4.as_ref()
+                .or(ipv6.as_ref())
+                .and_then(|listener| listener.local_addr().ok().map(|addr| addr.port())),
+        ) {
+            (0, Some(bound_port)) => bound_port,
             _ => port,
         };
-
-        let ipv4 = match TcpListener::bind(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            ipv4_port,
-        ))
-        .await
-        {
-            Ok(listener) => Some(listener),
-            Err(error) if ipv6.is_some() && error.kind() == io::ErrorKind::AddrInUse => None,
-            Err(error) if ipv6.is_some() => {
-                tracing_event!(
-                    Level::WARN,
-                    error = %error,
-                    "IPv4 listener bind failed; continuing with IPv6 listener only."
-                );
-                None
+        let utp = if utp_enabled {
+            match UtpPeerTransport::bind_listener(udp_port).await {
+                Ok(listener) => Some(listener),
+                Err(error) if ipv4.is_some() || ipv6.is_some() => {
+                    tracing_event!(
+                        Level::WARN,
+                        error = %error,
+                        "uTP listener bind failed; continuing with TCP listener only."
+                    );
+                    None
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
+        } else {
+            None
         };
 
-        if ipv4.is_none() && ipv6.is_none() {
+        if ipv4.is_none() && ipv6.is_none() && utp.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::AddrNotAvailable,
-                "failed to bind IPv4 or IPv6 listener",
+                "failed to bind any peer listener",
             ));
         }
 
-        Ok(Self { ipv4, ipv6 })
+        Ok(Self { ipv4, ipv6, utp })
     }
 
     async fn accept(&self) -> io::Result<PeerConnection> {
+        match (self.has_tcp_listener(), self.utp.as_ref()) {
+            (true, Some(utp)) => {
+                tokio::select! {
+                    res = self.accept_tcp() => res,
+                    res = utp.accept() => res,
+                }
+            }
+            (true, None) => self.accept_tcp().await,
+            (false, Some(utp)) => utp.accept().await,
+            (false, None) => Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "no listener is currently bound",
+            )),
+        }
+    }
+
+    async fn accept_tcp(&self) -> io::Result<PeerConnection> {
         let (stream, remote_addr) = match (&self.ipv4, &self.ipv6) {
             (Some(ipv4), Some(ipv6)) => {
                 tokio::select! {
@@ -285,13 +309,61 @@ impl ListenerSet {
         Ok(TcpPeerTransport::incoming(stream, remote_addr))
     }
 
+    fn has_tcp_listener(&self) -> bool {
+        self.ipv4.is_some() || self.ipv6.is_some()
+    }
+
     fn local_port(&self) -> Option<u16> {
         self.ipv4
             .as_ref()
             .or(self.ipv6.as_ref())
             .and_then(|listener| listener.local_addr().ok())
             .map(|addr| addr.port())
+            .or_else(|| self.utp.as_ref().and_then(UtpListenerSet::local_port))
     }
+}
+
+async fn bind_tcp_peer_listeners(
+    port: u16,
+) -> io::Result<(Option<TcpListener>, Option<TcpListener>)> {
+    let ipv6 =
+        match TcpListener::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)).await {
+            Ok(listener) => Some(listener),
+            Err(error) => {
+                tracing_event!(
+                    Level::WARN,
+                    error = %error,
+                    "IPv6 listener bind failed; continuing without IPv6 listener."
+                );
+                None
+            }
+        };
+
+    let ipv4_port = match (port, ipv6.as_ref()) {
+        (0, Some(listener)) => listener.local_addr()?.port(),
+        _ => port,
+    };
+
+    let ipv4 = match TcpListener::bind(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        ipv4_port,
+    ))
+    .await
+    {
+        Ok(listener) => Some(listener),
+        Err(error) if ipv6.is_some() && error.kind() == io::ErrorKind::AddrInUse => None,
+        Err(error) if ipv6.is_some() => {
+            tracing_event!(
+                Level::WARN,
+                error = %error,
+                "IPv4 listener bind failed; continuing with IPv6 listener only."
+            );
+            None
+        }
+        Err(error) => return Err(error),
+    };
+
+    Ok((ipv4, ipv6))
 }
 
 #[derive(serde::Deserialize)]
@@ -12866,7 +12938,7 @@ mod tests {
             false
         };
 
-        match ListenerSet::bind(port).await {
+        match ListenerSet::bind(port, true, false).await {
             Ok(listener_set) => {
                 assert!(
                     ipv6_can_bind_alongside_ipv4,
@@ -12895,7 +12967,7 @@ mod tests {
             };
         let port = occupied.local_addr().expect("occupied local addr").port();
 
-        match ListenerSet::bind(port).await {
+        match ListenerSet::bind(port, true, false).await {
             Ok(listener_set) => {
                 assert!(listener_set.ipv4.is_some());
                 assert!(listener_set.ipv6.is_none());
@@ -12905,5 +12977,17 @@ mod tests {
                 assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn listener_set_bind_can_run_utp_without_tcp() {
+        let listener_set = ListenerSet::bind(0, false, true)
+            .await
+            .expect("bind uTP-only listener");
+
+        assert!(listener_set.ipv4.is_none());
+        assert!(listener_set.ipv6.is_none());
+        assert!(listener_set.utp.is_some());
+        assert!(listener_set.local_port().is_some());
     }
 }

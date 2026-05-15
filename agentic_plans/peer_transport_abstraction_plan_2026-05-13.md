@@ -49,19 +49,23 @@ If work expands into UDP ownership, uTP, QUIC, certificate policy, or public-swa
 
 Last updated: 2026-05-14
 
-Overall status: TCP-only peer transport abstraction is implemented for the production app-to-manager inbound peer boundary and outbound manager connect path. Follow-up passes added an env-gated homegrown outbound uTP path with TCP fallback, uTP-only test mode, transport metrics, selective ACK handling, adaptive retransmit timeouts, and LEDBAT-style delay-based congestion control. Inbound uTP, shared UDP demux, default-on uTP, and QUIC remain future work.
+Overall status: TCP-only peer transport abstraction is implemented for the production app-to-manager inbound peer boundary and outbound manager connect path. Follow-up passes added an env-gated homegrown uTP path with TCP fallback, uTP-only test mode, transport metrics, selective ACK handling, adaptive retransmit timeouts, LEDBAT-style delay-based congestion control, shared UDP socket ownership for DHT/uTP, same-port outbound uTP, and inbound uTP handoff through the existing `PeerConnection` boundary. Default-on uTP and QUIC remain future work.
 
-## Follow-up Status: Homegrown uTP Outbound Probe
+## Follow-up Status: Homegrown uTP Path
 
 Last updated: 2026-05-14
 
-Status: implemented as an experimental outbound path behind `SUPERSEEDR_ENABLE_UTP`.
+Status: implemented as an experimental uTP path behind `SUPERSEEDR_ENABLE_UTP`.
 
 ### What Changed
 
 - Added `src/networking/utp.rs` with a homegrown BEP 29/uTP packet layer, outbound SYN/STATE handshake, DATA/STATE reliability, retransmission, FIN/RESET handling, extension-chain parsing, and selective ACK extension support.
 - Added out-of-order receive buffering with selective ACK responses and selective ACK processing for outbound packet acknowledgement.
 - Added adaptive retransmit timeout tracking and LEDBAT-style delay-based congestion control using remote timestamp differences, base-delay history, loss response, remote receive window limits, and packet-size adaptation.
+- Added `src/networking/shared_udp.rs` as the shared UDP socket owner and classifier for DHT and uTP datagrams.
+- Reworked DHT transport to subscribe to shared UDP DHT datagrams instead of owning an exclusive UDP receive loop.
+- Added inbound uTP demux and listener support so accepted uTP streams route through the existing app-to-manager `PeerConnection` handoff.
+- Moved outbound uTP to the configured client UDP port so DHT, inbound uTP, and outbound uTP share the same public UDP socket.
 - Added `UtpPeerTransport::connect` returning the same `PeerConnection` abstraction used by TCP.
 - Kept default production behavior TCP-only. Outbound uTP is attempted only when `SUPERSEEDR_ENABLE_UTP` is truthy (`1`, `true`, `yes`, or `on`).
 - If the uTP probe fails or times out, the manager falls back to TCP for the same peer.
@@ -79,15 +83,14 @@ Status: implemented as an experimental outbound path behind `SUPERSEEDR_ENABLE_U
 
 - Do not enable uTP by default until it has real-world soak evidence against public uTP peers.
 - Do not add external transport dependencies for this pass.
-- Use an outbound ephemeral UDP socket for the first implementation. This avoids interfering with the DHT-owned client UDP port, but it does not solve inbound reachability.
+- Use one shared UDP socket owner for DHT and uTP. The shared runtime classifies bencoded KRPC packets as DHT and BEP 29 version/type packets as uTP.
 - Keep TCP fallback mandatory while uTP is experimental, except when `SUPERSEEDR_UTP_ONLY=1` is used for isolated transport testing.
-- Allow `SUPERSEEDR_UTP_ONLY=1` only as a test switch; it is expected to fail against peers that do not answer uTP, and it does not add inbound uTP support.
+- Allow `SUPERSEEDR_UTP_ONLY=1` only as a test switch; it disables the TCP peer listener and outbound TCP fallback so inbound and outbound uTP can be tested in isolation.
 - Treat BitTorrent session success over the selected transport as the proof point, not just a uTP SYN/STATE transport connect.
 - Keep `ip:port` peer state keys for this pass because only one transport is selected per outbound peer attempt. A future simultaneous TCP/uTP identity migration still needs transport-qualified peer keys.
 
 ### Remaining Work
 
-- Add shared UDP ownership and demux before inbound uTP or same-port outbound uTP.
 - Run longer public-swarm soak tests before default-on uTP.
 - Add broader interoperability tests against real public uTP peers.
 - Decide how, if at all, to expose transport counts in the TUI; status JSON has the first observable surface.
@@ -102,6 +105,11 @@ Status: implemented as an experimental outbound path behind `SUPERSEEDR_ENABLE_U
 - `cargo test counts_transport_peers_and_payload_movers`
 - `cargo test integrations::status::tests::test_serialize_torrents_hex_keys`
 - `cargo test --features synthetic-load outbound_connect_sample_tracks_transport_breakdown`
+- `cargo test networking::utp -- --nocapture`
+- `cargo test dht::transport -- --nocapture`
+- `cargo test inbound_listener_accepts_utp_stream -- --nocapture`
+- `cargo test dht_and_utp_share_udp_port -- --nocapture`
+- `cargo test listener_set_bind_can_run_utp_without_tcp -- --nocapture`
 - `cargo test`
 - `cargo test utp_only_mode_disables_tcp_fallback -- --nocapture`
 - `cargo test enabled_utp_mode_keeps_tcp_fallback -- --nocapture`

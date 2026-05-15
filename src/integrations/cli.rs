@@ -207,6 +207,23 @@ pub enum SyntheticLoadMode {
 
 #[cfg(feature = "synthetic-load")]
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyntheticTransport {
+    Tcp,
+    Utp,
+}
+
+#[cfg(feature = "synthetic-load")]
+impl SyntheticTransport {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Utp => "utp",
+        }
+    }
+}
+
+#[cfg(feature = "synthetic-load")]
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyntheticLoadAddMode {
     Upfront,
     Burst,
@@ -258,6 +275,13 @@ pub struct SyntheticBenchmarkArgs {
     pub leecher_pipeline: usize,
     #[arg(long, default_value_t = 1.0)]
     pub target_gbps: f64,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = SyntheticTransport::Tcp,
+        help = "Transport used by the synthetic peer harness"
+    )]
+    pub transport: SyntheticTransport,
     #[arg(long, default_value_t = 1000)]
     pub peer_add_interval_ms: u64,
     #[arg(long, default_value_t = 10)]
@@ -356,6 +380,13 @@ pub struct SyntheticLoadArgs {
     pub leecher_pipeline: usize,
     #[arg(long)]
     pub target_gbps: Option<f64>,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = SyntheticTransport::Tcp,
+        help = "Transport used by the synthetic peer harness"
+    )]
+    pub transport: SyntheticTransport,
     #[arg(long)]
     pub peer_connection_permits: Option<usize>,
     #[arg(long, default_value_t = 256)]

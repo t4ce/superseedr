@@ -3,6 +3,7 @@
 
 pub mod protocol;
 pub mod session;
+pub mod shared_udp;
 pub mod transport;
 pub mod utp;
 pub mod web_seed_worker;
@@ -11,4 +12,4 @@ pub mod web_seed_worker;
 pub use protocol::BlockInfo;
 pub use session::{ConnectionType, PeerSession};
 pub use transport::{PeerConnection, TcpPeerTransport};
-pub use utp::UtpPeerTransport;
+pub use utp::{UtpListenerSet, UtpPeerTransport};

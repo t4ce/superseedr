@@ -317,7 +317,7 @@ impl PeerSession {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let manager_tx = self.torrent_manager_tx.clone();
 
-        let _result: Result<(), Box<dyn StdError + Send + Sync>> = 'session: loop {
+        let result: Result<(), Box<dyn StdError + Send + Sync>> = 'session: loop {
             tokio::select! {
                 // Timeout Check
                 _ = &mut inactivity_timeout => break 'session Err("Timeout".into()),
@@ -493,7 +493,7 @@ impl PeerSession {
             }
         };
 
-        Ok(())
+        result
     }
 
     fn process_manager_command(
