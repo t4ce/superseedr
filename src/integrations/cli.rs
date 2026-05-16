@@ -210,6 +210,7 @@ pub enum SyntheticLoadMode {
 pub enum SyntheticTransport {
     Tcp,
     Utp,
+    All,
 }
 
 #[cfg(feature = "synthetic-load")]
@@ -218,6 +219,7 @@ impl SyntheticTransport {
         match self {
             Self::Tcp => "tcp",
             Self::Utp => "utp",
+            Self::All => "all",
         }
     }
 }
@@ -278,8 +280,8 @@ pub struct SyntheticBenchmarkArgs {
     #[arg(
         long,
         value_enum,
-        default_value_t = SyntheticTransport::Tcp,
-        help = "Transport used by the synthetic peer harness"
+        default_value_t = SyntheticTransport::All,
+        help = "Transport mode used by the synthetic peer harness"
     )]
     pub transport: SyntheticTransport,
     #[arg(long, default_value_t = 1000)]
@@ -383,8 +385,8 @@ pub struct SyntheticLoadArgs {
     #[arg(
         long,
         value_enum,
-        default_value_t = SyntheticTransport::Tcp,
-        help = "Transport used by the synthetic peer harness"
+        default_value_t = SyntheticTransport::All,
+        help = "Transport mode used by the synthetic peer harness"
     )]
     pub transport: SyntheticTransport,
     #[arg(long)]

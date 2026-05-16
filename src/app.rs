@@ -184,29 +184,47 @@ pub struct ListenerSet {
     utp: Option<UtpListenerSet>,
 }
 
-const UTP_ONLY_ENV: &str = "SUPERSEEDR_UTP_ONLY";
+const PEER_TRANSPORT_ENV: &str = "SUPERSEEDR_PEER_TRANSPORT";
 
-fn tcp_peer_listener_enabled_from_env() -> bool {
-    tcp_peer_listener_enabled(app_env_flag(UTP_ONLY_ENV))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerListenerTransportMode {
+    Tcp,
+    Utp,
+    All,
 }
 
-fn tcp_peer_listener_enabled(utp_only: bool) -> bool {
-    !utp_only
+fn tcp_peer_listener_enabled_from_env() -> bool {
+    tcp_peer_listener_enabled(peer_listener_transport_mode_from_env())
+}
+
+fn tcp_peer_listener_enabled(mode: PeerListenerTransportMode) -> bool {
+    matches!(
+        mode,
+        PeerListenerTransportMode::Tcp | PeerListenerTransportMode::All
+    )
 }
 
 fn utp_peer_listener_enabled_from_env() -> bool {
-    app_env_flag("SUPERSEEDR_ENABLE_UTP") || app_env_flag(UTP_ONLY_ENV)
+    matches!(
+        peer_listener_transport_mode_from_env(),
+        PeerListenerTransportMode::Utp | PeerListenerTransportMode::All
+    )
 }
 
-fn app_env_flag(name: &str) -> bool {
-    std::env::var(name)
-        .map(|value| {
-            matches!(
-                value.to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+fn peer_listener_transport_mode_from_env() -> PeerListenerTransportMode {
+    match std::env::var(PEER_TRANSPORT_ENV) {
+        Ok(value) => peer_listener_transport_mode(&value),
+        Err(_) => PeerListenerTransportMode::All,
+    }
+}
+
+fn peer_listener_transport_mode(value: &str) -> PeerListenerTransportMode {
+    match value.to_ascii_lowercase().as_str() {
+        "tcp" => PeerListenerTransportMode::Tcp,
+        "utp" => PeerListenerTransportMode::Utp,
+        "all" => PeerListenerTransportMode::All,
+        _ => PeerListenerTransportMode::All,
+    }
 }
 
 async fn bind_peer_listener(port: u16) -> io::Result<Option<ListenerSet>> {
@@ -232,7 +250,7 @@ impl ListenerSet {
         } else {
             tracing_event!(
                 Level::INFO,
-                "TCP peer listener disabled by SUPERSEEDR_UTP_ONLY"
+                "TCP peer listener disabled by peer transport mode"
             );
             (None, None)
         };
@@ -7923,14 +7941,14 @@ mod tests {
         torrent_completion_percent, torrent_is_effectively_incomplete, App, AppClusterRole,
         AppCommand, AppMode, AppRuntimeMode, AppState, ColumnId, CommandIngestResult, DataRate,
         DhtWaveTargets, DhtWaveUiState, DiskBackpressureDecision, DiskBackpressureDownloadThrottle,
-        DiskBackpressureSample, FilePriority, IngestSource, ListenerSet, PeerInfo, PeerSortColumn,
-        PersistPayload, SelectedHeader, SortDirection, SwarmAvailabilityFlashState,
-        TorrentControlState, TorrentDisplayState, TorrentMetrics, TorrentPreviewPayload,
-        TorrentSortColumn, UiState, BITTORRENT_PROTOCOL_STR, DHT_WAVE_PHASE_WRAP_PERIOD,
-        DISK_WRITE_THROTTLE_MIN_BYTES_PER_SEC, DISK_WRITE_THROTTLE_START_BYTES_PER_SEC,
-        DISK_WRITE_THROTTLE_STEP_MAX, DISK_WRITE_THROTTLE_STEP_MIN,
-        DISK_WRITE_THROTTLE_TARGET_LATENCY_SECS, DISK_WRITE_THROTTLE_WINDOW_TICKS,
-        SWARM_AVAILABILITY_FLASH_DURATION,
+        DiskBackpressureSample, FilePriority, IngestSource, ListenerSet, PeerInfo,
+        PeerListenerTransportMode, PeerSortColumn, PersistPayload, SelectedHeader, SortDirection,
+        SwarmAvailabilityFlashState, TorrentControlState, TorrentDisplayState, TorrentMetrics,
+        TorrentPreviewPayload, TorrentSortColumn, UiState, BITTORRENT_PROTOCOL_STR,
+        DHT_WAVE_PHASE_WRAP_PERIOD, DISK_WRITE_THROTTLE_MIN_BYTES_PER_SEC,
+        DISK_WRITE_THROTTLE_START_BYTES_PER_SEC, DISK_WRITE_THROTTLE_STEP_MAX,
+        DISK_WRITE_THROTTLE_STEP_MIN, DISK_WRITE_THROTTLE_TARGET_LATENCY_SECS,
+        DISK_WRITE_THROTTLE_WINDOW_TICKS, SWARM_AVAILABILITY_FLASH_DURATION,
     };
     use crate::config::{
         clear_shared_config_state_for_tests, set_app_paths_override_for_tests, TorrentSettings,
@@ -7962,8 +7980,9 @@ mod tests {
 
     #[test]
     fn utp_only_mode_disables_tcp_peer_listener() {
-        assert!(!tcp_peer_listener_enabled(true));
-        assert!(tcp_peer_listener_enabled(false));
+        assert!(!tcp_peer_listener_enabled(PeerListenerTransportMode::Utp));
+        assert!(tcp_peer_listener_enabled(PeerListenerTransportMode::Tcp));
+        assert!(tcp_peer_listener_enabled(PeerListenerTransportMode::All));
     }
 
     fn mock_display(name: &str, peer_count: usize) -> TorrentDisplayState {

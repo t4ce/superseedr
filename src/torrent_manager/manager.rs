@@ -102,9 +102,15 @@ const UTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 const BASE_BACKOFF_MS: u64 = 1000;
 const JITTER_MS: u64 = 100;
-const ENABLE_UTP_ENV: &str = "SUPERSEEDR_ENABLE_UTP";
-const UTP_ONLY_ENV: &str = "SUPERSEEDR_UTP_ONLY";
+const PEER_TRANSPORT_ENV: &str = "SUPERSEEDR_PEER_TRANSPORT";
 const UTP_CONNECT_LOG_ENV: &str = "SUPERSEEDR_LOG_UTP_CONNECT";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerTransportMode {
+    Tcp,
+    Utp,
+    All,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct OutboundTransportMode {
@@ -113,17 +119,43 @@ struct OutboundTransportMode {
 }
 
 fn outbound_transport_mode_from_env() -> OutboundTransportMode {
-    outbound_transport_mode(env_flag(ENABLE_UTP_ENV), env_flag(UTP_ONLY_ENV))
+    outbound_transport_mode(peer_transport_mode_from_env())
 }
 
 fn utp_connect_log_enabled() -> bool {
     env_flag(UTP_CONNECT_LOG_ENV)
 }
 
-fn outbound_transport_mode(enable_utp: bool, utp_only: bool) -> OutboundTransportMode {
-    OutboundTransportMode {
-        try_utp: enable_utp || utp_only,
-        allow_tcp: !utp_only,
+fn outbound_transport_mode(mode: PeerTransportMode) -> OutboundTransportMode {
+    match mode {
+        PeerTransportMode::Tcp => OutboundTransportMode {
+            try_utp: false,
+            allow_tcp: true,
+        },
+        PeerTransportMode::Utp => OutboundTransportMode {
+            try_utp: true,
+            allow_tcp: false,
+        },
+        PeerTransportMode::All => OutboundTransportMode {
+            try_utp: true,
+            allow_tcp: true,
+        },
+    }
+}
+
+fn peer_transport_mode_from_env() -> PeerTransportMode {
+    match std::env::var(PEER_TRANSPORT_ENV) {
+        Ok(value) => peer_transport_mode(&value),
+        Err(_) => PeerTransportMode::All,
+    }
+}
+
+fn peer_transport_mode(value: &str) -> PeerTransportMode {
+    match value.to_ascii_lowercase().as_str() {
+        "tcp" => PeerTransportMode::Tcp,
+        "utp" => PeerTransportMode::Utp,
+        "all" => PeerTransportMode::All,
+        _ => PeerTransportMode::All,
     }
 }
 
@@ -3514,9 +3546,20 @@ mod tests {
     use tokio::sync::{broadcast, mpsc, watch};
 
     #[test]
-    fn utp_only_mode_disables_tcp_fallback() {
+    fn tcp_transport_mode_disables_utp() {
         assert_eq!(
-            outbound_transport_mode(false, true),
+            outbound_transport_mode(PeerTransportMode::Tcp),
+            OutboundTransportMode {
+                try_utp: false,
+                allow_tcp: true,
+            }
+        );
+    }
+
+    #[test]
+    fn utp_transport_mode_disables_tcp_fallback() {
+        assert_eq!(
+            outbound_transport_mode(PeerTransportMode::Utp),
             OutboundTransportMode {
                 try_utp: true,
                 allow_tcp: false,
@@ -3525,9 +3568,9 @@ mod tests {
     }
 
     #[test]
-    fn enabled_utp_mode_keeps_tcp_fallback() {
+    fn all_transport_mode_keeps_tcp_fallback() {
         assert_eq!(
-            outbound_transport_mode(true, false),
+            outbound_transport_mode(PeerTransportMode::All),
             OutboundTransportMode {
                 try_utp: true,
                 allow_tcp: true,
@@ -3536,7 +3579,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enabled_utp_mode_races_tcp_fallback() {
+    async fn all_transport_mode_races_tcp_fallback() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let peer_addr = listener.local_addr().unwrap();
         let accept_task = tokio::spawn(async move {

@@ -15,6 +15,10 @@ The harness is intended for engineering validation:
 It is not part of the default production build. Build with
 `--features synthetic-load` to expose these commands.
 
+Use `--transport tcp`, `--transport utp`, or `--transport all` to force the
+synthetic peer transport mode. The default is `all`, matching the normal runtime
+behavior where TCP and uTP are both enabled.
+
 ## Benchmark Mode
 
 `benchmark` is the high-level adaptive wrapper around the lower-level synthetic

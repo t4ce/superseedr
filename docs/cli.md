@@ -370,6 +370,7 @@ Common options:
 - `--size-per-torrent`
 - `--piece-size`
 - `--target-gbps`
+- `--transport tcp|utp|all`
 - `--issue-retries`
 - `--retry-delay-ms`
 - `--out`
