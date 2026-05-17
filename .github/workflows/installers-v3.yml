@@ -100,9 +100,18 @@ jobs:
         shell: pwsh
         run: |
           $flavor = "${{ matrix.suffix }}"
+          Remove-Item -LiteralPath "target/installer/windows" -Recurse -Force -ErrorAction SilentlyContinue
+
           .\scripts\build_windows_user_installer.ps1 -Flavor $flavor -SkipBuild -Backend inno
 
           $exe = Get-ChildItem -Path "target/installer/windows" -Filter "*.exe" |
+            Where-Object {
+              if ($flavor -eq "private") {
+                $_.Name -like "superseedr-private-*-x64-setup.exe"
+              } else {
+                $_.Name -like "superseedr-*-x64-setup.exe" -and $_.Name -notlike "superseedr-private-*"
+              }
+            } |
             Sort-Object LastWriteTime -Descending |
             Select-Object -First 1
           if ($null -eq $exe) {
