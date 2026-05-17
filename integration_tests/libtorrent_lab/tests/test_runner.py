@@ -12,6 +12,7 @@ from integration_tests.libtorrent_lab.run import (
     _superseedr_download_path,
     _validate_superseedr_transport_observations,
     _validate_download,
+    _validate_download_set,
 )
 
 
@@ -28,6 +29,8 @@ def test_load_basic_scenario() -> None:
     assert scenario.leech_client == CLIENT_LIBTORRENT
     assert scenario.mode == "v1"
     assert scenario.seed_listen_port != scenario.leech_listen_port
+    assert scenario.libtorrent_seed_count == 1
+    assert scenario.libtorrent_leech_count == 1
     assert scenario.libtorrent_settings["enable_dht"] is False
 
 
@@ -98,6 +101,24 @@ def test_load_directory_and_mode_scenarios() -> None:
         assert scenario.payload == payload
         assert scenario.download_name == payload
         assert scenario.superseedr_peer_transport == "tcp"
+
+
+def test_load_fanout_scenarios() -> None:
+    superseedr_seed = LabScenario.from_file(
+        Path("integration_tests/libtorrent_lab/scenarios/superseedr_to_libtorrent_tcp_fanout.json")
+    )
+    libtorrent_seed = LabScenario.from_file(
+        Path("integration_tests/libtorrent_lab/scenarios/libtorrent_to_superseedr_tcp_fanout.json")
+    )
+
+    assert superseedr_seed.seed_client == CLIENT_SUPERSEEDR
+    assert superseedr_seed.leech_client == CLIENT_LIBTORRENT
+    assert superseedr_seed.libtorrent_seed_count == 1
+    assert superseedr_seed.libtorrent_leech_count == 3
+    assert libtorrent_seed.seed_client == CLIENT_LIBTORRENT
+    assert libtorrent_seed.leech_client == CLIENT_SUPERSEEDR
+    assert libtorrent_seed.libtorrent_seed_count == 3
+    assert libtorrent_seed.libtorrent_leech_count == 1
 
 
 def test_superseedr_lab_uses_fast_lab_image() -> None:
@@ -187,6 +208,23 @@ def test_validate_download_reports_missing_file(tmp_path: Path) -> None:
 
     assert report["ok"] is False
     assert report["issues"] == ["missing missing.bin"]
+
+
+def test_validate_download_set_reports_all_participants(tmp_path: Path) -> None:
+    expected = tmp_path / "expected.bin"
+    one = tmp_path / "one.bin"
+    two = tmp_path / "two.bin"
+    expected.write_bytes(b"fanout")
+    one.write_bytes(b"fanout")
+    two.write_bytes(b"different")
+
+    report = _validate_download_set({"one": one, "two": two}, expected)
+
+    assert report["ok"] is False
+    assert report["participant_count"] == 2
+    assert report["participants"]["one"]["ok"] is True
+    assert report["participants"]["two"]["ok"] is False
+    assert report["issues"][0].startswith("two: size expected=6 actual=9")
 
 
 def test_validate_download_reports_directory_hash_match(tmp_path: Path) -> None:

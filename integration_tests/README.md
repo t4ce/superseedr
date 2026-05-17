@@ -178,6 +178,8 @@ Initial scenario names:
 - `libtorrent_to_superseedr_v1_nested`
 - `superseedr_to_libtorrent_v2_multi_file`
 - `libtorrent_to_superseedr_hybrid_nested`
+- `superseedr_to_libtorrent_tcp_fanout`
+- `libtorrent_to_superseedr_tcp_fanout`
 
 Artifacts are written under:
 

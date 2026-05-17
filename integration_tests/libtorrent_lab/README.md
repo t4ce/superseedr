@@ -59,6 +59,13 @@ torrents without widening into a full matrix:
 ./integration_tests/run_libtorrent_lab.sh libtorrent_to_superseedr_hybrid_nested
 ```
 
+Fanout scenarios activate three libtorrent peers on one side:
+
+```bash
+./integration_tests/run_libtorrent_lab.sh superseedr_to_libtorrent_tcp_fanout
+./integration_tests/run_libtorrent_lab.sh libtorrent_to_superseedr_tcp_fanout
+```
+
 The Superseedr containers use `docker/Dockerfile.superseedr`, which builds a
 debug binary for fast lab iteration instead of the production release image.
 
@@ -82,9 +89,10 @@ Important files:
 Scenarios live in `integration_tests/libtorrent_lab/scenarios/*.json`.
 
 Each scenario declares seed/leech client types, one torrent, one payload file,
-listen ports, timeout, Superseedr peer transport, and the libtorrent settings
-applied to libtorrent peers. The libtorrent peer process takes a generated
-`/config/peer.json` and writes JSON status plus JSONL events to `/artifacts`.
+listen ports, timeout, optional libtorrent seed/leech counts, Superseedr peer
+transport, and the libtorrent settings applied to libtorrent peers. The
+libtorrent peer process takes a generated `/config/peer.json` and writes JSON
+status plus JSONL events to `/artifacts`.
 
 Future scenarios should add knobs to the scenario manifest rather than baking
 new topology assumptions into the runner.

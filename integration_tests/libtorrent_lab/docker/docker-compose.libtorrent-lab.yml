@@ -24,6 +24,32 @@ services:
     depends_on:
       - tracker
 
+  libtorrent_seed_2:
+    image: superseedr-libtorrent-lab-peer:bookworm
+    init: true
+    environment:
+      - LIBTORRENT_LAB_CONFIG=/config/peer.json
+    volumes:
+      - ${LIBTORRENT_LAB_FIXTURES_PATH}:/fixtures:ro
+      - ${LIBTORRENT_LAB_SEED_DATA_PATH_2}:/data
+      - ${LIBTORRENT_LAB_SEED_CONFIG_PATH_2}:/config:ro
+      - ${LIBTORRENT_LAB_SEED_ARTIFACTS_PATH_2}:/artifacts
+    depends_on:
+      - tracker
+
+  libtorrent_seed_3:
+    image: superseedr-libtorrent-lab-peer:bookworm
+    init: true
+    environment:
+      - LIBTORRENT_LAB_CONFIG=/config/peer.json
+    volumes:
+      - ${LIBTORRENT_LAB_FIXTURES_PATH}:/fixtures:ro
+      - ${LIBTORRENT_LAB_SEED_DATA_PATH_3}:/data
+      - ${LIBTORRENT_LAB_SEED_CONFIG_PATH_3}:/config:ro
+      - ${LIBTORRENT_LAB_SEED_ARTIFACTS_PATH_3}:/artifacts
+    depends_on:
+      - tracker
+
   libtorrent_leech:
     image: superseedr-libtorrent-lab-peer:bookworm
     init: true
@@ -34,6 +60,32 @@ services:
       - ${LIBTORRENT_LAB_LEECH_DATA_PATH}:/data
       - ${LIBTORRENT_LAB_LEECH_CONFIG_PATH}:/config:ro
       - ${LIBTORRENT_LAB_LEECH_ARTIFACTS_PATH}:/artifacts
+    depends_on:
+      - tracker
+
+  libtorrent_leech_2:
+    image: superseedr-libtorrent-lab-peer:bookworm
+    init: true
+    environment:
+      - LIBTORRENT_LAB_CONFIG=/config/peer.json
+    volumes:
+      - ${LIBTORRENT_LAB_FIXTURES_PATH}:/fixtures:ro
+      - ${LIBTORRENT_LAB_LEECH_DATA_PATH_2}:/data
+      - ${LIBTORRENT_LAB_LEECH_CONFIG_PATH_2}:/config:ro
+      - ${LIBTORRENT_LAB_LEECH_ARTIFACTS_PATH_2}:/artifacts
+    depends_on:
+      - tracker
+
+  libtorrent_leech_3:
+    image: superseedr-libtorrent-lab-peer:bookworm
+    init: true
+    environment:
+      - LIBTORRENT_LAB_CONFIG=/config/peer.json
+    volumes:
+      - ${LIBTORRENT_LAB_FIXTURES_PATH}:/fixtures:ro
+      - ${LIBTORRENT_LAB_LEECH_DATA_PATH_3}:/data
+      - ${LIBTORRENT_LAB_LEECH_CONFIG_PATH_3}:/config:ro
+      - ${LIBTORRENT_LAB_LEECH_ARTIFACTS_PATH_3}:/artifacts
     depends_on:
       - tracker
 
