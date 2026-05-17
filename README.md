@@ -34,7 +34,7 @@ Superseedr is a modern Rust BitTorrent client featuring a high-performance termi
 ## Installation
 
 Download platform-specific installers from the [releases page](https://github.com/Jagalite/superseedr/releases) **(includes browser magnet link support)**:
-- Windows: `.msi` installer
+- Windows: `.exe` per-user installer (no admin) or `.msi` installer
 - macOS: `.pkg` installer  
 - Debian/Ubuntu: `.deb` package
 
@@ -455,7 +455,6 @@ Superseedr implements the following BitTorrent Enhancement Proposals (BEPs):
 * **BEP 52:** The BitTorrent Protocol v2
 
 </details>
-
 
 
 

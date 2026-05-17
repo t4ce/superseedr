@@ -300,9 +300,11 @@ jobs:
         
   build_windows:
     timeout-minutes: 120
-    name: Build Windows MSI (${{ matrix.suffix }})
+    name: Build Windows Installers (${{ matrix.suffix }})
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: windows-latest
+    env:
+      WINDOWS_CERT_AVAILABLE: ${{ secrets.WINDOWS_CERT_P12_BASE64 != '' }}
     strategy:
       matrix:
         include:
@@ -327,14 +329,26 @@ jobs:
         run: rustup target add x86_64-pc-windows-msvc
         
       - name: Install WiX Toolset v3
-        run: choco install wixtoolset
+        run: choco install wixtoolset --no-progress -y
         
       - name: Install cargo-wix
-        run: cargo install cargo-wix
-        
+        shell: pwsh
+        run: |
+          if (Get-Command cargo-wix -ErrorAction SilentlyContinue) {
+            Write-Host "Using cached cargo-wix"
+            cargo wix --version
+          } else {
+            cargo install cargo-wix
+          }
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
       - name: Build MSI Installer (${{ matrix.suffix }})
         id: build_msi
+        shell: pwsh
         run: |
+          Remove-Item -LiteralPath "target/wix" -Recurse -Force -ErrorAction SilentlyContinue
 
           if ("${{ matrix.flags }}" -eq "") {
             # For the "normal" build, just run the default command.
@@ -355,14 +369,47 @@ jobs:
 
           
           # Update the path: 'cargo wix' outputs to 'target/wix'
-          $MSI_FILE = Get-ChildItem -Path "target/wix" -Filter "*.msi" | Select-Object -First 1
+          $MSI_FILE = Get-ChildItem -Path "target/wix" -Filter "*.msi" |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
           if ($null -eq $MSI_FILE) { echo "::error:: No .msi file found"; exit 1; }
           echo "msi_path=$($MSI_FILE.FullName)" >> $env:GITHUB_OUTPUT
 
-      - name: Sign MSI Installer (if secret is present)
+      - name: Build per-user EXE Installer (${{ matrix.suffix }})
+        id: build_exe
+        shell: pwsh
+        run: |
+          $VERSION_TAG = "${{ github.ref_name }}"
+          $INSTALLER_VERSION = $VERSION_TAG -replace '^[vV]', ''
+          if (-not $INSTALLER_VERSION) {
+            $INSTALLER_VERSION = $VERSION_TAG
+          }
+
+          $flavor = "${{ matrix.suffix }}"
+          Remove-Item -LiteralPath "target/installer/windows" -Recurse -Force -ErrorAction SilentlyContinue
+
+          .\scripts\build_windows_user_installer.ps1 -Flavor $flavor -Version $INSTALLER_VERSION -SkipBuild -Backend inno
+
+          $exe = Get-ChildItem -Path "target/installer/windows" -Filter "*.exe" |
+            Where-Object {
+              if ($flavor -eq "private") {
+                $_.Name -like "superseedr-private-*-x64-setup.exe"
+              } else {
+                $_.Name -like "superseedr-*-x64-setup.exe" -and $_.Name -notlike "superseedr-private-*"
+              }
+            } |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if ($null -eq $exe) {
+            echo "::error:: No .exe installer found in target/installer/windows"
+            exit 1
+          }
+          echo "exe_path=$($exe.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Sign Windows Installers (if secret is present)
         # This step will be SKIPPED if the secret is empty
-        if: env.WINDOWS_CERT_P12_BASE64 != ''
-        id: sign_msi
+        if: env.WINDOWS_CERT_AVAILABLE == 'true'
+        id: sign_windows
         env:
           WINDOWS_CERT_P12_BASE64: ${{ secrets.WINDOWS_CERT_P12_BASE64 }}
           WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
@@ -370,9 +417,6 @@ jobs:
         run: |
           # Decode the certificate
           [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($env:WINDOWS_CERT_P12_BASE64)) | Out-File -FilePath windows.pfx -Encoding OEM
-          
-          $MSI_PATH = "${{ steps.build_msi.outputs.msi_path }}"
-          echo "Signing $MSI_PATH..."
           
           # Find signtool.exe (it's part of the Windows SDK)
           $SIGNTOOL_PATH = (Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\bin" -Filter "signtool.exe" -Recurse | Sort-Object VersionInfo -Descending | Select-Object -First 1).FullName
@@ -382,38 +426,57 @@ jobs:
           }
           echo "Using signtool at $SIGNTOOL_PATH"
 
-          # Sign the file
-          & $SIGNTOOL_PATH sign /f "windows.pfx" /p $env:WINDOWS_CERT_PASSWORD /tr http://timestamp.digicert.com /td SHA256 $MSI_PATH
+          $INSTALLERS = @(
+            "${{ steps.build_msi.outputs.msi_path }}",
+            "${{ steps.build_exe.outputs.exe_path }}"
+          )
+          foreach ($INSTALLER_PATH in $INSTALLERS) {
+            echo "Signing $INSTALLER_PATH..."
+            & $SIGNTOOL_PATH sign /f "windows.pfx" /p $env:WINDOWS_CERT_PASSWORD /tr http://timestamp.digicert.com /td SHA256 $INSTALLER_PATH
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
+          }
           
           # Clean up
           Remove-Item windows.pfx
 
-      - name: Stage MSI
+      - name: Stage Windows Installers
         shell: pwsh
         run: |
           # Use the git tag for the version, not the Cargo.toml version
           $VERSION_TAG = "${{ github.ref_name }}"
           $MSI_FILE_PATH = "${{ steps.build_msi.outputs.msi_path }}"
+          $EXE_FILE_PATH = "${{ steps.build_exe.outputs.exe_path }}"
           
           $SUFFIX = "${{ matrix.suffix }}"
           if ($SUFFIX -eq "normal") {
               $MSI_NAME = "${{ env.APP_NAME }}_${VERSION_TAG}_x64_en-US.msi"
+              $EXE_NAME = "${{ env.APP_NAME }}-${VERSION_TAG}-x64-setup.exe"
           } else {
               $MSI_NAME = "${{ env.APP_NAME }}-${SUFFIX}_${VERSION_TAG}_x64_en-US.msi"
+              $EXE_NAME = "${{ env.APP_NAME }}-${SUFFIX}-${VERSION_TAG}-x64-setup.exe"
           }
-          mkdir staging
-          $DEST_PATH = "staging/$MSI_NAME"
-          echo "Moving $MSI_FILE_PATH to $DEST_PATH"
-          mv $MSI_FILE_PATH $DEST_PATH
-          
+          New-Item -ItemType Directory -Force -Path staging | Out-Null
+
+          $MSI_DEST_PATH = "staging/$MSI_NAME"
+          $EXE_DEST_PATH = "staging/$EXE_NAME"
+          echo "Moving $MSI_FILE_PATH to $MSI_DEST_PATH"
+          mv $MSI_FILE_PATH $MSI_DEST_PATH
+          echo "Moving $EXE_FILE_PATH to $EXE_DEST_PATH"
+          mv $EXE_FILE_PATH $EXE_DEST_PATH
+
+          Get-ChildItem staging | Format-Table Name, Length, LastWriteTime
+
           # Output the final staged name for the release body
           echo "final_msi_name=$MSI_NAME" >> $env:GITHUB_OUTPUT
+          echo "final_exe_name=$EXE_NAME" >> $env:GITHUB_OUTPUT
 
-      - name: Upload Windows MSI Artifact
+      - name: Upload Windows Installer Artifacts
         uses: actions/upload-artifact@v7
         with:
           name: superseedr-windows-${{ matrix.suffix }}-${{ github.ref_name }}
-          path: staging/*.msi
+          path: staging/*
 
   build_and_push_docker: 
     name: Docker (${{ matrix.flavor }})
@@ -497,6 +560,7 @@ jobs:
             ## Standard Builds (Recommended)
             * **macOS Universal:** [superseedr-${{ env.RELEASE_VERSION }}-universal-macos.pkg](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr-${{ env.RELEASE_VERSION }}-universal-macos.pkg)
             * **Linux (Debian):** [superseedr_${{ env.RELEASE_VERSION }}_amd64.deb](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr_${{ env.RELEASE_VERSION }}_amd64.deb)
+            * **Windows (EXE, no admin):** [superseedr-${{ env.RELEASE_VERSION }}-x64-setup.exe](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr-${{ env.RELEASE_VERSION }}-x64-setup.exe)
             * **Windows (MSI):** [superseedr_${{ env.RELEASE_VERSION }}_x64_en-US.msi](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr_${{ env.RELEASE_VERSION }}_x64_en-US.msi)
             ---
             ## Private Builds (Advanced)
@@ -504,10 +568,12 @@ jobs:
             
             * **macOS Universal:** [superseedr-${{ env.RELEASE_VERSION }}-private-universal-macos.pkg](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr-${{ env.RELEASE_VERSION }}-private-universal-macos.pkg)
             * **Linux (Debian):** [superseedr-private_${{ env.RELEASE_VERSION }}_amd64.deb](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr-private_${{ env.RELEASE_VERSION }}_amd64.deb)
+            * **Windows (EXE, no admin):** [superseedr-private-${{ env.RELEASE_VERSION }}-x64-setup.exe](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr-private-${{ env.RELEASE_VERSION }}-x64-setup.exe)
             * **Windows (MSI):** [superseedr-private_${{ env.RELEASE_VERSION }}_x64_en-US.msi](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr-private_${{ env.RELEASE_VERSION }}_x64_en-US.msi)
           files: |
             artifacts/superseedr-linux-amd64-*-${{ github.ref_name }}/*.deb
             artifacts/superseedr-macos-*-universal-${{ github.ref_name }}/*.pkg
+            artifacts/superseedr-windows-*-${{ github.ref_name }}/*.exe
             artifacts/superseedr-windows-*-${{ github.ref_name }}/*.msi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
