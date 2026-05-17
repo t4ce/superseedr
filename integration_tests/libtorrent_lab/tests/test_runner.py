@@ -10,6 +10,8 @@ from integration_tests.libtorrent_lab.run import (
     _client_payload_path,
     _matrix_markdown,
     _netem_command,
+    _profile_for_name,
+    _profile_markdown,
     _project_name,
     _scenario_names_for_matrix,
     _superseedr_seed_is_ready,
@@ -138,6 +140,23 @@ def test_matrix_scenario_sets_are_stable() -> None:
     assert len(_scenario_names_for_matrix("full")) == 11
 
 
+def test_profile_presets_are_stable() -> None:
+    quick = _profile_for_name("quick")
+    premerge = _profile_for_name("premerge")
+    stress = _profile_for_name("stress")
+    soak = _profile_for_name("soak")
+
+    assert [step.matrix for step in quick.steps] == ["smoke"]
+    assert [step.name for step in premerge.steps] == [
+        "clean_full",
+        "mild_netem_transport",
+    ]
+    assert premerge.steps[1].network_impairment.enabled() is True
+    assert stress.steps[0].repeat == 2
+    assert stress.steps[1].matrix == "fanout"
+    assert soak.steps[0].repeat > stress.steps[0].repeat
+
+
 def test_netem_command_includes_impairment_knobs() -> None:
     command = _netem_command(
         NetworkImpairment(
@@ -206,6 +225,51 @@ def test_matrix_markdown_summarizes_results() -> None:
 
     assert "Result: FAIL" in markdown
     assert "| basic_ul_dl | 2 | FAIL | 4.0s | `/tmp/lab/two` |" in markdown
+
+
+def test_profile_markdown_summarizes_steps() -> None:
+    markdown = _profile_markdown(
+        {
+            "profile": "premerge",
+            "description": "Full clean matrix plus a mild impaired transport pass.",
+            "ok": True,
+            "step_count": 2,
+            "completed_steps": 2,
+            "attempt_count": 15,
+            "passed_attempts": 15,
+            "failed_attempts": 0,
+            "duration_secs": 42.0,
+            "artifacts_dir": "/tmp/profile",
+            "steps": [
+                {
+                    "name": "clean_full",
+                    "matrix": "full",
+                    "ok": True,
+                    "repeat_count": 1,
+                    "attempt_count": 11,
+                    "failed_attempts": 0,
+                    "duration_secs": 30.0,
+                    "artifacts_dir": "/tmp/profile/clean",
+                    "network_impairment": {"enabled": False},
+                },
+                {
+                    "name": "mild_netem_transport",
+                    "matrix": "transport",
+                    "ok": True,
+                    "repeat_count": 1,
+                    "attempt_count": 4,
+                    "failed_attempts": 0,
+                    "duration_secs": 12.0,
+                    "artifacts_dir": "/tmp/profile/netem",
+                    "network_impairment": {"enabled": True},
+                },
+            ],
+        }
+    )
+
+    assert "Libtorrent Lab Profile: premerge" in markdown
+    assert "| clean_full | full | PASS | 1 | 11 | 0 | off | 30.0s | `/tmp/profile/clean` |" in markdown
+    assert "| mild_netem_transport | transport | PASS | 1 | 4 | 0 | on | 12.0s | `/tmp/profile/netem` |" in markdown
 
 
 def test_superseedr_lab_uses_fast_lab_image() -> None:

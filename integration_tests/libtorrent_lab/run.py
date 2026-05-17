@@ -160,6 +160,109 @@ def _validate_impairment(config: NetworkImpairment) -> None:
             raise ValueError(f"Network impairment {label} must be in range 0..100")
 
 
+@dataclass(frozen=True)
+class ProfileStep:
+    name: str
+    matrix: str
+    repeat: int = 1
+    fail_fast: bool = True
+    timeout_secs: int | None = None
+    network_impairment: NetworkImpairment = NetworkImpairment()
+
+
+@dataclass(frozen=True)
+class LabProfile:
+    name: str
+    description: str
+    steps: tuple[ProfileStep, ...]
+
+
+LAB_PROFILES: dict[str, LabProfile] = {
+    "quick": LabProfile(
+        name="quick",
+        description="Fast local smoke over direct libtorrent and Superseedr interop.",
+        steps=(
+            ProfileStep(
+                name="smoke",
+                matrix="smoke",
+                fail_fast=True,
+            ),
+        ),
+    ),
+    "premerge": LabProfile(
+        name="premerge",
+        description="Full clean matrix plus a mild impaired transport pass.",
+        steps=(
+            ProfileStep(
+                name="clean_full",
+                matrix="full",
+                fail_fast=True,
+            ),
+            ProfileStep(
+                name="mild_netem_transport",
+                matrix="transport",
+                fail_fast=True,
+                network_impairment=NetworkImpairment(
+                    delay_ms=20,
+                    jitter_ms=5,
+                    loss_pct=0.2,
+                ),
+            ),
+        ),
+    ),
+    "stress": LabProfile(
+        name="stress",
+        description="Repeat the full matrix and exercise fanout with moderate impairment.",
+        steps=(
+            ProfileStep(
+                name="repeat_full",
+                matrix="full",
+                repeat=2,
+                fail_fast=True,
+            ),
+            ProfileStep(
+                name="impaired_fanout",
+                matrix="fanout",
+                repeat=3,
+                fail_fast=True,
+                network_impairment=NetworkImpairment(
+                    delay_ms=50,
+                    jitter_ms=10,
+                    loss_pct=0.5,
+                    duplicate_pct=0.1,
+                    reorder_pct=1.0,
+                ),
+            ),
+        ),
+    ),
+    "soak": LabProfile(
+        name="soak",
+        description="Longer repeat profile for local or scheduled endurance runs.",
+        steps=(
+            ProfileStep(
+                name="repeat_full",
+                matrix="full",
+                repeat=5,
+                fail_fast=True,
+            ),
+            ProfileStep(
+                name="impaired_transport",
+                matrix="transport",
+                repeat=5,
+                fail_fast=True,
+                network_impairment=NetworkImpairment(
+                    delay_ms=75,
+                    jitter_ms=25,
+                    loss_pct=1.0,
+                    duplicate_pct=0.25,
+                    reorder_pct=2.0,
+                ),
+            ),
+        ),
+    ),
+}
+
+
 def _utc_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
@@ -181,6 +284,14 @@ def _scenario_names_for_matrix(matrix: str) -> list[str]:
     except KeyError as exc:
         known = ", ".join(sorted(LAB_MATRIXES))
         raise ValueError(f"Unknown libtorrent lab matrix {matrix!r}; expected one of: {known}") from exc
+
+
+def _profile_for_name(profile: str) -> LabProfile:
+    try:
+        return LAB_PROFILES[profile]
+    except KeyError as exc:
+        known = ", ".join(sorted(LAB_PROFILES))
+        raise ValueError(f"Unknown libtorrent lab profile {profile!r}; expected one of: {known}") from exc
 
 
 def _libtorrent_service(role: str, index: int) -> str:
@@ -1189,6 +1300,53 @@ def _matrix_markdown(summary: dict[str, object]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _profile_step_result(matrix_summary: dict[str, object], step: ProfileStep) -> dict[str, object]:
+    return {
+        "name": step.name,
+        "matrix": step.matrix,
+        "ok": bool(matrix_summary.get("ok", False)),
+        "repeat_count": matrix_summary.get("repeat_count", step.repeat),
+        "attempt_count": matrix_summary.get("attempt_count", 0),
+        "passed_attempts": matrix_summary.get("passed_attempts", 0),
+        "failed_attempts": matrix_summary.get("failed_attempts", 0),
+        "duration_secs": matrix_summary.get("duration_secs", 0),
+        "artifacts_dir": matrix_summary.get("artifacts_dir", ""),
+        "network_impairment": matrix_summary.get(
+            "network_impairment",
+            step.network_impairment.as_dict(),
+        ),
+    }
+
+
+def _profile_markdown(summary: dict[str, object]) -> str:
+    lines = [
+        f"# Libtorrent Lab Profile: {summary['profile']}",
+        "",
+        f"- Result: {'PASS' if summary['ok'] else 'FAIL'}",
+        f"- Description: {summary['description']}",
+        f"- Steps: {summary['completed_steps']}/{summary['step_count']}",
+        f"- Attempts: {summary['attempt_count']}",
+        f"- Passed attempts: {summary['passed_attempts']}",
+        f"- Failed attempts: {summary['failed_attempts']}",
+        f"- Duration: {summary['duration_secs']}s",
+        f"- Artifacts: `{summary['artifacts_dir']}`",
+        "",
+        "| Step | Matrix | Result | Repeat | Attempts | Failed | Netem | Duration | Artifacts |",
+        "| --- | --- | --- | ---: | ---: | ---: | --- | ---: | --- |",
+    ]
+    for step in summary["steps"]:
+        status = "PASS" if step.get("ok") else "FAIL"
+        impairment = step.get("network_impairment", {})
+        netem = "on" if isinstance(impairment, dict) and impairment.get("enabled") else "off"
+        lines.append(
+            f"| {step['name']} | {step['matrix']} | {status} | "
+            f"{step.get('repeat_count', 0)} | {step.get('attempt_count', 0)} | "
+            f"{step.get('failed_attempts', 0)} | {netem} | "
+            f"{step.get('duration_secs', 0)}s | `{step.get('artifacts_dir', '')}` |"
+        )
+    return "\n".join(lines) + "\n"
+
+
 def run_lab_matrix(
     *,
     matrix: str,
@@ -1285,10 +1443,77 @@ def run_lab_matrix(
     return summary
 
 
+def run_lab_profile(
+    *,
+    profile_name: str,
+    run_id: str,
+    timeout_secs: int | None = None,
+    skip_build: bool = False,
+    repeat_multiplier: int = 1,
+    fail_fast: bool = False,
+    network_impairment_override: NetworkImpairment | None = None,
+) -> dict[str, object]:
+    if repeat_multiplier < 1:
+        raise ValueError("repeat multiplier must be at least 1")
+
+    profile = _profile_for_name(profile_name)
+    paths = resolve_paths()
+    profile_root = paths.artifacts_root / "libtorrent_lab" / run_id
+    profile_root.mkdir(parents=True, exist_ok=True)
+
+    started_at = time.monotonic()
+    step_results: list[dict[str, object]] = []
+    for step in profile.steps:
+        step_impairment = network_impairment_override or step.network_impairment
+        matrix_run_id = f"{run_id}_{step.name}"
+        matrix_summary = run_lab_matrix(
+            matrix=step.matrix,
+            run_id=matrix_run_id,
+            timeout_secs=timeout_secs or step.timeout_secs,
+            skip_build=skip_build,
+            repeat=step.repeat * repeat_multiplier,
+            fail_fast=fail_fast or step.fail_fast,
+            network_impairment=step_impairment,
+        )
+        step_result = _profile_step_result(matrix_summary, step)
+        step_results.append(step_result)
+        print(
+            "LIBTORRENT_LAB_PROFILE_STEP "
+            f"{'PASS' if step_result['ok'] else 'FAIL'} "
+            f"profile={profile.name} step={step.name} matrix={step.matrix} "
+            f"artifacts={step_result['artifacts_dir']}"
+        )
+        if (fail_fast or step.fail_fast) and not step_result["ok"]:
+            break
+
+    failed_steps = sum(1 for step in step_results if step.get("ok") is not True)
+    summary: dict[str, object] = {
+        "run_id": run_id,
+        "profile": profile.name,
+        "description": profile.description,
+        "ok": failed_steps == 0 and len(step_results) == len(profile.steps),
+        "step_count": len(profile.steps),
+        "completed_steps": len(step_results),
+        "passed_steps": sum(1 for step in step_results if step.get("ok") is True),
+        "failed_steps": failed_steps,
+        "attempt_count": sum(int(step.get("attempt_count", 0)) for step in step_results),
+        "passed_attempts": sum(int(step.get("passed_attempts", 0)) for step in step_results),
+        "failed_attempts": sum(int(step.get("failed_attempts", 0)) for step in step_results),
+        "repeat_multiplier": repeat_multiplier,
+        "duration_secs": round(time.monotonic() - started_at, 3),
+        "artifacts_dir": str(profile_root),
+        "steps": step_results,
+    }
+    _write_json(profile_root / "profile_summary.json", summary)
+    (profile_root / "profile_summary.md").write_text(_profile_markdown(summary), encoding="utf-8")
+    return summary
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run Dockerized libtorrent lab scenarios")
     p.add_argument("--scenario", default="basic_ul_dl")
     p.add_argument("--matrix", choices=sorted(LAB_MATRIXES), default="")
+    p.add_argument("--profile", choices=sorted(LAB_PROFILES), default="")
     p.add_argument("--run-id", default="")
     p.add_argument("--timeout-secs", type=int, default=0)
     p.add_argument("--skip-build", action="store_true")
@@ -1305,6 +1530,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.profile and args.matrix:
+        raise SystemExit("Choose only one of --profile or --matrix")
+
     impairment = NetworkImpairment(
         delay_ms=args.netem_delay_ms,
         jitter_ms=args.netem_jitter_ms,
@@ -1314,6 +1542,24 @@ def main() -> int:
         reorder_pct=args.netem_reorder_pct,
     )
     _validate_impairment(impairment)
+    impairment_override = impairment if impairment.enabled() else None
+    if args.profile:
+        run_id = args.run_id or f"libtorrent_lab_profile_{args.profile}_{_utc_stamp()}"
+        summary = run_lab_profile(
+            profile_name=args.profile,
+            run_id=run_id,
+            timeout_secs=args.timeout_secs or None,
+            skip_build=args.skip_build,
+            repeat_multiplier=args.repeat,
+            fail_fast=args.fail_fast,
+            network_impairment_override=impairment_override,
+        )
+        print(
+            "LIBTORRENT_LAB_PROFILE_RESULT "
+            f"{'PASS' if summary['ok'] else 'FAIL'} artifacts={summary['artifacts_dir']}"
+        )
+        return 0 if summary["ok"] else 1
+
     if args.matrix:
         run_id = args.run_id or f"libtorrent_lab_matrix_{args.matrix}_{_utc_stamp()}"
         summary = run_lab_matrix(

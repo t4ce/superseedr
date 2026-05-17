@@ -87,6 +87,30 @@ Repeat mode is the first flake detector:
 Each matrix writes `matrix_summary.json` and `matrix_summary.md` under its
 artifact directory, with links to the per-scenario run artifacts.
 
+## Profile Runs
+
+Profiles bundle one or more matrix runs into named local/CI lanes:
+
+```bash
+./integration_tests/run_libtorrent_lab.sh --profile quick
+./integration_tests/run_libtorrent_lab.sh --profile premerge
+./integration_tests/run_libtorrent_lab.sh --profile stress
+./integration_tests/run_libtorrent_lab.sh --profile soak
+```
+
+Current profiles:
+
+- `quick`: smoke matrix.
+- `premerge`: full clean matrix plus a mild impaired transport matrix.
+- `stress`: repeated full matrix plus repeated impaired fanout matrix.
+- `soak`: longer repeated full and impaired transport matrices for scheduled
+  endurance runs.
+
+Profile runs write `profile_summary.json` and `profile_summary.md`, plus the
+normal per-step matrix summaries. `--repeat N` multiplies each profile step's
+repeat count, and explicit `--netem-*` flags override each profile step's
+default impairment.
+
 ## Network Impairment
 
 Scenario and matrix runs can apply Docker `tc netem` impairment to active peer

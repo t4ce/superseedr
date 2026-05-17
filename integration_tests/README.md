@@ -174,6 +174,15 @@ Matrix entrypoint:
 ./integration_tests/run_libtorrent_lab.sh --matrix full --repeat 2
 ```
 
+Profile entrypoint:
+
+```bash
+./integration_tests/run_libtorrent_lab.sh --profile quick
+./integration_tests/run_libtorrent_lab.sh --profile premerge
+./integration_tests/run_libtorrent_lab.sh --profile stress
+./integration_tests/run_libtorrent_lab.sh --profile soak
+```
+
 Network impairment can be applied to any scenario or matrix with the `netem`
 flags:
 
@@ -204,6 +213,9 @@ Artifacts are written under:
 
 Matrix runs also write `matrix_summary.json` and `matrix_summary.md` in their
 matrix artifact directory.
+
+Profile runs also write `profile_summary.json` and `profile_summary.md` in
+their profile artifact directory.
 
 ## Artifacts and Monitoring
 
