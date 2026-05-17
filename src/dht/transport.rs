@@ -434,7 +434,7 @@ impl TransportActor {
     }
 
     fn spawn_receive_loop(
-        mut datagram_rx: mpsc::UnboundedReceiver<SharedUdpDatagram>,
+        mut datagram_rx: mpsc::Receiver<SharedUdpDatagram>,
         inflight_queries: Arc<StdMutex<HashMap<TransactionId, InflightQuery>>>,
         event_tx: mpsc::UnboundedSender<TransportEvent>,
         source_validation: SourceValidationMode,

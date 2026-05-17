@@ -12,6 +12,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 const MAX_DATAGRAM_SIZE: usize = 65_535;
+const SHARED_UDP_SUBSCRIBER_QUEUE_CAPACITY: usize = 1_024;
 const SHARED_UDP_BIND_RETRY_ATTEMPTS: usize = 16;
 const SHARED_UDP_BIND_RETRY_DELAY: Duration = Duration::from_millis(1);
 
@@ -43,8 +44,8 @@ pub struct SharedUdpDatagram {
 struct SharedUdpInner {
     key: SharedUdpKey,
     socket: Arc<UdpSocket>,
-    dht_tx: StdMutex<Option<mpsc::UnboundedSender<SharedUdpDatagram>>>,
-    utp_tx: StdMutex<Option<mpsc::UnboundedSender<SharedUdpDatagram>>>,
+    dht_tx: StdMutex<Option<mpsc::Sender<SharedUdpDatagram>>>,
+    utp_tx: StdMutex<Option<mpsc::Sender<SharedUdpDatagram>>>,
     shutdown_tx: watch::Sender<bool>,
     receive_task: StdMutex<Option<JoinHandle<()>>>,
 }
@@ -148,8 +149,8 @@ impl SharedUdpHandle {
     pub fn subscribe(
         &self,
         protocol: SharedUdpProtocol,
-    ) -> io::Result<mpsc::UnboundedReceiver<SharedUdpDatagram>> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    ) -> io::Result<mpsc::Receiver<SharedUdpDatagram>> {
+        let (tx, rx) = mpsc::channel(SHARED_UDP_SUBSCRIBER_QUEUE_CAPACITY);
         let slot = match protocol {
             SharedUdpProtocol::Dht => &self.inner.dht_tx,
             SharedUdpProtocol::Utp => &self.inner.utp_tx,
@@ -284,21 +285,24 @@ fn dispatch_datagram(inner: &SharedUdpInner, source: SocketAddr, payload: &[u8])
     } else {
         return;
     };
-    let datagram = SharedUdpDatagram {
-        source,
-        payload: payload.to_vec(),
-    };
     let slot = match protocol {
         SharedUdpProtocol::Dht => &inner.dht_tx,
         SharedUdpProtocol::Utp => &inner.utp_tx,
     };
-    if let Some(sender) = slot
+    let sender = slot
         .lock()
         .expect("shared udp subscriber lock")
         .as_ref()
         .filter(|sender| !sender.is_closed())
-    {
-        let _ = sender.send(datagram);
+        .cloned();
+    if let Some(sender) = sender {
+        let datagram = SharedUdpDatagram {
+            source,
+            payload: payload.to_vec(),
+        };
+        if sender.try_send(datagram).is_err() {
+            tracing::debug!(?protocol, %source, "dropping shared UDP datagram for full subscriber queue");
+        }
     }
 }
 

@@ -31,11 +31,13 @@ const TYPE_SYN: u8 = 4;
 const EXT_NONE: u8 = 0;
 const EXT_SELECTIVE_ACK: u8 = 1;
 
-const RECEIVE_WINDOW: u32 = 1_048_576;
 const MIN_PACKET_SIZE: usize = 150;
 const MAX_PACKET_SIZE: usize = 2_560;
 const STREAM_BUFFER: usize = 256 * 1024;
+const RECEIVE_WINDOW: u32 = STREAM_BUFFER as u32;
 const MAX_INFLIGHT_PACKETS: usize = 64;
+const UTP_ACCEPT_QUEUE_CAPACITY: usize = 128;
+const UTP_SESSION_QUEUE_CAPACITY: usize = 2_048;
 const CONNECT_RETRIES: usize = 4;
 const CONNECT_RETRY_TIMEOUT: Duration = Duration::from_millis(400);
 const ENDPOINT_BIND_RETRY_ATTEMPTS: usize = 16;
@@ -254,7 +256,7 @@ pub struct UtpListener {
 impl UtpListener {
     async fn bind(bind_addr: SocketAddr) -> io::Result<Self> {
         let endpoint = UtpEndpoint::bind(bind_addr).await?;
-        let (accept_tx, accept_rx) = mpsc::channel(128);
+        let (accept_tx, accept_rx) = mpsc::channel(UTP_ACCEPT_QUEUE_CAPACITY);
         endpoint.set_accept_sender(accept_tx)?;
         Ok(Self {
             endpoint,
@@ -283,7 +285,7 @@ struct UtpEndpoint {
 
 struct UtpEndpointInner {
     udp: SharedUdpHandle,
-    sessions: StdMutex<HashMap<UtpSessionKey, mpsc::UnboundedSender<UtpPacket>>>,
+    sessions: StdMutex<HashMap<UtpSessionKey, mpsc::Sender<UtpPacket>>>,
     inbound_syn_responses: StdMutex<HashMap<UtpSessionKey, UtpPacket>>,
     accept_tx: StdMutex<Option<mpsc::Sender<PeerConnection>>>,
     shutdown_tx: watch::Sender<bool>,
@@ -293,7 +295,7 @@ struct UtpEndpointInner {
 struct UtpSessionIo {
     endpoint: UtpEndpoint,
     remote_addr: SocketAddr,
-    incoming_packets: mpsc::UnboundedReceiver<UtpPacket>,
+    incoming_packets: mpsc::Receiver<UtpPacket>,
     _session_guard: UtpSessionGuard,
 }
 
@@ -382,12 +384,12 @@ impl UtpEndpoint {
         &self,
         remote_addr: SocketAddr,
         connection_id: u16,
-    ) -> io::Result<(mpsc::UnboundedReceiver<UtpPacket>, UtpSessionGuard)> {
+    ) -> io::Result<(mpsc::Receiver<UtpPacket>, UtpSessionGuard)> {
         let key = UtpSessionKey {
             remote_addr,
             connection_id,
         };
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(UTP_SESSION_QUEUE_CAPACITY);
         let mut sessions = self.inner.sessions.lock().expect("uTP session map lock");
         if sessions.get(&key).is_some_and(|sender| !sender.is_closed()) {
             return Err(io::Error::new(
@@ -471,7 +473,7 @@ fn register_utp_endpoint(key: SharedUdpKey, inner: &Arc<UtpEndpointInner>) {
 
 fn spawn_utp_demux_task(
     endpoint: Weak<UtpEndpointInner>,
-    mut datagram_rx: mpsc::UnboundedReceiver<SharedUdpDatagram>,
+    mut datagram_rx: mpsc::Receiver<SharedUdpDatagram>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -516,7 +518,13 @@ async fn dispatch_utp_datagram(endpoint: &Arc<UtpEndpointInner>, datagram: Share
         .get(&key)
         .cloned();
     if let Some(sender) = sender {
-        let _ = sender.send(packet);
+        if sender.try_send(packet).is_err() {
+            tracing::debug!(
+                %datagram.source,
+                connection_id = key.connection_id,
+                "dropping uTP packet for full session queue"
+            );
+        }
     }
 }
 
@@ -562,6 +570,14 @@ async fn handle_inbound_syn(
             }
             Err(_) => return,
         };
+    let accept_permit = match accept_tx.try_reserve() {
+        Ok(permit) => permit,
+        Err(error) => {
+            tracing::debug!(%remote_addr, ?error, "dropping inbound uTP SYN because accept queue is full or closed");
+            send_reset_for_syn(&endpoint, remote_addr, &syn).await;
+            return;
+        }
+    };
 
     let start = Instant::now();
     let server_seq_nr = random_connection_id();
@@ -629,7 +645,22 @@ async fn handle_inbound_syn(
         remote_addr,
         PeerConnectionDirection::Incoming,
     );
-    let _ = accept_tx.send(connection).await;
+    accept_permit.send(connection);
+}
+
+async fn send_reset_for_syn(endpoint: &UtpEndpoint, remote_addr: SocketAddr, syn: &UtpPacket) {
+    let reset = UtpPacket {
+        packet_type: TYPE_RESET,
+        connection_id: syn.connection_id,
+        timestamp_microseconds: 0,
+        timestamp_difference_microseconds: 0,
+        wnd_size: 0,
+        seq_nr: 0,
+        ack_nr: syn.seq_nr,
+        selective_ack: Vec::new(),
+        payload: Vec::new(),
+    };
+    let _ = endpoint.send_packet(remote_addr, &reset).await;
 }
 
 fn bind_ip_for(remote_addr: SocketAddr) -> IpAddr {
@@ -805,6 +836,12 @@ struct AckOutcome {
     advanced_ack: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcessIncomingOutcome {
+    Continue,
+    RemoteEof,
+}
+
 #[derive(Default)]
 struct DelayHistory {
     buckets: VecDeque<DelayBucket>,
@@ -846,6 +883,7 @@ impl UtpDriverState {
         outcome: AckOutcome,
         packet: &UtpPacket,
         count_duplicate_acks: bool,
+        out_of_order_payloads: &BTreeMap<u16, Vec<u8>>,
     ) -> io::Result<()> {
         if outcome.advanced_ack {
             self.duplicate_ack_count = 0;
@@ -853,8 +891,14 @@ impl UtpDriverState {
         } else if count_duplicate_acks && packet.ack_nr == self.last_ack_nr_seen {
             self.duplicate_ack_count = self.duplicate_ack_count.saturating_add(1);
             if self.duplicate_ack_count >= 3 {
-                if retransmit_packet(io, self, unacked_packets, packet.ack_nr.wrapping_add(1))
-                    .await?
+                if retransmit_packet(
+                    io,
+                    self,
+                    unacked_packets,
+                    packet.ack_nr.wrapping_add(1),
+                    out_of_order_payloads,
+                )
+                .await?
                 {
                     self.on_packet_loss();
                 }
@@ -868,7 +912,9 @@ impl UtpDriverState {
         if !outcome.fast_retransmit.is_empty() {
             let mut retransmitted = false;
             for seq_nr in outcome.fast_retransmit {
-                retransmitted |= retransmit_packet(io, self, unacked_packets, seq_nr).await?;
+                retransmitted |=
+                    retransmit_packet(io, self, unacked_packets, seq_nr, out_of_order_payloads)
+                        .await?;
             }
             if retransmitted {
                 self.on_packet_loss();
@@ -990,19 +1036,37 @@ async fn run_utp_driver(
     let mut unacked_packets: VecDeque<SentPacket> = VecDeque::new();
     let mut out_of_order_payloads: BTreeMap<u16, Vec<u8>> = BTreeMap::new();
     let mut local_eof = false;
+    let mut local_fin_sent = false;
+    let mut remote_fin_seq_nr: Option<u16> = None;
+    let mut remote_eof_delivered = false;
     let mut retransmit_tick = time::interval(RETRANSMIT_TICK);
 
     loop {
-        flush_pending_payloads(&io, &mut state, &mut pending_payloads, &mut unacked_packets)
-            .await?;
+        flush_pending_payloads(
+            &io,
+            &mut state,
+            &mut pending_payloads,
+            &mut unacked_packets,
+            &out_of_order_payloads,
+        )
+        .await?;
 
         if local_eof && pending_payloads.is_empty() && unacked_packets.is_empty() {
-            send_control_packet(&io, &mut state, TYPE_FIN).await?;
-            return Ok(());
+            if local_fin_sent {
+                return Ok(());
+            }
+            send_fin_packet(
+                &io,
+                &mut state,
+                &mut unacked_packets,
+                &out_of_order_payloads,
+            )
+            .await?;
+            local_fin_sent = true;
         }
 
         tokio::select! {
-            read_result = local_reader.read(&mut local_buf), if !local_eof && pending_payloads.len() < MAX_INFLIGHT_PACKETS => {
+            read_result = local_reader.read(&mut local_buf), if !local_eof && !remote_eof_delivered && pending_payloads.len() < MAX_INFLIGHT_PACKETS => {
                 let bytes_read = read_result?;
                 if bytes_read == 0 {
                     local_eof = true;
@@ -1012,17 +1076,22 @@ async fn run_utp_driver(
             }
             recv_result = io.recv() => {
                 let packet = recv_result?;
-                process_incoming_packet(
+                let outcome = process_incoming_packet(
                     &io,
                     &mut local_writer,
                     &mut state,
                     &mut unacked_packets,
                     &mut out_of_order_payloads,
+                    &mut remote_fin_seq_nr,
                     packet,
                 ).await?;
+                if outcome == ProcessIncomingOutcome::RemoteEof {
+                    remote_eof_delivered = true;
+                    local_eof = true;
+                }
             }
             _ = retransmit_tick.tick() => {
-                retransmit_due_packets(&io, &mut state, &mut unacked_packets).await?;
+                retransmit_due_packets(&io, &mut state, &mut unacked_packets, &out_of_order_payloads).await?;
             }
         }
     }
@@ -1033,6 +1102,7 @@ async fn flush_pending_payloads(
     state: &mut UtpDriverState,
     pending_payloads: &mut VecDeque<Vec<u8>>,
     unacked_packets: &mut VecDeque<SentPacket>,
+    out_of_order_payloads: &BTreeMap<u16, Vec<u8>>,
 ) -> io::Result<()> {
     while pending_payloads.front().is_some() {
         if unacked_packets.len() >= MAX_INFLIGHT_PACKETS {
@@ -1054,7 +1124,7 @@ async fn flush_pending_payloads(
         let payload = pop_next_payload_chunk(pending_payloads, state.packet_size);
         let seq_nr = state.next_send_seq_nr;
         state.next_send_seq_nr = state.next_send_seq_nr.wrapping_add(1);
-        let packet = data_packet(state, seq_nr, payload.clone());
+        let packet = data_packet(state, seq_nr, payload.clone(), out_of_order_payloads);
         io.send(&packet).await?;
         unacked_packets.push_back(SentPacket {
             packet_type: TYPE_DATA,
@@ -1074,13 +1144,14 @@ async fn process_incoming_packet<W>(
     state: &mut UtpDriverState,
     unacked_packets: &mut VecDeque<SentPacket>,
     out_of_order_payloads: &mut BTreeMap<u16, Vec<u8>>,
+    remote_fin_seq_nr: &mut Option<u16>,
     packet: UtpPacket,
-) -> io::Result<()>
+) -> io::Result<ProcessIncomingOutcome>
 where
     W: AsyncWrite + Unpin,
 {
     if packet.connection_id != state.receive_connection_id {
-        return Ok(());
+        return Ok(ProcessIncomingOutcome::Continue);
     }
 
     state.record_received_packet(&packet);
@@ -1091,12 +1162,20 @@ where
                 acknowledge_packets(unacked_packets, packet.ack_nr, &packet.selective_ack);
             let count_duplicate_acks = packet.packet_type == TYPE_STATE;
             state
-                .apply_ack_outcome(io, unacked_packets, outcome, &packet, count_duplicate_acks)
+                .apply_ack_outcome(
+                    io,
+                    unacked_packets,
+                    outcome,
+                    &packet,
+                    count_duplicate_acks,
+                    out_of_order_payloads,
+                )
                 .await?;
         }
         _ => {}
     }
 
+    let mut outcome = ProcessIncomingOutcome::Continue;
     match packet.packet_type {
         TYPE_STATE => {}
         TYPE_DATA => {
@@ -1106,7 +1185,17 @@ where
                     local_writer.write_all(&packet.payload).await?;
                 }
                 state.record_remote_payload_sequence(packet.seq_nr);
-                deliver_buffered_payloads(local_writer, state, out_of_order_payloads).await?;
+                if deliver_buffered_payloads(
+                    local_writer,
+                    state,
+                    out_of_order_payloads,
+                    remote_fin_seq_nr,
+                )
+                .await?
+                {
+                    local_writer.shutdown().await?;
+                    outcome = ProcessIncomingOutcome::RemoteEof;
+                }
             } else if seq_gt(packet.seq_nr, expected_seq_nr)
                 && out_of_order_payloads.len() < MAX_OUT_OF_ORDER_PACKETS
             {
@@ -1118,13 +1207,21 @@ where
         }
         TYPE_FIN => {
             if state.accepts_remote_payload_sequence(packet.seq_nr) {
+                *remote_fin_seq_nr = Some(packet.seq_nr);
                 state.record_remote_payload_sequence(packet.seq_nr);
+                local_writer.shutdown().await?;
+                outcome = ProcessIncomingOutcome::RemoteEof;
+            } else if seq_gt(packet.seq_nr, state.last_remote_seq_nr.wrapping_add(1))
+                && out_of_order_payloads.len() < MAX_OUT_OF_ORDER_PACKETS
+            {
+                *remote_fin_seq_nr = Some(packet.seq_nr);
+                out_of_order_payloads.entry(packet.seq_nr).or_default();
+            } else if remote_fin_seq_nr
+                .is_some_and(|seq_nr| seq_lte(seq_nr, state.last_remote_seq_nr))
+            {
+                outcome = ProcessIncomingOutcome::RemoteEof;
             }
             send_state_packet(io, state, out_of_order_payloads).await?;
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "uTP peer closed stream",
-            ));
         }
         TYPE_RESET => {
             return Err(io::Error::new(
@@ -1136,13 +1233,14 @@ where
         _ => {}
     }
 
-    Ok(())
+    Ok(outcome)
 }
 
 async fn retransmit_due_packets(
     io: &UtpSessionIo,
     state: &mut UtpDriverState,
     unacked_packets: &mut VecDeque<SentPacket>,
+    out_of_order_payloads: &BTreeMap<u16, Vec<u8>>,
 ) -> io::Result<()> {
     let now = Instant::now();
     let timeout = state.retransmit_timeout;
@@ -1166,7 +1264,7 @@ async fn retransmit_due_packets(
             connection_id: state.send_connection_id,
             timestamp_microseconds: timestamp_microseconds(state.start),
             timestamp_difference_microseconds: timestamp_difference_microseconds(state),
-            wnd_size: RECEIVE_WINDOW,
+            wnd_size: advertised_window(out_of_order_payloads),
             seq_nr: sent.seq_nr,
             ack_nr: state.ack_nr(),
             selective_ack: Vec::new(),
@@ -1184,25 +1282,33 @@ async fn retransmit_due_packets(
     Ok(())
 }
 
-async fn send_control_packet(
+async fn send_fin_packet(
     io: &UtpSessionIo,
     state: &mut UtpDriverState,
-    packet_type: u8,
+    unacked_packets: &mut VecDeque<SentPacket>,
+    out_of_order_payloads: &BTreeMap<u16, Vec<u8>>,
 ) -> io::Result<()> {
     let seq_nr = state.next_send_seq_nr;
     state.next_send_seq_nr = state.next_send_seq_nr.wrapping_add(1);
     let packet = UtpPacket {
-        packet_type,
+        packet_type: TYPE_FIN,
         connection_id: state.send_connection_id,
         timestamp_microseconds: timestamp_microseconds(state.start),
         timestamp_difference_microseconds: timestamp_difference_microseconds(state),
-        wnd_size: RECEIVE_WINDOW,
+        wnd_size: advertised_window(out_of_order_payloads),
         seq_nr,
         ack_nr: state.ack_nr(),
         selective_ack: Vec::new(),
         payload: Vec::new(),
     };
     io.send(&packet).await?;
+    unacked_packets.push_back(SentPacket {
+        packet_type: TYPE_FIN,
+        seq_nr,
+        payload: Vec::new(),
+        sent_at: Instant::now(),
+        retransmits: 0,
+    });
     Ok(())
 }
 
@@ -1227,13 +1333,18 @@ async fn send_state_packet(
     Ok(())
 }
 
-fn data_packet(state: &UtpDriverState, seq_nr: u16, payload: Vec<u8>) -> UtpPacket {
+fn data_packet(
+    state: &UtpDriverState,
+    seq_nr: u16,
+    payload: Vec<u8>,
+    out_of_order_payloads: &BTreeMap<u16, Vec<u8>>,
+) -> UtpPacket {
     UtpPacket {
         packet_type: TYPE_DATA,
         connection_id: state.send_connection_id,
         timestamp_microseconds: timestamp_microseconds(state.start),
         timestamp_difference_microseconds: timestamp_difference_microseconds(state),
-        wnd_size: RECEIVE_WINDOW,
+        wnd_size: advertised_window(out_of_order_payloads),
         seq_nr,
         ack_nr: state.ack_nr(),
         selective_ack: Vec::new(),
@@ -1311,11 +1422,15 @@ async fn deliver_buffered_payloads<W>(
     local_writer: &mut W,
     state: &mut UtpDriverState,
     out_of_order_payloads: &mut BTreeMap<u16, Vec<u8>>,
-) -> io::Result<()>
+    remote_fin_seq_nr: &Option<u16>,
+) -> io::Result<bool>
 where
     W: AsyncWrite + Unpin,
 {
     loop {
+        if remote_fin_seq_nr.is_some_and(|seq_nr| seq_lte(seq_nr, state.last_remote_seq_nr)) {
+            return Ok(true);
+        }
         let expected_seq_nr = state.last_remote_seq_nr.wrapping_add(1);
         let Some(payload) = out_of_order_payloads.remove(&expected_seq_nr) else {
             break;
@@ -1326,7 +1441,7 @@ where
         state.last_remote_seq_nr = expected_seq_nr;
     }
 
-    Ok(())
+    Ok(remote_fin_seq_nr.is_some_and(|seq_nr| seq_lte(seq_nr, state.last_remote_seq_nr)))
 }
 
 async fn retransmit_packet(
@@ -1334,6 +1449,7 @@ async fn retransmit_packet(
     state: &UtpDriverState,
     unacked_packets: &mut VecDeque<SentPacket>,
     seq_nr: u16,
+    out_of_order_payloads: &BTreeMap<u16, Vec<u8>>,
 ) -> io::Result<bool> {
     let Some(sent) = unacked_packets
         .iter_mut()
@@ -1360,7 +1476,7 @@ async fn retransmit_packet(
         connection_id: state.send_connection_id,
         timestamp_microseconds: timestamp_microseconds(state.start),
         timestamp_difference_microseconds: timestamp_difference_microseconds(state),
-        wnd_size: RECEIVE_WINDOW,
+        wnd_size: advertised_window(out_of_order_payloads),
         seq_nr: sent.seq_nr,
         ack_nr: state.ack_nr(),
         selective_ack: Vec::new(),
@@ -1585,6 +1701,16 @@ mod tests {
     }
 
     #[test]
+    fn advertised_window_subtracts_buffered_out_of_order_payloads() {
+        let mut out_of_order = BTreeMap::new();
+        out_of_order.insert(12, vec![0; 64]);
+        out_of_order.insert(13, Vec::new());
+        out_of_order.insert(14, vec![0; 128]);
+
+        assert_eq!(advertised_window(&out_of_order), RECEIVE_WINDOW - 192);
+    }
+
+    #[test]
     fn congestion_window_reacts_to_delay_and_loss() {
         let mut state = UtpDriverState {
             send_connection_id: 2,
@@ -1765,6 +1891,94 @@ mod tests {
         connection.stream.read_exact(&mut reordered).await.unwrap();
 
         assert_eq!(&reordered, b"firstsecond");
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn outbound_connection_delivers_reordered_tail_before_fin_eof() {
+        let server = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = vec![0_u8; 2_048];
+            let (n, client_addr) = server.recv_from(&mut buf).await.unwrap();
+            let syn = UtpPacket::decode(&buf[..n]).unwrap();
+            assert_eq!(syn.packet_type, TYPE_SYN);
+
+            let server_seq_nr = 77;
+            let state = UtpPacket {
+                packet_type: TYPE_STATE,
+                connection_id: syn.connection_id,
+                timestamp_microseconds: 1,
+                timestamp_difference_microseconds: 0,
+                wnd_size: RECEIVE_WINDOW,
+                seq_nr: server_seq_nr,
+                ack_nr: syn.seq_nr,
+                selective_ack: Vec::new(),
+                payload: Vec::new(),
+            };
+            server.send_to(&state.encode(), client_addr).await.unwrap();
+
+            let second = UtpPacket {
+                packet_type: TYPE_DATA,
+                connection_id: syn.connection_id,
+                timestamp_microseconds: 2,
+                timestamp_difference_microseconds: 0,
+                wnd_size: RECEIVE_WINDOW,
+                seq_nr: server_seq_nr.wrapping_add(1),
+                ack_nr: syn.seq_nr,
+                selective_ack: Vec::new(),
+                payload: b"second".to_vec(),
+            };
+            server.send_to(&second.encode(), client_addr).await.unwrap();
+
+            let fin = UtpPacket {
+                packet_type: TYPE_FIN,
+                connection_id: syn.connection_id,
+                timestamp_microseconds: 3,
+                timestamp_difference_microseconds: 0,
+                wnd_size: RECEIVE_WINDOW,
+                seq_nr: server_seq_nr.wrapping_add(2),
+                ack_nr: syn.seq_nr,
+                selective_ack: Vec::new(),
+                payload: Vec::new(),
+            };
+            server.send_to(&fin.encode(), client_addr).await.unwrap();
+
+            let first = UtpPacket {
+                packet_type: TYPE_DATA,
+                connection_id: syn.connection_id,
+                timestamp_microseconds: 4,
+                timestamp_difference_microseconds: 0,
+                wnd_size: RECEIVE_WINDOW,
+                seq_nr: server_seq_nr,
+                ack_nr: syn.seq_nr,
+                selective_ack: Vec::new(),
+                payload: b"first".to_vec(),
+            };
+            server.send_to(&first.encode(), client_addr).await.unwrap();
+        });
+
+        let mut connection = UtpPeerTransport::connect(server_addr).await.unwrap();
+        let mut reordered = [0_u8; 11];
+        time::timeout(
+            Duration::from_secs(1),
+            connection.stream.read_exact(&mut reordered),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&reordered, b"firstsecond");
+
+        let mut eof = [0_u8; 1];
+        let read = time::timeout(Duration::from_secs(1), connection.stream.read(&mut eof))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read, 0);
+
         server_task.await.unwrap();
     }
 

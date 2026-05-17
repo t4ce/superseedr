@@ -2093,13 +2093,21 @@ impl TorrentManager {
     }
 
     pub fn connect_to_peer(&mut self, peer_addr: SocketAddr) {
+        self.connect_to_peer_with_key(peer_addr, peer_addr.to_string());
+    }
+
+    #[cfg(feature = "synthetic-load")]
+    pub fn connect_to_synthetic_peer(&mut self, peer_addr: SocketAddr, peer_key: String) {
+        self.connect_to_peer_with_key(peer_addr, peer_key);
+    }
+
+    fn connect_to_peer_with_key(&mut self, peer_addr: SocketAddr, peer_ip_port: String) {
         let _ = self
             .manager_event_tx
             .try_send(ManagerEvent::PeerDiscovered {
                 info_hash: self.state.info_hash.clone(),
             });
 
-        let peer_ip_port = peer_addr.to_string();
         if self.state.torrent_status == TorrentStatus::Done {
             if let Some(&expires_at) = self.state.known_seeders.get(&peer_ip_port) {
                 if Instant::now() < expires_at {
@@ -3005,6 +3013,10 @@ impl TorrentManager {
                         #[cfg(feature = "synthetic-load")]
                         ManagerCommand::ConnectToPeer(peer_addr) => {
                             self.connect_to_peer(peer_addr);
+                        }
+                        #[cfg(feature = "synthetic-load")]
+                        ManagerCommand::ConnectToSyntheticPeer { addr, peer_key } => {
+                            self.connect_to_synthetic_peer(addr, peer_key);
                         }
                         ManagerCommand::ProbeFileBatch {
                             epoch,

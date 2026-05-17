@@ -196,6 +196,11 @@ pub enum SyntheticPeerConnectFailure {
 pub enum ManagerCommand {
     #[cfg(feature = "synthetic-load")]
     ConnectToPeer(SocketAddr),
+    #[cfg(feature = "synthetic-load")]
+    ConnectToSyntheticPeer {
+        addr: SocketAddr,
+        peer_key: String,
+    },
     ProbeFileBatch {
         epoch: u64,
         start_file_index: usize,
