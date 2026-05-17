@@ -12,10 +12,15 @@ from integration_tests.libtorrent_lab.run import (
     _netem_command,
     _profile_for_name,
     _profile_markdown,
+    _probe_tracker_announces,
     _project_name,
+    _run_behavior_probes,
     _scenario_names_for_matrix,
+    _summarize_libtorrent_events_for_role,
+    _summarize_tracker_log,
     _superseedr_seed_is_ready,
     _superseedr_download_path,
+    _validate_transfer_accounting,
     _validate_superseedr_transport_observations,
     _validate_download,
     _validate_download_set,
@@ -127,6 +132,31 @@ def test_load_fanout_scenarios() -> None:
     assert libtorrent_seed.libtorrent_leech_count == 1
 
 
+def test_load_config_scenarios() -> None:
+    tcp_only = LabScenario.from_file(
+        Path("integration_tests/libtorrent_lab/scenarios/basic_ul_dl_tcp_only.json")
+    )
+    utp_only = LabScenario.from_file(
+        Path("integration_tests/libtorrent_lab/scenarios/basic_ul_dl_utp_only.json")
+    )
+    dual_stack = LabScenario.from_file(
+        Path("integration_tests/libtorrent_lab/scenarios/superseedr_all_to_libtorrent_dual_stack.json")
+    )
+    dht_lsd = LabScenario.from_file(
+        Path("integration_tests/libtorrent_lab/scenarios/basic_ul_dl_dht_lsd_enabled.json")
+    )
+
+    assert tcp_only.libtorrent_settings["enable_incoming_tcp"] is True
+    assert tcp_only.libtorrent_settings["enable_incoming_utp"] is False
+    assert utp_only.libtorrent_settings["enable_incoming_tcp"] is False
+    assert utp_only.libtorrent_settings["enable_incoming_utp"] is True
+    assert dual_stack.superseedr_peer_transport == "all"
+    assert dual_stack.libtorrent_settings["enable_outgoing_tcp"] is True
+    assert dual_stack.libtorrent_settings["enable_outgoing_utp"] is True
+    assert dht_lsd.libtorrent_settings["enable_dht"] is True
+    assert dht_lsd.libtorrent_settings["enable_lsd"] is True
+
+
 def test_matrix_scenario_sets_are_stable() -> None:
     assert _scenario_names_for_matrix("smoke") == [
         "basic_ul_dl",
@@ -136,6 +166,19 @@ def test_matrix_scenario_sets_are_stable() -> None:
     assert _scenario_names_for_matrix("fanout") == [
         "superseedr_to_libtorrent_tcp_fanout",
         "libtorrent_to_superseedr_tcp_fanout",
+    ]
+    assert _scenario_names_for_matrix("config") == [
+        "basic_ul_dl_tcp_only",
+        "basic_ul_dl_utp_only",
+        "basic_ul_dl_dht_lsd_enabled",
+        "superseedr_all_to_libtorrent_dual_stack",
+        "libtorrent_dual_stack_to_superseedr_all",
+    ]
+    assert _scenario_names_for_matrix("behavior") == [
+        "basic_ul_dl_tcp_only",
+        "basic_ul_dl_utp_only",
+        "superseedr_all_to_libtorrent_dual_stack",
+        "libtorrent_dual_stack_to_superseedr_all",
     ]
     assert len(_scenario_names_for_matrix("full")) == 11
 
@@ -224,7 +267,7 @@ def test_matrix_markdown_summarizes_results() -> None:
     )
 
     assert "Result: FAIL" in markdown
-    assert "| basic_ul_dl | 2 | FAIL | 4.0s | `/tmp/lab/two` |" in markdown
+    assert "| basic_ul_dl | 2 | FAIL | PASS | PASS | 0 | 4.0s | `/tmp/lab/two` |" in markdown
 
 
 def test_profile_markdown_summarizes_steps() -> None:
@@ -350,6 +393,191 @@ def test_utp_only_scenario_rejects_superseedr_tcp_payload() -> None:
         "seed Superseedr observed 1 TCP peer(s) in uTP-only mode",
         "seed Superseedr did not observe a uTP peer",
         "seed Superseedr did not move payload over uTP",
+    ]
+
+
+def test_transfer_accounting_requires_completed_counters() -> None:
+    scenario = LabScenario.from_file(
+        Path("integration_tests/libtorrent_lab/scenarios/basic_ul_dl_tcp_only.json")
+    )
+    report = _validate_transfer_accounting(
+        scenario=scenario,
+        source_payload_size=16,
+        active_seed_count=1,
+        active_leech_count=1,
+        validation={"ok": True, "issues": []},
+        seed_status={
+            "client": CLIENT_LIBTORRENT,
+            "is_seed": True,
+            "total_done": 16,
+            "total_upload": 15,
+        },
+        leech_status={
+            "client": CLIENT_LIBTORRENT,
+            "is_seed": True,
+            "total_done": 16,
+            "total_download": 16,
+        },
+    )
+
+    assert report["ok"] is False
+    assert report["issues"] == [
+        "seed libtorrent total_upload expected>=16 actual=15",
+    ]
+
+
+def test_transfer_accounting_handles_libtorrent_fanout() -> None:
+    scenario = LabScenario.from_file(
+        Path("integration_tests/libtorrent_lab/scenarios/superseedr_to_libtorrent_tcp_fanout.json")
+    )
+    report = _validate_transfer_accounting(
+        scenario=scenario,
+        source_payload_size=16,
+        active_seed_count=0,
+        active_leech_count=3,
+        validation={"ok": True, "issues": []},
+        seed_status={
+            "client": CLIENT_SUPERSEEDR,
+            "status": "ok",
+            "complete_torrents": 1,
+            "data_available_torrents": 1,
+            "session_total_uploaded": 16,
+        },
+        leech_status={
+            "client": CLIENT_LIBTORRENT,
+            "complete_peers": 3,
+            "total_download": 48,
+            "participants": {
+                "leech": {"is_seed": True, "total_done": 16},
+                "leech_2": {"is_seed": True, "total_done": 16},
+                "leech_3": {"is_seed": True, "total_done": 16},
+            },
+        },
+    )
+
+    assert report["ok"] is True
+    assert report["issues"] == []
+
+
+def test_libtorrent_event_summary_extracts_probe_metrics(tmp_path: Path) -> None:
+    artifacts = tmp_path / "peer"
+    events = artifacts / "events.jsonl"
+    events.parent.mkdir()
+    events.write_text(
+        "\n".join(
+            [
+                '{"event":"starting","peer_id":"leech"}',
+                '{"event":"status","status":{"num_peers":1,"progress":0.5,"total_done":8,"uptime_secs":1.25}}',
+                '{"alert":"tracker_error_alert","message":"temporary"}',
+                '{"event":"complete","status":{"total_done":16}}',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    summary = _summarize_libtorrent_events_for_role({1: artifacts}, "leech")
+    participant = summary["participants"]["leech"]
+
+    assert participant["event_counts"]["status"] == 1
+    assert participant["tracker_error_count"] == 1
+    assert participant["first_peer_secs"] == 1.25
+    assert participant["first_progress_secs"] == 1.25
+    assert participant["completed"] is True
+
+
+def test_tracker_probe_warns_by_default_and_can_fail() -> None:
+    events = {
+        "seed": {
+            "participants": {
+                "seed": {
+                    "tracker_error_count": 2,
+                    "tracker_reply_count": 0,
+                }
+            }
+        },
+        "leech": {"participants": {}},
+    }
+    tracker = {
+        "ok": True,
+        "issues": [],
+        "announce_count": 2,
+        "unique_peer_count": 2,
+    }
+
+    warn_only = _probe_tracker_announces(
+        events,
+        tracker_summary=tracker,
+        fail_on_tracker_error=False,
+    )
+    fail = _probe_tracker_announces(
+        events,
+        tracker_summary=tracker,
+        fail_on_tracker_error=True,
+    )
+
+    assert warn_only["ok"] is True
+    assert warn_only["warnings"] == ["seed seed saw 2 tracker error alert(s)"]
+    assert fail["ok"] is False
+    assert fail["issues"] == ["seed seed saw 2 tracker error alert(s)"]
+
+
+def test_tracker_log_summary_requires_expected_announcers() -> None:
+    summary = _summarize_tracker_log(
+        "\n".join(
+            [
+                "tracker-1 | announce info_hash=aa peer_id=seed ip=172.18.0.2 port=1 left=0 peers_out=0",
+                "tracker-1 | announce info_hash=aa peer_id=leech ip=172.18.0.3 port=2 left=0 peers_out=1",
+            ]
+        ),
+        expected_peer_count=2,
+    )
+    missing = _summarize_tracker_log("", expected_peer_count=2)
+
+    assert summary["ok"] is True
+    assert summary["announce_count"] == 2
+    assert summary["unique_peer_count"] == 2
+    assert missing["ok"] is False
+    assert missing["issues"] == [
+        "tracker log did not record any announces",
+        "tracker announced peers expected>=2 actual=0",
+    ]
+
+
+def test_behavior_probes_include_transfer_and_event_health() -> None:
+    scenario = LabScenario.from_file(
+        Path("integration_tests/libtorrent_lab/scenarios/basic_ul_dl_tcp_only.json")
+    )
+    report = _run_behavior_probes(
+        scenario=scenario,
+        transfer_assertions={"ok": True, "issues": [], "checks": [{"name": "download"}]},
+        event_summary={
+            "seed": {"participants": {}},
+            "leech": {
+                "participants": {
+                    "leech": {
+                        "event_counts": {"status": 1},
+                        "hard_alert_counts": {},
+                        "status_sample_count": 1,
+                        "first_progress_secs": 0.5,
+                        "max_total_done": 16,
+                    }
+                }
+            },
+        },
+        tracker_summary={
+            "ok": True,
+            "issues": [],
+            "announce_count": 2,
+            "unique_peer_count": 2,
+        },
+    )
+
+    assert report["ok"] is True
+    assert [probe["name"] for probe in report["probes"]] == [
+        "transfer_accounting",
+        "libtorrent_event_health",
+        "tracker_announces",
+        "progress_timeline",
     ]
 
 

@@ -136,6 +136,15 @@ def main() -> int:
             last_status_write = now
             payload = _status_payload(peer_id, role, handle, started_at)
             _write_json(status_path, payload)
+            _append_event(
+                events_path,
+                {
+                    "ts": int(time.time()),
+                    "peer_id": peer_id,
+                    "event": "status",
+                    "status": payload,
+                },
+            )
             if exit_when_seed and payload["is_seed"]:
                 _append_event(
                     events_path,

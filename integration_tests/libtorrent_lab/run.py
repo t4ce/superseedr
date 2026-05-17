@@ -27,6 +27,23 @@ CLIENT_LIBTORRENT = "libtorrent"
 CLIENT_SUPERSEEDR = "superseedr"
 CLIENTS = {CLIENT_LIBTORRENT, CLIENT_SUPERSEEDR}
 MAX_LIBTORRENT_FANOUT = 3
+DEFAULT_BEHAVIOR_PROBES = (
+    "transfer_accounting",
+    "libtorrent_event_health",
+    "tracker_announces",
+    "progress_timeline",
+)
+LIBTORRENT_HARD_FAILURE_ALERTS = {
+    "file_error_alert",
+    "hash_failed_alert",
+    "listen_failed_alert",
+    "metadata_failed_alert",
+    "peer_error_alert",
+    "read_piece_alert",
+    "save_resume_data_failed_alert",
+    "torrent_error_alert",
+    "url_seed_alert",
+}
 LAB_MATRIXES: dict[str, list[str]] = {
     "smoke": [
         "basic_ul_dl",
@@ -48,6 +65,19 @@ LAB_MATRIXES: dict[str, list[str]] = {
     "fanout": [
         "superseedr_to_libtorrent_tcp_fanout",
         "libtorrent_to_superseedr_tcp_fanout",
+    ],
+    "config": [
+        "basic_ul_dl_tcp_only",
+        "basic_ul_dl_utp_only",
+        "basic_ul_dl_dht_lsd_enabled",
+        "superseedr_all_to_libtorrent_dual_stack",
+        "libtorrent_dual_stack_to_superseedr_all",
+    ],
+    "behavior": [
+        "basic_ul_dl_tcp_only",
+        "basic_ul_dl_utp_only",
+        "superseedr_all_to_libtorrent_dual_stack",
+        "libtorrent_dual_stack_to_superseedr_all",
     ],
 }
 LAB_MATRIXES["full"] = [
@@ -75,6 +105,8 @@ class LabScenario:
     libtorrent_leech_count: int
     superseedr_peer_transport: str
     libtorrent_settings: dict[str, object]
+    behavior_probes: tuple[str, ...]
+    assertions: dict[str, object]
 
     @classmethod
     def from_file(cls, path: Path) -> "LabScenario":
@@ -110,6 +142,8 @@ class LabScenario:
             libtorrent_leech_count=leech_count,
             superseedr_peer_transport=str(raw.get("superseedr_peer_transport", "tcp")),
             libtorrent_settings=dict(raw.get("libtorrent_settings", {})),
+            behavior_probes=tuple(raw.get("behavior_probes", DEFAULT_BEHAVIOR_PROBES)),
+            assertions=dict(raw.get("assertions", {})),
         )
 
 
@@ -737,6 +771,576 @@ def _validate_download_set(
     }
 
 
+def _int_value(raw: object, default: int = 0) -> int:
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _float_value(raw: object, default: float = 0.0) -> float:
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _status_participants(status: dict[str, object], fallback_label: str) -> dict[str, dict[str, object]]:
+    participants = status.get("participants")
+    if isinstance(participants, dict):
+        return {
+            str(label): dict(participant)
+            for label, participant in participants.items()
+            if isinstance(participant, dict)
+        }
+    return {fallback_label: status}
+
+
+def _read_jsonl(path: Path) -> list[dict[str, object]]:
+    if not path.exists():
+        return []
+
+    records: list[dict[str, object]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            records.append({"event": "invalid_jsonl", "raw": line})
+            continue
+        if isinstance(payload, dict):
+            records.append(payload)
+    return records
+
+
+def _first_status_sample_secs(
+    events: list[dict[str, object]],
+    predicate: object,
+) -> float | None:
+    if not callable(predicate):
+        return None
+    for event in events:
+        status = event.get("status")
+        if not isinstance(status, dict):
+            continue
+        try:
+            matched = predicate(status)
+        except Exception:
+            matched = False
+        if matched:
+            uptime = status.get("uptime_secs")
+            try:
+                return round(float(uptime), 3)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _summarize_libtorrent_events_for_role(
+    artifacts_roots: dict[int, Path],
+    role: str,
+) -> dict[str, object]:
+    participants: dict[str, object] = {}
+    for index, artifacts_root in sorted(artifacts_roots.items()):
+        label = _libtorrent_label(role, index)
+        events_path = artifacts_root / "events.jsonl"
+        events = _read_jsonl(events_path)
+        alert_counts: dict[str, int] = {}
+        event_counts: dict[str, int] = {}
+        for event in events:
+            alert = event.get("alert")
+            if isinstance(alert, str):
+                alert_counts[alert] = alert_counts.get(alert, 0) + 1
+            event_name = event.get("event")
+            if isinstance(event_name, str):
+                event_counts[event_name] = event_counts.get(event_name, 0) + 1
+
+        hard_alerts = {
+            alert: count
+            for alert, count in sorted(alert_counts.items())
+            if alert in LIBTORRENT_HARD_FAILURE_ALERTS
+        }
+        status_samples = [
+            event.get("status")
+            for event in events
+            if isinstance(event.get("status"), dict) and event.get("event") == "status"
+        ]
+        max_total_done = max(
+            (_int_value(sample.get("total_done")) for sample in status_samples),
+            default=0,
+        )
+        participants[label] = {
+            "events_path": str(events_path),
+            "event_count": len(events),
+            "alert_counts": dict(sorted(alert_counts.items())),
+            "event_counts": dict(sorted(event_counts.items())),
+            "hard_alert_counts": hard_alerts,
+            "tracker_error_count": alert_counts.get("tracker_error_alert", 0),
+            "tracker_reply_count": alert_counts.get("tracker_reply_alert", 0),
+            "peer_disconnect_count": alert_counts.get("peer_disconnected_alert", 0),
+            "status_sample_count": len(status_samples),
+            "max_total_done": max_total_done,
+            "first_peer_secs": _first_status_sample_secs(
+                events,
+                lambda status: _int_value(status.get("num_peers")) > 0,
+            ),
+            "first_progress_secs": _first_status_sample_secs(
+                events,
+                lambda status: _int_value(status.get("total_done")) > 0
+                or _float_value(status.get("progress")) > 0.0,
+            ),
+            "completed": event_counts.get("complete", 0) > 0,
+            "timed_out": event_counts.get("timeout", 0) > 0,
+        }
+
+    return {
+        "role": role,
+        "participant_count": len(participants),
+        "participants": participants,
+    }
+
+
+def _summarize_libtorrent_events(
+    seed_artifacts: dict[int, Path],
+    leech_artifacts: dict[int, Path],
+) -> dict[str, object]:
+    return {
+        "seed": _summarize_libtorrent_events_for_role(seed_artifacts, "seed"),
+        "leech": _summarize_libtorrent_events_for_role(leech_artifacts, "leech"),
+    }
+
+
+def _summarize_tracker_log(
+    log_text: str,
+    *,
+    expected_peer_count: int,
+) -> dict[str, object]:
+    announce_lines = [line for line in log_text.splitlines() if "announce info_hash=" in line]
+    peer_ids: set[str] = set()
+    for line in announce_lines:
+        if " peer_id=" not in line or " ip=" not in line:
+            continue
+        peer_id = line.split(" peer_id=", 1)[1].split(" ip=", 1)[0]
+        if peer_id:
+            peer_ids.add(peer_id)
+
+    issues: list[str] = []
+    if not announce_lines:
+        issues.append("tracker log did not record any announces")
+    if len(peer_ids) < expected_peer_count:
+        issues.append(
+            f"tracker announced peers expected>={expected_peer_count} actual={len(peer_ids)}"
+        )
+
+    return {
+        "ok": not issues,
+        "issues": issues,
+        "announce_count": len(announce_lines),
+        "unique_peer_count": len(peer_ids),
+        "expected_peer_count": expected_peer_count,
+        "sample": announce_lines[-5:],
+    }
+
+
+def _append_issue(issues: list[str], checks: list[dict[str, object]], name: str, issue: str) -> None:
+    issues.append(issue)
+    checks.append({"name": name, "ok": False, "issue": issue})
+
+
+def _append_check(checks: list[dict[str, object]], name: str, **metrics: object) -> None:
+    checks.append({"name": name, "ok": True, **metrics})
+
+
+def _validate_libtorrent_completion(
+    role: str,
+    status: dict[str, object],
+    *,
+    expected_size: int,
+    expected_count: int,
+    issues: list[str],
+    checks: list[dict[str, object]],
+) -> None:
+    participants = _status_participants(status, role)
+    if len(participants) != expected_count:
+        _append_issue(
+            issues,
+            checks,
+            f"{role}_libtorrent_participant_count",
+            f"{role} libtorrent participant count expected={expected_count} actual={len(participants)}",
+        )
+
+    for label, participant in sorted(participants.items()):
+        if participant.get("status") in {"missing", "invalid"}:
+            _append_issue(
+                issues,
+                checks,
+                f"{label}_status",
+                f"{label} libtorrent status is {participant.get('status')}",
+            )
+            continue
+        if participant.get("is_seed") is not True:
+            _append_issue(
+                issues,
+                checks,
+                f"{label}_complete",
+                f"{label} libtorrent did not reach seed state",
+            )
+        total_done = _int_value(participant.get("total_done"))
+        if total_done < expected_size:
+            _append_issue(
+                issues,
+                checks,
+                f"{label}_total_done",
+                f"{label} libtorrent total_done expected>={expected_size} actual={total_done}",
+            )
+        else:
+            _append_check(
+                checks,
+                f"{label}_total_done",
+                total_done=total_done,
+                expected_size=expected_size,
+            )
+
+
+def _validate_superseedr_completion(
+    role: str,
+    status: dict[str, object],
+    *,
+    expected_size: int,
+    issues: list[str],
+    checks: list[dict[str, object]],
+) -> None:
+    if status.get("status") != "ok":
+        _append_issue(
+            issues,
+            checks,
+            f"{role}_superseedr_status",
+            f"{role} Superseedr status is {status.get('status')}",
+        )
+        return
+
+    complete_torrents = _int_value(status.get("complete_torrents"))
+    data_available = _int_value(status.get("data_available_torrents"))
+    if complete_torrents < 1 or data_available < 1:
+        _append_issue(
+            issues,
+            checks,
+            f"{role}_superseedr_complete",
+            f"{role} Superseedr did not report complete available data",
+        )
+    else:
+        _append_check(
+            checks,
+            f"{role}_superseedr_complete",
+            complete_torrents=complete_torrents,
+            data_available_torrents=data_available,
+        )
+
+    counter = "session_total_downloaded" if role == "leech" else "session_total_uploaded"
+    observed = _int_value(status.get(counter))
+    if observed < expected_size:
+        _append_issue(
+            issues,
+            checks,
+            f"{role}_superseedr_{counter}",
+            f"{role} Superseedr {counter} expected>={expected_size} actual={observed}",
+        )
+    else:
+        _append_check(
+            checks,
+            f"{role}_superseedr_{counter}",
+            observed=observed,
+            expected_size=expected_size,
+        )
+
+
+def _validate_transfer_accounting(
+    *,
+    scenario: LabScenario,
+    source_payload_size: int,
+    active_seed_count: int,
+    active_leech_count: int,
+    validation: dict[str, object],
+    seed_status: dict[str, object],
+    leech_status: dict[str, object],
+) -> dict[str, object]:
+    issues: list[str] = []
+    checks: list[dict[str, object]] = []
+
+    if validation.get("ok") is not True:
+        for issue in validation.get("issues", ["download validation failed"]):
+            _append_issue(issues, checks, "download_validation", str(issue))
+    else:
+        _append_check(checks, "download_validation", expected_size=source_payload_size)
+
+    if scenario.leech_client == CLIENT_LIBTORRENT:
+        _validate_libtorrent_completion(
+            "leech",
+            leech_status,
+            expected_size=source_payload_size,
+            expected_count=max(1, active_leech_count),
+            issues=issues,
+            checks=checks,
+        )
+        total_download = _int_value(leech_status.get("total_download"))
+        expected_total = source_payload_size * max(1, active_leech_count)
+        if total_download < expected_total:
+            _append_issue(
+                issues,
+                checks,
+                "leech_libtorrent_total_download",
+                f"leech libtorrent total_download expected>={expected_total} actual={total_download}",
+            )
+        else:
+            _append_check(
+                checks,
+                "leech_libtorrent_total_download",
+                total_download=total_download,
+                expected_total=expected_total,
+            )
+    else:
+        _validate_superseedr_completion(
+            "leech",
+            leech_status,
+            expected_size=source_payload_size,
+            issues=issues,
+            checks=checks,
+        )
+
+    if scenario.seed_client == CLIENT_LIBTORRENT:
+        _validate_libtorrent_completion(
+            "seed",
+            seed_status,
+            expected_size=source_payload_size,
+            expected_count=max(1, active_seed_count),
+            issues=issues,
+            checks=checks,
+        )
+        seed_upload = _int_value(seed_status.get("total_upload"))
+        if seed_upload < source_payload_size:
+            _append_issue(
+                issues,
+                checks,
+                "seed_libtorrent_total_upload",
+                f"seed libtorrent total_upload expected>={source_payload_size} actual={seed_upload}",
+            )
+        else:
+            _append_check(
+                checks,
+                "seed_libtorrent_total_upload",
+                total_upload=seed_upload,
+                expected_size=source_payload_size,
+            )
+    else:
+        _validate_superseedr_completion(
+            "seed",
+            seed_status,
+            expected_size=source_payload_size,
+            issues=issues,
+            checks=checks,
+        )
+
+    return {"ok": not issues, "issues": issues, "checks": checks}
+
+
+def _behavior_probe_result(
+    name: str,
+    *,
+    ok: bool = True,
+    issues: list[str] | None = None,
+    warnings: list[str] | None = None,
+    metrics: dict[str, object] | None = None,
+) -> dict[str, object]:
+    return {
+        "name": name,
+        "ok": ok,
+        "issues": issues or [],
+        "warnings": warnings or [],
+        "metrics": metrics or {},
+    }
+
+
+def _probe_libtorrent_event_health(
+    event_summary: dict[str, object],
+) -> dict[str, object]:
+    issues: list[str] = []
+    warnings: list[str] = []
+    metrics = {"participants": 0, "hard_alerts": 0, "peer_disconnects": 0}
+
+    for role in ("seed", "leech"):
+        role_summary = event_summary.get(role, {})
+        if not isinstance(role_summary, dict):
+            continue
+        participants = role_summary.get("participants", {})
+        if not isinstance(participants, dict):
+            continue
+        for label, raw in participants.items():
+            if not isinstance(raw, dict):
+                continue
+            metrics["participants"] = int(metrics["participants"]) + 1
+            hard_alerts = raw.get("hard_alert_counts", {})
+            if isinstance(hard_alerts, dict) and hard_alerts:
+                count = sum(_int_value(value) for value in hard_alerts.values())
+                metrics["hard_alerts"] = int(metrics["hard_alerts"]) + count
+                issues.append(f"{role} {label} emitted hard libtorrent alerts: {hard_alerts}")
+            if raw.get("timed_out") is True and role == "leech":
+                issues.append(f"{role} {label} timed out before completion")
+            disconnects = _int_value(raw.get("peer_disconnect_count"))
+            metrics["peer_disconnects"] = int(metrics["peer_disconnects"]) + disconnects
+            if disconnects > 50:
+                issues.append(f"{role} {label} had a peer disconnect storm: {disconnects}")
+            elif disconnects > 0:
+                warnings.append(f"{role} {label} had {disconnects} peer disconnect alert(s)")
+
+    return _behavior_probe_result(
+        "libtorrent_event_health",
+        ok=not issues,
+        issues=issues,
+        warnings=warnings,
+        metrics=metrics,
+    )
+
+
+def _probe_tracker_announces(
+    event_summary: dict[str, object],
+    *,
+    tracker_summary: dict[str, object] | None,
+    fail_on_tracker_error: bool,
+) -> dict[str, object]:
+    issues: list[str] = []
+    warnings: list[str] = []
+    metrics = {
+        "tracker_replies": 0,
+        "tracker_errors": 0,
+        "tracker_log_announces": 0,
+        "tracker_log_unique_peers": 0,
+    }
+
+    if tracker_summary:
+        metrics["tracker_log_announces"] = _int_value(tracker_summary.get("announce_count"))
+        metrics["tracker_log_unique_peers"] = _int_value(tracker_summary.get("unique_peer_count"))
+        if tracker_summary.get("ok") is not True:
+            issues.extend(str(issue) for issue in tracker_summary.get("issues", []))
+
+    for role in ("seed", "leech"):
+        role_summary = event_summary.get(role, {})
+        if not isinstance(role_summary, dict):
+            continue
+        participants = role_summary.get("participants", {})
+        if not isinstance(participants, dict):
+            continue
+        for label, raw in participants.items():
+            if not isinstance(raw, dict):
+                continue
+            errors = _int_value(raw.get("tracker_error_count"))
+            replies = _int_value(raw.get("tracker_reply_count"))
+            metrics["tracker_errors"] = int(metrics["tracker_errors"]) + errors
+            metrics["tracker_replies"] = int(metrics["tracker_replies"]) + replies
+            if errors:
+                message = f"{role} {label} saw {errors} tracker error alert(s)"
+                if fail_on_tracker_error:
+                    issues.append(message)
+                else:
+                    warnings.append(message)
+
+    return _behavior_probe_result(
+        "tracker_announces",
+        ok=not issues,
+        issues=issues,
+        warnings=warnings,
+        metrics=metrics,
+    )
+
+
+def _probe_progress_timeline(
+    event_summary: dict[str, object],
+) -> dict[str, object]:
+    issues: list[str] = []
+    warnings: list[str] = []
+    metrics: dict[str, object] = {}
+
+    leech_summary = event_summary.get("leech", {})
+    participants = leech_summary.get("participants", {}) if isinstance(leech_summary, dict) else {}
+    if not isinstance(participants, dict):
+        participants = {}
+
+    for label, raw in participants.items():
+        if not isinstance(raw, dict):
+            continue
+        sample_count = _int_value(raw.get("status_sample_count"))
+        first_progress = raw.get("first_progress_secs")
+        metrics[str(label)] = {
+            "status_samples": sample_count,
+            "first_peer_secs": raw.get("first_peer_secs"),
+            "first_progress_secs": first_progress,
+            "max_total_done": raw.get("max_total_done", 0),
+        }
+        if sample_count == 0:
+            warnings.append(f"leech {label} emitted no status timeline samples")
+        elif first_progress is None and _int_value(raw.get("max_total_done")) == 0:
+            issues.append(f"leech {label} never reported transfer progress")
+
+    return _behavior_probe_result(
+        "progress_timeline",
+        ok=not issues,
+        issues=issues,
+        warnings=warnings,
+        metrics=metrics,
+    )
+
+
+def _run_behavior_probes(
+    *,
+    scenario: LabScenario,
+    transfer_assertions: dict[str, object],
+    event_summary: dict[str, object],
+    tracker_summary: dict[str, object] | None,
+) -> dict[str, object]:
+    probe_names = set(scenario.behavior_probes)
+    probes: list[dict[str, object]] = []
+
+    if "transfer_accounting" in probe_names:
+        probes.append(
+            _behavior_probe_result(
+                "transfer_accounting",
+                ok=bool(transfer_assertions.get("ok")),
+                issues=[str(issue) for issue in transfer_assertions.get("issues", [])],
+                metrics={"check_count": len(transfer_assertions.get("checks", []))},
+            )
+        )
+    if "libtorrent_event_health" in probe_names:
+        probes.append(_probe_libtorrent_event_health(event_summary))
+    if "tracker_announces" in probe_names:
+        probes.append(
+            _probe_tracker_announces(
+                event_summary,
+                tracker_summary=tracker_summary,
+                fail_on_tracker_error=bool(scenario.assertions.get("fail_on_tracker_error", False)),
+            )
+        )
+    if "progress_timeline" in probe_names:
+        probes.append(_probe_progress_timeline(event_summary))
+
+    issues = [
+        issue
+        for probe in probes
+        if probe.get("ok") is not True
+        for issue in probe.get("issues", [])
+    ]
+    warnings = [
+        warning
+        for probe in probes
+        for warning in probe.get("warnings", [])
+    ]
+    return {
+        "ok": not issues,
+        "issues": issues,
+        "warnings": warnings,
+        "probes": probes,
+    }
+
+
 def _read_libtorrent_statuses(
     artifacts_roots: dict[int, Path],
     role: str,
@@ -1217,14 +1821,48 @@ def run_lab_scenario(
             final_seed_status,
             final_leech_status,
         )
-        if not transport_validation["ok"]:
-            summary["ok"] = False
+        libtorrent_events = _summarize_libtorrent_events(
+            active_seed_artifacts,
+            active_leech_artifacts,
+        )
+        assertions = _validate_transfer_accounting(
+            scenario=scenario,
+            source_payload_size=source_payload_size,
+            active_seed_count=active_seed_count,
+            active_leech_count=active_leech_count,
+            validation=validation,
+            seed_status=final_seed_status,
+            leech_status=final_leech_status,
+        )
+        expected_tracker_peers = (
+            active_seed_count if scenario.seed_client == CLIENT_LIBTORRENT else 1
+        ) + (active_leech_count if scenario.leech_client == CLIENT_LIBTORRENT else 1)
+        tracker_summary = _summarize_tracker_log(
+            compose.logs("tracker", tail=1000),
+            expected_peer_count=expected_tracker_peers,
+        )
+        behavior_probes = _run_behavior_probes(
+            scenario=scenario,
+            transfer_assertions=assertions,
+            event_summary=libtorrent_events,
+            tracker_summary=tracker_summary,
+        )
+        summary["ok"] = (
+            validation.get("ok") is True
+            and transport_validation.get("ok") is True
+            and assertions.get("ok") is True
+            and behavior_probes.get("ok") is True
+        )
 
         summary.update(
             {
                 "duration_secs": round(time.monotonic() - started_at, 3),
                 "validation": validation,
                 "transport_validation": transport_validation,
+                "assertions": assertions,
+                "behavior_probes": behavior_probes,
+                "libtorrent_events": libtorrent_events,
+                "tracker": tracker_summary,
                 "seed_status": final_seed_status,
                 "leech_status": final_leech_status,
             }
@@ -1255,6 +1893,8 @@ def _load_scenario(name: str) -> LabScenario:
 def _short_result(summary: dict[str, object]) -> dict[str, object]:
     validation = summary.get("validation", {})
     transport_validation = summary.get("transport_validation", {})
+    assertions = summary.get("assertions", {})
+    behavior_probes = summary.get("behavior_probes", {})
     return {
         "run_id": summary.get("run_id", ""),
         "scenario": summary.get("scenario", ""),
@@ -1270,6 +1910,15 @@ def _short_result(summary: dict[str, object]) -> dict[str, object]:
             transport_validation.get("issues", [])
             if isinstance(transport_validation, dict)
             else []
+        ),
+        "assertions_ok": assertions.get("ok") if isinstance(assertions, dict) else None,
+        "assertion_issues": assertions.get("issues", []) if isinstance(assertions, dict) else [],
+        "behavior_ok": behavior_probes.get("ok") if isinstance(behavior_probes, dict) else None,
+        "behavior_issues": (
+            behavior_probes.get("issues", []) if isinstance(behavior_probes, dict) else []
+        ),
+        "behavior_warnings": (
+            behavior_probes.get("warnings", []) if isinstance(behavior_probes, dict) else []
         ),
     }
 
@@ -1287,14 +1936,18 @@ def _matrix_markdown(summary: dict[str, object]) -> str:
         f"- Duration: {summary['duration_secs']}s",
         f"- Artifacts: `{summary['artifacts_dir']}`",
         "",
-        "| Scenario | Iteration | Result | Duration | Artifacts |",
-        "| --- | ---: | --- | ---: | --- |",
+        "| Scenario | Iteration | Result | Assertions | Behavior | Warnings | Duration | Artifacts |",
+        "| --- | ---: | --- | --- | --- | ---: | ---: | --- |",
     ]
     for result in summary["results"]:
         status = "PASS" if result.get("ok") else "FAIL"
         duration = result.get("duration_secs", 0)
+        assertions = "PASS" if result.get("assertions_ok") is not False else "FAIL"
+        behavior = "PASS" if result.get("behavior_ok") is not False else "FAIL"
+        warnings = len(result.get("behavior_warnings", []))
         lines.append(
             f"| {result['scenario']} | {result['iteration']} | {status} | "
+            f"{assertions} | {behavior} | {warnings} | "
             f"{duration}s | `{result.get('artifacts_dir', '')}` |"
         )
     return "\n".join(lines) + "\n"
@@ -1408,6 +2061,11 @@ def run_lab_matrix(
                     "validation_issues": [str(exc)],
                     "transport_ok": None,
                     "transport_issues": [],
+                    "assertions_ok": None,
+                    "assertion_issues": [str(exc)],
+                    "behavior_ok": None,
+                    "behavior_issues": [],
+                    "behavior_warnings": [],
                 }
             results.append(result)
             print(

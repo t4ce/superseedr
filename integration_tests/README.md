@@ -171,6 +171,8 @@ Matrix entrypoint:
 
 ```bash
 ./integration_tests/run_libtorrent_lab.sh --matrix smoke
+./integration_tests/run_libtorrent_lab.sh --matrix config
+./integration_tests/run_libtorrent_lab.sh --matrix behavior
 ./integration_tests/run_libtorrent_lab.sh --matrix full --repeat 2
 ```
 
@@ -206,6 +208,11 @@ Initial scenario names:
 - `libtorrent_to_superseedr_hybrid_nested`
 - `superseedr_to_libtorrent_tcp_fanout`
 - `libtorrent_to_superseedr_tcp_fanout`
+- `basic_ul_dl_tcp_only`
+- `basic_ul_dl_utp_only`
+- `basic_ul_dl_dht_lsd_enabled`
+- `superseedr_all_to_libtorrent_dual_stack`
+- `libtorrent_dual_stack_to_superseedr_all`
 
 Artifacts are written under:
 
@@ -216,6 +223,10 @@ matrix artifact directory.
 
 Profile runs also write `profile_summary.json` and `profile_summary.md` in
 their profile artifact directory.
+
+Per-scenario `summary.json` also includes stronger `assertions`, summarized
+`libtorrent_events`, and `behavior_probes` so completed-but-suspicious runs can
+fail or at least emit trendable warnings.
 
 ## Artifacts and Monitoring
 

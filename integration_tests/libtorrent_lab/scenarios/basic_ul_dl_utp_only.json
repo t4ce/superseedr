@@ -1,0 +1,23 @@
+{
+  "name": "basic_ul_dl_utp_only",
+  "description": "One libtorrent peer seeds one deterministic v1 fixture and one libtorrent peer downloads it with TCP disabled.",
+  "seed_client": "libtorrent",
+  "leech_client": "libtorrent",
+  "mode": "v1",
+  "torrent": "single_16k.bin.torrent",
+  "payload": "single/single_16k.bin",
+  "download_name": "single_16k.bin",
+  "timeout_secs": 120,
+  "seed_listen_port": 26881,
+  "leech_listen_port": 26882,
+  "libtorrent_settings": {
+    "enable_dht": false,
+    "enable_lsd": false,
+    "enable_natpmp": false,
+    "enable_upnp": false,
+    "enable_incoming_tcp": false,
+    "enable_outgoing_tcp": false,
+    "enable_incoming_utp": true,
+    "enable_outgoing_utp": true
+  }
+}

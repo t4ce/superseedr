@@ -75,6 +75,8 @@ Use matrix mode when you want a single pass/fail summary across a scenario set:
 ./integration_tests/run_libtorrent_lab.sh --matrix transport
 ./integration_tests/run_libtorrent_lab.sh --matrix fixtures
 ./integration_tests/run_libtorrent_lab.sh --matrix fanout
+./integration_tests/run_libtorrent_lab.sh --matrix config
+./integration_tests/run_libtorrent_lab.sh --matrix behavior
 ./integration_tests/run_libtorrent_lab.sh --matrix full
 ```
 
@@ -85,7 +87,20 @@ Repeat mode is the first flake detector:
 ```
 
 Each matrix writes `matrix_summary.json` and `matrix_summary.md` under its
-artifact directory, with links to the per-scenario run artifacts.
+artifact directory, with links to the per-scenario run artifacts. Matrix rows
+also show whether the stronger assertions and behavior probes passed and how
+many probe warnings were emitted.
+
+`config` covers focused libtorrent settings and transport-mode variants:
+
+- TCP-only libtorrent.
+- uTP-only libtorrent.
+- libtorrent DHT and local service discovery enabled.
+- Superseedr `all` mode against dual-stack libtorrent.
+- dual-stack libtorrent against Superseedr `all` mode.
+
+`behavior` is the first explicit probe lane. It runs the focused config
+surfaces that should keep producing stable protocol behavior artifacts.
 
 ## Profile Runs
 
@@ -139,6 +154,12 @@ integration_tests/artifacts/libtorrent_lab/<run_id>/
 Important files:
 
 - `summary.json`: scenario result and final peer status.
+- `summary.json.assertions`: stronger pass/fail checks for completed payload
+  bytes, participant completion, seed upload floors, and leech download floors.
+- `summary.json.behavior_probes`: probe results and warnings for transfer
+  accounting, libtorrent event health, tracker announces, and progress timing.
+- `summary.json.libtorrent_events`: summarized libtorrent alert/event counts
+  and per-peer progress timing.
 - `peers/seed/status.json`: latest seed status emitted by the peer.
 - `peers/seed/events.jsonl`: seed libtorrent events and alerts.
 - `peers/leech/status.json`: latest leech status emitted by the peer.
@@ -151,9 +172,10 @@ Scenarios live in `integration_tests/libtorrent_lab/scenarios/*.json`.
 
 Each scenario declares seed/leech client types, one torrent, one payload file,
 listen ports, timeout, optional libtorrent seed/leech counts, Superseedr peer
-transport, and the libtorrent settings applied to libtorrent peers. The
-libtorrent peer process takes a generated `/config/peer.json` and writes JSON
-status plus JSONL events to `/artifacts`.
+transport, optional behavior probes, optional assertion settings, and the
+libtorrent settings applied to libtorrent peers. The libtorrent peer process
+takes a generated `/config/peer.json` and writes JSON status plus JSONL events
+to `/artifacts`.
 
 Future scenarios should add knobs to the scenario manifest rather than baking
 new topology assumptions into the runner.
