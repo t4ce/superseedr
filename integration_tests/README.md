@@ -167,6 +167,23 @@ or:
 python3 -m integration_tests.libtorrent_lab.run --scenario basic_ul_dl
 ```
 
+Matrix entrypoint:
+
+```bash
+./integration_tests/run_libtorrent_lab.sh --matrix smoke
+./integration_tests/run_libtorrent_lab.sh --matrix full --repeat 2
+```
+
+Network impairment can be applied to any scenario or matrix with the `netem`
+flags:
+
+```bash
+./integration_tests/run_libtorrent_lab.sh --matrix transport \
+  --netem-delay-ms 50 \
+  --netem-jitter-ms 10 \
+  --netem-loss-pct 0.5
+```
+
 Initial scenario names:
 
 - `basic_ul_dl`
@@ -184,6 +201,9 @@ Initial scenario names:
 Artifacts are written under:
 
 - `integration_tests/artifacts/libtorrent_lab/<run_id>/`
+
+Matrix runs also write `matrix_summary.json` and `matrix_summary.md` in their
+matrix artifact directory.
 
 ## Artifacts and Monitoring
 

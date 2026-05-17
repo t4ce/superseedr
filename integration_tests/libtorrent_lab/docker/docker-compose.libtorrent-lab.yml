@@ -14,6 +14,8 @@ services:
       dockerfile: docker/Dockerfile.peer
     image: superseedr-libtorrent-lab-peer:bookworm
     init: true
+    cap_add:
+      - NET_ADMIN
     environment:
       - LIBTORRENT_LAB_CONFIG=/config/peer.json
     volumes:
@@ -27,6 +29,8 @@ services:
   libtorrent_seed_2:
     image: superseedr-libtorrent-lab-peer:bookworm
     init: true
+    cap_add:
+      - NET_ADMIN
     environment:
       - LIBTORRENT_LAB_CONFIG=/config/peer.json
     volumes:
@@ -40,6 +44,8 @@ services:
   libtorrent_seed_3:
     image: superseedr-libtorrent-lab-peer:bookworm
     init: true
+    cap_add:
+      - NET_ADMIN
     environment:
       - LIBTORRENT_LAB_CONFIG=/config/peer.json
     volumes:
@@ -53,6 +59,8 @@ services:
   libtorrent_leech:
     image: superseedr-libtorrent-lab-peer:bookworm
     init: true
+    cap_add:
+      - NET_ADMIN
     environment:
       - LIBTORRENT_LAB_CONFIG=/config/peer.json
     volumes:
@@ -66,6 +74,8 @@ services:
   libtorrent_leech_2:
     image: superseedr-libtorrent-lab-peer:bookworm
     init: true
+    cap_add:
+      - NET_ADMIN
     environment:
       - LIBTORRENT_LAB_CONFIG=/config/peer.json
     volumes:
@@ -79,6 +89,8 @@ services:
   libtorrent_leech_3:
     image: superseedr-libtorrent-lab-peer:bookworm
     init: true
+    cap_add:
+      - NET_ADMIN
     environment:
       - LIBTORRENT_LAB_CONFIG=/config/peer.json
     volumes:
@@ -97,6 +109,8 @@ services:
     tty: true
     stdin_open: true
     init: true
+    cap_add:
+      - NET_ADMIN
     environment:
       - SUPERSEEDR_CLIENT_PORT=16881
       - SUPERSEEDR_OUTPUT_STATUS_INTERVAL=${LIBTORRENT_LAB_STATUS_INTERVAL:-1}
@@ -115,6 +129,8 @@ services:
     tty: true
     stdin_open: true
     init: true
+    cap_add:
+      - NET_ADMIN
     environment:
       - SUPERSEEDR_CLIENT_PORT=16882
       - SUPERSEEDR_OUTPUT_STATUS_INTERVAL=${LIBTORRENT_LAB_STATUS_INTERVAL:-1}

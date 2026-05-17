@@ -27,6 +27,36 @@ CLIENT_LIBTORRENT = "libtorrent"
 CLIENT_SUPERSEEDR = "superseedr"
 CLIENTS = {CLIENT_LIBTORRENT, CLIENT_SUPERSEEDR}
 MAX_LIBTORRENT_FANOUT = 3
+LAB_MATRIXES: dict[str, list[str]] = {
+    "smoke": [
+        "basic_ul_dl",
+        "superseedr_to_libtorrent",
+        "libtorrent_to_superseedr",
+    ],
+    "transport": [
+        "superseedr_to_libtorrent",
+        "libtorrent_to_superseedr",
+        "superseedr_utp_to_libtorrent",
+        "libtorrent_utp_to_superseedr",
+    ],
+    "fixtures": [
+        "superseedr_to_libtorrent_v1_multi_file",
+        "libtorrent_to_superseedr_v1_nested",
+        "superseedr_to_libtorrent_v2_multi_file",
+        "libtorrent_to_superseedr_hybrid_nested",
+    ],
+    "fanout": [
+        "superseedr_to_libtorrent_tcp_fanout",
+        "libtorrent_to_superseedr_tcp_fanout",
+    ],
+}
+LAB_MATRIXES["full"] = [
+    *LAB_MATRIXES["smoke"],
+    "superseedr_utp_to_libtorrent",
+    "libtorrent_utp_to_superseedr",
+    *LAB_MATRIXES["fixtures"],
+    *LAB_MATRIXES["fanout"],
+]
 
 
 @dataclass(frozen=True)
@@ -83,6 +113,53 @@ class LabScenario:
         )
 
 
+@dataclass(frozen=True)
+class NetworkImpairment:
+    delay_ms: int = 0
+    jitter_ms: int = 0
+    loss_pct: float = 0.0
+    duplicate_pct: float = 0.0
+    corrupt_pct: float = 0.0
+    reorder_pct: float = 0.0
+
+    def enabled(self) -> bool:
+        return any(
+            value > 0
+            for value in (
+                self.delay_ms,
+                self.jitter_ms,
+                self.loss_pct,
+                self.duplicate_pct,
+                self.corrupt_pct,
+                self.reorder_pct,
+            )
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "enabled": self.enabled(),
+            "delay_ms": self.delay_ms,
+            "jitter_ms": self.jitter_ms,
+            "loss_pct": self.loss_pct,
+            "duplicate_pct": self.duplicate_pct,
+            "corrupt_pct": self.corrupt_pct,
+            "reorder_pct": self.reorder_pct,
+        }
+
+
+def _validate_impairment(config: NetworkImpairment) -> None:
+    if config.delay_ms < 0 or config.jitter_ms < 0:
+        raise ValueError("Network impairment delay and jitter must be non-negative")
+    for label, value in (
+        ("loss_pct", config.loss_pct),
+        ("duplicate_pct", config.duplicate_pct),
+        ("corrupt_pct", config.corrupt_pct),
+        ("reorder_pct", config.reorder_pct),
+    ):
+        if value < 0 or value > 100:
+            raise ValueError(f"Network impairment {label} must be in range 0..100")
+
+
 def _utc_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
@@ -96,6 +173,14 @@ def _reserve_local_port() -> int:
 def _project_name(run_id: str) -> str:
     safe = "".join(ch.lower() if ch.isalnum() else "" for ch in run_id)
     return f"ltlab{safe}"[:48]
+
+
+def _scenario_names_for_matrix(matrix: str) -> list[str]:
+    try:
+        return LAB_MATRIXES[matrix]
+    except KeyError as exc:
+        known = ", ".join(sorted(LAB_MATRIXES))
+        raise ValueError(f"Unknown libtorrent lab matrix {matrix!r}; expected one of: {known}") from exc
 
 
 def _libtorrent_service(role: str, index: int) -> str:
@@ -137,6 +222,66 @@ def _sha256_file(path: Path) -> str:
 def _write_json(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _pct(value: float) -> str:
+    text = f"{value:.3f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _netem_command(config: NetworkImpairment) -> list[str]:
+    _validate_impairment(config)
+    args = ["tc", "qdisc", "replace", "dev", "eth0", "root", "netem"]
+    if config.delay_ms > 0 or config.jitter_ms > 0:
+        args.extend(["delay", f"{config.delay_ms}ms"])
+        if config.jitter_ms > 0:
+            args.append(f"{config.jitter_ms}ms")
+    if config.loss_pct > 0:
+        args.extend(["loss", f"{_pct(config.loss_pct)}%"])
+    if config.duplicate_pct > 0:
+        args.extend(["duplicate", f"{_pct(config.duplicate_pct)}%"])
+    if config.corrupt_pct > 0:
+        args.extend(["corrupt", f"{_pct(config.corrupt_pct)}%"])
+    if config.reorder_pct > 0:
+        args.extend(["reorder", f"{_pct(config.reorder_pct)}%", "50%"])
+    return args
+
+
+def _apply_network_impairment(
+    compose: DockerCompose,
+    services: list[str],
+    config: NetworkImpairment,
+) -> dict[str, object]:
+    if not config.enabled():
+        return {
+            "enabled": False,
+            "config": config.as_dict(),
+            "services": [],
+            "issues": [],
+            "ok": True,
+        }
+
+    command = _netem_command(config)
+    issues: list[str] = []
+    applied_services: list[str] = []
+    for service in services:
+        result = compose.exec(service, command, check=False, capture=True)
+        if result.returncode == 0:
+            applied_services.append(service)
+            continue
+        issues.append(
+            f"{service}: tc exited {result.returncode}: "
+            f"{(result.stderr or result.stdout).strip()}"
+        )
+
+    return {
+        "enabled": True,
+        "config": config.as_dict(),
+        "command": command,
+        "services": applied_services,
+        "issues": issues,
+        "ok": not issues,
+    }
 
 
 def _wait_for_tracker(port: int, timeout_secs: int = 20) -> None:
@@ -675,9 +820,12 @@ def run_lab_scenario(
     run_id: str,
     timeout_secs: int | None = None,
     skip_build: bool = False,
+    network_impairment: NetworkImpairment | None = None,
 ) -> dict[str, object]:
     paths = resolve_paths()
     timeout = timeout_secs or scenario.timeout_secs
+    impairment = network_impairment or NetworkImpairment()
+    _validate_impairment(impairment)
     run_root = paths.artifacts_root / "libtorrent_lab" / run_id
     runtime_root = run_root / "runtime"
     fixtures_root = runtime_root / "fixtures"
@@ -849,6 +997,7 @@ def run_lab_scenario(
         "libtorrent_seed_count": active_seed_count,
         "libtorrent_leech_count": active_leech_count,
         "superseedr_peer_transport": scenario.superseedr_peer_transport,
+        "network_impairment": impairment.as_dict(),
         "artifacts_dir": str(run_root),
         "ok": False,
     }
@@ -880,6 +1029,17 @@ def run_lab_scenario(
             for artifacts_root in active_seed_artifacts.values():
                 _wait_for_seed_ready(artifacts_root / "status.json", timeout_secs=30)
         compose.up(leech_services, no_build=True)
+        impairment_result = _apply_network_impairment(
+            compose,
+            [*seed_services, *leech_services],
+            impairment,
+        )
+        summary["network_impairment"] = impairment_result
+        if impairment_result.get("issues"):
+            raise RuntimeError(
+                "Failed to apply network impairment: "
+                + "; ".join(str(issue) for issue in impairment_result["issues"])
+            )
 
         deadline = time.monotonic() + timeout
         validation: dict[str, object] = {"ok": False, "issues": ["not checked"]}
@@ -970,27 +1130,215 @@ def run_lab_scenario(
         compose.down()
 
 
+def _scenario_path(name: str) -> Path:
+    return SCENARIOS_ROOT / f"{name}.json"
+
+
+def _load_scenario(name: str) -> LabScenario:
+    path = _scenario_path(name)
+    if not path.exists():
+        raise ValueError(f"Unknown libtorrent lab scenario: {name}")
+    return LabScenario.from_file(path)
+
+
+def _short_result(summary: dict[str, object]) -> dict[str, object]:
+    validation = summary.get("validation", {})
+    transport_validation = summary.get("transport_validation", {})
+    return {
+        "run_id": summary.get("run_id", ""),
+        "scenario": summary.get("scenario", ""),
+        "ok": bool(summary.get("ok", False)),
+        "duration_secs": summary.get("duration_secs", 0),
+        "artifacts_dir": summary.get("artifacts_dir", ""),
+        "validation_ok": validation.get("ok") if isinstance(validation, dict) else None,
+        "validation_issues": validation.get("issues", []) if isinstance(validation, dict) else [],
+        "transport_ok": (
+            transport_validation.get("ok") if isinstance(transport_validation, dict) else None
+        ),
+        "transport_issues": (
+            transport_validation.get("issues", [])
+            if isinstance(transport_validation, dict)
+            else []
+        ),
+    }
+
+
+def _matrix_markdown(summary: dict[str, object]) -> str:
+    lines = [
+        f"# Libtorrent Lab Matrix: {summary['matrix']}",
+        "",
+        f"- Result: {'PASS' if summary['ok'] else 'FAIL'}",
+        f"- Scenarios: {summary['scenario_count']}",
+        f"- Attempts: {summary['attempt_count']}",
+        f"- Passed: {summary['passed_attempts']}",
+        f"- Failed: {summary['failed_attempts']}",
+        f"- Repeat count: {summary['repeat_count']}",
+        f"- Duration: {summary['duration_secs']}s",
+        f"- Artifacts: `{summary['artifacts_dir']}`",
+        "",
+        "| Scenario | Iteration | Result | Duration | Artifacts |",
+        "| --- | ---: | --- | ---: | --- |",
+    ]
+    for result in summary["results"]:
+        status = "PASS" if result.get("ok") else "FAIL"
+        duration = result.get("duration_secs", 0)
+        lines.append(
+            f"| {result['scenario']} | {result['iteration']} | {status} | "
+            f"{duration}s | `{result.get('artifacts_dir', '')}` |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def run_lab_matrix(
+    *,
+    matrix: str,
+    run_id: str,
+    timeout_secs: int | None = None,
+    skip_build: bool = False,
+    repeat: int = 1,
+    fail_fast: bool = False,
+    network_impairment: NetworkImpairment | None = None,
+) -> dict[str, object]:
+    if repeat < 1:
+        raise ValueError("repeat must be at least 1")
+
+    scenario_names = _scenario_names_for_matrix(matrix)
+    paths = resolve_paths()
+    matrix_root = paths.artifacts_root / "libtorrent_lab" / run_id
+    matrix_root.mkdir(parents=True, exist_ok=True)
+    impairment = network_impairment or NetworkImpairment()
+    _validate_impairment(impairment)
+
+    started_at = time.monotonic()
+    results: list[dict[str, object]] = []
+    libtorrent_image_built = False
+    superseedr_image_built = False
+
+    for iteration in range(1, repeat + 1):
+        for scenario_name in scenario_names:
+            scenario = _load_scenario(scenario_name)
+            scenario_run_id = f"{run_id}_{scenario.name}_r{iteration}"
+            needs_superseedr = CLIENT_SUPERSEEDR in {scenario.seed_client, scenario.leech_client}
+            effective_skip_build = skip_build or (
+                libtorrent_image_built and (superseedr_image_built or not needs_superseedr)
+            )
+            try:
+                scenario_summary = run_lab_scenario(
+                    scenario=scenario,
+                    run_id=scenario_run_id,
+                    timeout_secs=timeout_secs,
+                    skip_build=effective_skip_build,
+                    network_impairment=impairment,
+                )
+                libtorrent_image_built = True
+                if needs_superseedr:
+                    superseedr_image_built = True
+                result = {
+                    **_short_result(scenario_summary),
+                    "iteration": iteration,
+                }
+            except Exception as exc:
+                result = {
+                    "run_id": scenario_run_id,
+                    "scenario": scenario.name,
+                    "iteration": iteration,
+                    "ok": False,
+                    "duration_secs": 0,
+                    "artifacts_dir": str(paths.artifacts_root / "libtorrent_lab" / scenario_run_id),
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "validation_ok": None,
+                    "validation_issues": [str(exc)],
+                    "transport_ok": None,
+                    "transport_issues": [],
+                }
+            results.append(result)
+            print(
+                "LIBTORRENT_LAB_MATRIX_STEP "
+                f"{'PASS' if result['ok'] else 'FAIL'} "
+                f"matrix={matrix} scenario={scenario.name} iteration={iteration} "
+                f"artifacts={result['artifacts_dir']}"
+            )
+            if fail_fast and not result["ok"]:
+                break
+        if fail_fast and results and not results[-1]["ok"]:
+            break
+
+    passed = sum(1 for result in results if result.get("ok") is True)
+    failed = len(results) - passed
+    summary: dict[str, object] = {
+        "run_id": run_id,
+        "matrix": matrix,
+        "ok": failed == 0,
+        "scenario_count": len(scenario_names),
+        "attempt_count": len(results),
+        "passed_attempts": passed,
+        "failed_attempts": failed,
+        "repeat_count": repeat,
+        "fail_fast": fail_fast,
+        "network_impairment": impairment.as_dict(),
+        "duration_secs": round(time.monotonic() - started_at, 3),
+        "artifacts_dir": str(matrix_root),
+        "results": results,
+    }
+    _write_json(matrix_root / "matrix_summary.json", summary)
+    (matrix_root / "matrix_summary.md").write_text(_matrix_markdown(summary), encoding="utf-8")
+    return summary
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run Dockerized libtorrent lab scenarios")
     p.add_argument("--scenario", default="basic_ul_dl")
+    p.add_argument("--matrix", choices=sorted(LAB_MATRIXES), default="")
     p.add_argument("--run-id", default="")
     p.add_argument("--timeout-secs", type=int, default=0)
     p.add_argument("--skip-build", action="store_true")
+    p.add_argument("--repeat", type=int, default=1)
+    p.add_argument("--fail-fast", action="store_true")
+    p.add_argument("--netem-delay-ms", type=int, default=0)
+    p.add_argument("--netem-jitter-ms", type=int, default=0)
+    p.add_argument("--netem-loss-pct", type=float, default=0.0)
+    p.add_argument("--netem-duplicate-pct", type=float, default=0.0)
+    p.add_argument("--netem-corrupt-pct", type=float, default=0.0)
+    p.add_argument("--netem-reorder-pct", type=float, default=0.0)
     return p.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    scenario_path = SCENARIOS_ROOT / f"{args.scenario}.json"
-    if not scenario_path.exists():
-        raise SystemExit(f"Unknown libtorrent lab scenario: {args.scenario}")
-    scenario = LabScenario.from_file(scenario_path)
+    impairment = NetworkImpairment(
+        delay_ms=args.netem_delay_ms,
+        jitter_ms=args.netem_jitter_ms,
+        loss_pct=args.netem_loss_pct,
+        duplicate_pct=args.netem_duplicate_pct,
+        corrupt_pct=args.netem_corrupt_pct,
+        reorder_pct=args.netem_reorder_pct,
+    )
+    _validate_impairment(impairment)
+    if args.matrix:
+        run_id = args.run_id or f"libtorrent_lab_matrix_{args.matrix}_{_utc_stamp()}"
+        summary = run_lab_matrix(
+            matrix=args.matrix,
+            run_id=run_id,
+            timeout_secs=args.timeout_secs or None,
+            skip_build=args.skip_build,
+            repeat=args.repeat,
+            fail_fast=args.fail_fast,
+            network_impairment=impairment,
+        )
+        print(
+            "LIBTORRENT_LAB_MATRIX_RESULT "
+            f"{'PASS' if summary['ok'] else 'FAIL'} artifacts={summary['artifacts_dir']}"
+        )
+        return 0 if summary["ok"] else 1
+
+    scenario = _load_scenario(args.scenario)
     run_id = args.run_id or f"libtorrent_lab_{scenario.name}_{_utc_stamp()}"
     summary = run_lab_scenario(
         scenario=scenario,
         run_id=run_id,
         timeout_secs=args.timeout_secs or None,
         skip_build=args.skip_build,
+        network_impairment=impairment,
     )
     print(f"LIBTORRENT_LAB_RESULT {'PASS' if summary['ok'] else 'FAIL'} artifacts={summary['artifacts_dir']}")
     return 0 if summary["ok"] else 1

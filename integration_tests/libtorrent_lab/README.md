@@ -66,6 +66,43 @@ Fanout scenarios activate three libtorrent peers on one side:
 ./integration_tests/run_libtorrent_lab.sh libtorrent_to_superseedr_tcp_fanout
 ```
 
+## Matrix Runs
+
+Use matrix mode when you want a single pass/fail summary across a scenario set:
+
+```bash
+./integration_tests/run_libtorrent_lab.sh --matrix smoke
+./integration_tests/run_libtorrent_lab.sh --matrix transport
+./integration_tests/run_libtorrent_lab.sh --matrix fixtures
+./integration_tests/run_libtorrent_lab.sh --matrix fanout
+./integration_tests/run_libtorrent_lab.sh --matrix full
+```
+
+Repeat mode is the first flake detector:
+
+```bash
+./integration_tests/run_libtorrent_lab.sh --matrix smoke --repeat 3
+```
+
+Each matrix writes `matrix_summary.json` and `matrix_summary.md` under its
+artifact directory, with links to the per-scenario run artifacts.
+
+## Network Impairment
+
+Scenario and matrix runs can apply Docker `tc netem` impairment to active peer
+containers:
+
+```bash
+./integration_tests/run_libtorrent_lab.sh superseedr_to_libtorrent \
+  --netem-delay-ms 50 \
+  --netem-jitter-ms 10 \
+  --netem-loss-pct 0.5
+```
+
+The lab images include `iproute2`, and peer containers run with `NET_ADMIN` so
+the runner can apply delay, jitter, loss, duplicate, corruption, and reorder
+knobs before validation.
+
 The Superseedr containers use `docker/Dockerfile.superseedr`, which builds a
 debug binary for fast lab iteration instead of the production release image.
 

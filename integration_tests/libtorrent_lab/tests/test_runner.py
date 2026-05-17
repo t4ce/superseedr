@@ -6,8 +6,12 @@ from integration_tests.libtorrent_lab.run import (
     CLIENT_LIBTORRENT,
     CLIENT_SUPERSEEDR,
     LabScenario,
+    NetworkImpairment,
     _client_payload_path,
+    _matrix_markdown,
+    _netem_command,
     _project_name,
+    _scenario_names_for_matrix,
     _superseedr_seed_is_ready,
     _superseedr_download_path,
     _validate_superseedr_transport_observations,
@@ -121,6 +125,89 @@ def test_load_fanout_scenarios() -> None:
     assert libtorrent_seed.libtorrent_leech_count == 1
 
 
+def test_matrix_scenario_sets_are_stable() -> None:
+    assert _scenario_names_for_matrix("smoke") == [
+        "basic_ul_dl",
+        "superseedr_to_libtorrent",
+        "libtorrent_to_superseedr",
+    ]
+    assert _scenario_names_for_matrix("fanout") == [
+        "superseedr_to_libtorrent_tcp_fanout",
+        "libtorrent_to_superseedr_tcp_fanout",
+    ]
+    assert len(_scenario_names_for_matrix("full")) == 11
+
+
+def test_netem_command_includes_impairment_knobs() -> None:
+    command = _netem_command(
+        NetworkImpairment(
+            delay_ms=25,
+            jitter_ms=5,
+            loss_pct=1.5,
+            duplicate_pct=0.25,
+            corrupt_pct=0.1,
+            reorder_pct=2.0,
+        )
+    )
+
+    assert command == [
+        "tc",
+        "qdisc",
+        "replace",
+        "dev",
+        "eth0",
+        "root",
+        "netem",
+        "delay",
+        "25ms",
+        "5ms",
+        "loss",
+        "1.5%",
+        "duplicate",
+        "0.25%",
+        "corrupt",
+        "0.1%",
+        "reorder",
+        "2%",
+        "50%",
+    ]
+
+
+def test_matrix_markdown_summarizes_results() -> None:
+    markdown = _matrix_markdown(
+        {
+            "matrix": "smoke",
+            "ok": False,
+            "scenario_count": 1,
+            "attempt_count": 2,
+            "passed_attempts": 1,
+            "failed_attempts": 1,
+            "repeat_count": 2,
+            "duration_secs": 12.5,
+            "artifacts_dir": "/tmp/lab",
+            "results": [
+                {
+                    "scenario": "basic_ul_dl",
+                    "iteration": 1,
+                    "ok": True,
+                    "duration_secs": 3.0,
+                    "artifacts_dir": "/tmp/lab/one",
+                },
+                {
+                    "scenario": "basic_ul_dl",
+                    "iteration": 2,
+                    "ok": False,
+                    "duration_secs": 4.0,
+                    "artifacts_dir": "/tmp/lab/two",
+                },
+            ],
+        }
+    )
+
+    assert "Result: FAIL" in markdown
+    assert "| basic_ul_dl | 2 | FAIL | 4.0s | `/tmp/lab/two` |" in markdown
+
+
 def test_superseedr_lab_uses_fast_lab_image() -> None:
     compose = Path(
         "integration_tests/libtorrent_lab/docker/docker-compose.libtorrent-lab.yml"
@@ -128,6 +215,22 @@ def test_superseedr_lab_uses_fast_lab_image() -> None:
 
     assert "integration_tests/libtorrent_lab/docker/Dockerfile.superseedr" in compose
     assert "dockerfile: Dockerfile" not in compose
+
+
+def test_lab_images_include_netem_prerequisites() -> None:
+    peer_dockerfile = Path(
+        "integration_tests/libtorrent_lab/docker/Dockerfile.peer"
+    ).read_text(encoding="utf-8")
+    superseedr_dockerfile = Path(
+        "integration_tests/libtorrent_lab/docker/Dockerfile.superseedr"
+    ).read_text(encoding="utf-8")
+    compose = Path(
+        "integration_tests/libtorrent_lab/docker/docker-compose.libtorrent-lab.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "iproute2" in peer_dockerfile
+    assert "iproute2" in superseedr_dockerfile
+    assert "NET_ADMIN" in compose
 
 
 def test_superseedr_seed_ready_accepts_completed_data() -> None:
