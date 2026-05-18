@@ -586,6 +586,8 @@ fn init_tracing(
     let quiet_filter = Targets::new()
         .with_default(DEFAULT_LOG_FILTER)
         .with_target("mainline::rpc::socket", LevelFilter::ERROR);
+    let attempted_file_logging = !log_dirs.is_empty();
+    let mut suppressed_warnings = Vec::new();
     for log_dir in log_dirs {
         if let Err(error) = fs::create_dir_all(&log_dir) {
             let message = format!(
@@ -593,9 +595,7 @@ fn init_tracing(
                 log_dir.display(),
                 error
             );
-            if emit_stderr {
-                eprintln!("[Warn] {}", message);
-            }
+            report_logging_setup_warning(message, emit_stderr, &mut suppressed_warnings);
         } else {
             match logging::non_blocking_daily_file_writer_with_stderr_reporting(
                 &log_dir,
@@ -619,9 +619,11 @@ fn init_tracing(
                             "Failed to initialize tracing subscriber for file logging at {}",
                             log_dir.display()
                         );
-                        if emit_stderr {
-                            eprintln!("[Warn] {}", message);
-                        }
+                        report_logging_setup_warning(
+                            message,
+                            emit_stderr,
+                            &mut suppressed_warnings,
+                        );
                     }
                 }
                 Err(error) => {
@@ -630,27 +632,51 @@ fn init_tracing(
                         log_dir.display(),
                         error
                     );
-                    if emit_stderr {
-                        eprintln!("[Warn] {}", message);
-                    }
+                    report_logging_setup_warning(message, emit_stderr, &mut suppressed_warnings);
                 }
             }
         }
     }
 
-    let fallback_layer = if emit_stderr {
-        fmt::layer().with_filter(quiet_filter).boxed()
-    } else {
-        fmt::layer()
-            .with_writer(io::sink)
-            .with_filter(quiet_filter)
-            .boxed()
-    };
+    if !emit_stderr {
+        eprintln!(
+            "[Warn] {}",
+            final_logging_fallback_message(attempted_file_logging)
+        );
+        for warning in &suppressed_warnings {
+            eprintln!("[Warn] {}", warning);
+        }
+    }
+
+    let fallback_layer = fmt::layer()
+        .with_writer(io::stderr)
+        .with_filter(quiet_filter)
+        .boxed();
     let _ = tracing_subscriber::registry()
         .with(fallback_layer)
         .try_init();
 
     Vec::new()
+}
+
+fn report_logging_setup_warning(
+    message: String,
+    emit_stderr: bool,
+    suppressed_warnings: &mut Vec<String>,
+) {
+    if emit_stderr {
+        eprintln!("[Warn] {}", message);
+    } else {
+        suppressed_warnings.push(message);
+    }
+}
+
+fn final_logging_fallback_message(attempted_file_logging: bool) -> &'static str {
+    if attempted_file_logging {
+        "File logging is unavailable; using stderr fallback for diagnostics."
+    } else {
+        "No file logging directories were available; using stderr fallback for diagnostics."
+    }
 }
 
 fn already_running_message() -> &'static str {
@@ -3347,6 +3373,34 @@ mod tests {
     #[test]
     fn already_running_message_matches_terminal_text() {
         assert_eq!(already_running_message(), "superseedr is already running.");
+    }
+
+    #[test]
+    fn final_logging_fallback_message_reports_emergency_stderr_path() {
+        assert_eq!(
+            final_logging_fallback_message(true),
+            "File logging is unavailable; using stderr fallback for diagnostics."
+        );
+        assert_eq!(
+            final_logging_fallback_message(false),
+            "No file logging directories were available; using stderr fallback for diagnostics."
+        );
+    }
+
+    #[test]
+    fn logging_setup_warning_is_collected_when_stderr_is_suppressed() {
+        let mut suppressed_warnings = Vec::new();
+
+        report_logging_setup_warning(
+            "Failed to initialize file logging at /tmp/demo: denied".to_string(),
+            false,
+            &mut suppressed_warnings,
+        );
+
+        assert_eq!(
+            suppressed_warnings,
+            vec!["Failed to initialize file logging at /tmp/demo: denied"]
+        );
     }
 
     #[test]

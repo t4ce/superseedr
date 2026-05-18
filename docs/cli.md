@@ -67,6 +67,24 @@ cargo run --release --features synthetic-load -- benchmark --max-torrents 1000 -
 See [`docs/synthetic-benchmark.md`](synthetic-benchmark.md) for deeper
 synthetic load testing, disk-budget behavior, and per-scenario examples.
 
+## Runtime Peer Transport
+
+Production peer transport enables TCP and uTP by default. When both transports
+are enabled, Superseedr races uTP and TCP connection attempts so a slow or
+unreachable uTP path does not block TCP fallback.
+
+Use `SUPERSEEDR_PEER_TRANSPORT` to override the default:
+
+- `all`: enable TCP and uTP; this is the default
+- `tcp`: use TCP only
+- `utp`: use uTP only
+
+Example:
+
+```bash
+SUPERSEEDR_PEER_TRANSPORT=tcp superseedr
+```
+
 ## Targeting Torrents
 
 Many commands accept either:
@@ -506,4 +524,3 @@ Errors return:
   "error": "..."
 }
 ```
-

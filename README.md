@@ -16,9 +16,10 @@ Superseedr is a modern Rust BitTorrent client featuring a high-performance termi
 
 | **Experience** | **Networking** | **Engineering** |
 | :--- | :--- | :--- |
-| 🎨 **60 FPS TUI + Themes**<br>Fluid, animated interface with heatmaps and 40 live-switchable built-in themes. | 🐳 **Docker + VPN**<br>Gluetun integration with dynamic port reloading. | 🧬 **BitTorrent v2**<br>Hybrid swarms & Merkle tree verification. |
+| 🎨 **60 FPS TUI + Themes**<br>Fluid, animated interface with heatmaps and 40 live-switchable built-in themes. | 🔁 **TCP + uTP Peers**<br>Production peer transport enables TCP and uTP by default, with TCP retained as fallback. | 🧬 **BitTorrent v2**<br>Hybrid swarms & Merkle tree verification. |
 | 📰 **RSS Feeds**<br>In-app feed tracking, filtering, and ingest. | 🧩 **Cluster Mode**<br>OS-agnostic shared torrent catalog with automatic failover. | 🧠 **Self-Tuning**<br>Adaptive limits control for max speed and I/O Stability. |
-| 🧲 **Magnet Links**<br>Native OS-level handler support. | 👻 **Private Mode**<br>Optional builds disabling DHT/PEX. | 📡 **Integrity Prober**<br>Continuous lightweight background integrity checks with fast recovery reprobes. |
+| 🧲 **Magnet Links**<br>Native OS-level handler support. | 🐳 **Docker + VPN**<br>Gluetun integration with dynamic port reloading. | 📡 **Integrity Prober**<br>Continuous lightweight background integrity checks with fast recovery reprobes. |
+| ⌨️ **CLI Control**<br>Scriptable commands for status, queue control, and offline-capable operations. | 👻 **Private Mode**<br>Optional builds disabling DHT/PEX. | 🧪 **Fuzzing Harnesses**<br>Protocol decoders and transport paths are exercised through fuzz targets. |
 
 ### Terminal Torrenting With Superseedr
 
@@ -455,8 +456,5 @@ Superseedr implements the following BitTorrent Enhancement Proposals (BEPs):
 * **BEP 52:** The BitTorrent Protocol v2
 
 </details>
-
-
-
 
 
