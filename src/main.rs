@@ -638,7 +638,8 @@ fn init_tracing(
         }
     }
 
-    if !emit_stderr {
+    let fallback_mode = fallback_tracing_mode(emit_stderr);
+    if fallback_mode == FallbackTracingMode::Stderr {
         eprintln!(
             "[Warn] {}",
             final_logging_fallback_message(attempted_file_logging)
@@ -648,15 +649,40 @@ fn init_tracing(
         }
     }
 
-    let fallback_layer = fmt::layer()
-        .with_writer(io::stderr)
-        .with_filter(quiet_filter)
-        .boxed();
+    let fallback_layer = match fallback_mode {
+        FallbackTracingMode::Stderr => fmt::layer()
+            .with_writer(io::stderr)
+            .with_filter(quiet_filter)
+            .boxed(),
+        FallbackTracingMode::Sink => {
+            let sink_filter = Targets::new()
+                .with_default(LevelFilter::WARN)
+                .with_target("mainline::rpc::socket", LevelFilter::ERROR);
+            fmt::layer()
+                .with_writer(io::sink)
+                .with_filter(sink_filter)
+                .boxed()
+        }
+    };
     let _ = tracing_subscriber::registry()
         .with(fallback_layer)
         .try_init();
 
     Vec::new()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FallbackTracingMode {
+    Stderr,
+    Sink,
+}
+
+fn fallback_tracing_mode(emit_stderr: bool) -> FallbackTracingMode {
+    if emit_stderr {
+        FallbackTracingMode::Stderr
+    } else {
+        FallbackTracingMode::Sink
+    }
 }
 
 fn report_logging_setup_warning(
@@ -3385,6 +3411,12 @@ mod tests {
             final_logging_fallback_message(false),
             "No file logging directories were available; using stderr fallback for diagnostics."
         );
+    }
+
+    #[test]
+    fn fallback_tracing_mode_keeps_non_cli_fallback_off_stderr() {
+        assert_eq!(fallback_tracing_mode(false), FallbackTracingMode::Sink);
+        assert_eq!(fallback_tracing_mode(true), FallbackTracingMode::Stderr);
     }
 
     #[test]
