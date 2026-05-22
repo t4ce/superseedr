@@ -113,7 +113,9 @@ use sysinfo::System;
 
 use tracing::{event as tracing_event, Level};
 
-use crate::resource_manager::{ResourceManager, ResourceManagerClient};
+use crate::resource_manager::{
+    PermitGuard, ResourceManager, ResourceManagerClient, ResourceManagerError,
+};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
@@ -153,14 +155,27 @@ const RSS_MANUAL_DOWNLOAD_TIMEOUT_SECS: u64 = 20;
 const NETWORK_HISTORY_PERSIST_INTERVAL_SECS: u64 = 15 * 60;
 const WATCH_FOLDER_RESCAN_INTERVAL_SECS: u64 = 5;
 const SHARED_ROLE_RETRY_INTERVAL_SECS: u64 = 2;
-const STARTUP_ROLLING_BATCH_SIZE: usize = 1;
 const STARTUP_ROLLING_BATCH_INTERVAL_SECS: u64 = 1;
 const STARTUP_ROLLING_LOADS_PER_INTERVAL: usize = 1;
+const STARTUP_ROLLING_WARMUP_DELAY_SECS: u64 = 1;
+const STARTUP_ROLLING_PRESSURE_DELAY_SECS: u64 = 3;
+const STARTUP_ROLLING_WAKE_HOLD_RATIO: f64 = 0.35;
+const STARTUP_ROLLING_DRAW_HOLD_RATIO: f64 = 0.90;
+const STARTUP_ROLLING_CPU_HOLD_PERCENT: f32 = 85.0;
 
 const SHUTDOWN_TIMEOUT_SECS: u64 = 20;
 const INCOMING_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+const INCOMING_PEER_HANDSHAKE_QUEUE_SIZE: usize = 1024;
 const PORT_FAMILY_HIGHLIGHT_DURATION: Duration = Duration::from_secs(2);
 const UI_FPS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+const UI_RESPONSIVENESS_EMA_ALPHA: f64 = 0.35;
+const WAKE_LAG_PEER_THROTTLE_BAD_RATIO: f64 = 0.25;
+const WAKE_LAG_PEER_THROTTLE_GOOD_RATIO: f64 = 0.12;
+const WAKE_LAG_PEER_THROTTLE_GOOD_TICKS: u8 = 3;
+const WAKE_LAG_PEER_THROTTLE_ADDITIVE_STEP_PEERS: usize = 256;
+const WAKE_LAG_PEER_THROTTLE_ADDITIVE_STEP_PERCENT: usize = 10;
+const WAKE_LAG_PEER_THROTTLE_RECOVERY_HEADROOM_PEERS: usize = 512;
+const WAKE_LAG_PEER_THROTTLE_MIN_PEERS: usize = 8;
 const NORMAL_IDLE_FRAME_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 const NORMAL_ANIMATION_RECENT_BLOCK_ROWS: usize = 64;
 const NORMAL_ANIMATION_RECENT_PEER_EVENTS: usize = 120;
@@ -571,7 +586,7 @@ impl DataRate {
     }
 }
 
-#[derive(Default, Clone, Debug)]
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct CalculatedLimits {
     pub reserve_permits: usize,
     pub max_connected_peers: usize,
@@ -579,12 +594,30 @@ pub struct CalculatedLimits {
     pub disk_write_permits: usize,
 }
 impl CalculatedLimits {
-    pub fn into_map(self) -> HashMap<ResourceType, usize> {
+    pub fn into_map_with_peer_queue(
+        self,
+        peer_connection_queue_size: usize,
+    ) -> HashMap<ResourceType, (usize, usize)> {
         let mut map = HashMap::new();
-        map.insert(ResourceType::Reserve, self.reserve_permits);
-        map.insert(ResourceType::PeerConnection, self.max_connected_peers);
-        map.insert(ResourceType::DiskRead, self.disk_read_permits);
-        map.insert(ResourceType::DiskWrite, self.disk_write_permits);
+        map.insert(ResourceType::Reserve, (self.reserve_permits, 0));
+        map.insert(
+            ResourceType::PeerConnection,
+            (self.max_connected_peers, peer_connection_queue_size),
+        );
+        map.insert(
+            ResourceType::DiskRead,
+            (
+                self.disk_read_permits,
+                self.disk_read_permits.saturating_mul(2),
+            ),
+        );
+        map.insert(
+            ResourceType::DiskWrite,
+            (
+                self.disk_write_permits,
+                self.disk_write_permits.saturating_mul(2),
+            ),
+        );
         map
     }
 }
@@ -790,6 +823,12 @@ pub enum AppCommand {
     },
     UpdateConfig(Settings),
     UpdateVersionAvailable(String),
+}
+
+struct IncomingPeerHandshake {
+    connection: PeerConnection,
+    buffer: Vec<u8>,
+    permit: PermitGuard,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1408,6 +1447,8 @@ pub struct UiState {
     pub measured_fps: Option<f64>,
     pub fps_sample_started_at: Option<Instant>,
     pub fps_sample_frames: u32,
+    pub frame_wake_lag_ratio_ema: Option<f64>,
+    pub frame_draw_ratio_ema: Option<f64>,
     pub file_activity_download_phase: f64,
     pub file_activity_upload_phase: f64,
     pub swarm_availability_flash: SwarmAvailabilityFlashState,
@@ -1447,6 +1488,42 @@ impl UiState {
         }
         self.fps_sample_started_at = Some(now);
         self.fps_sample_frames = 0;
+    }
+
+    fn update_responsiveness_ema(target: &mut Option<f64>, sample: f64) {
+        *target = Some(match *target {
+            Some(previous) => {
+                (sample * UI_RESPONSIVENESS_EMA_ALPHA)
+                    + (previous * (1.0 - UI_RESPONSIVENESS_EMA_ALPHA))
+            }
+            None => sample,
+        });
+    }
+
+    fn record_frame_wake(
+        &mut self,
+        scheduled_at: Instant,
+        woke_at: Instant,
+        target_frame_interval: Duration,
+    ) {
+        let wake_lag = woke_at.saturating_duration_since(scheduled_at);
+        let target_secs = target_frame_interval.as_secs_f64();
+        if target_secs > 0.0 {
+            Self::update_responsiveness_ema(
+                &mut self.frame_wake_lag_ratio_ema,
+                wake_lag.as_secs_f64() / target_secs,
+            );
+        }
+    }
+
+    fn record_draw_duration(&mut self, draw_duration: Duration, target_frame_interval: Duration) {
+        let target_secs = target_frame_interval.as_secs_f64();
+        if target_secs > 0.0 {
+            Self::update_responsiveness_ema(
+                &mut self.frame_draw_ratio_ema,
+                draw_duration.as_secs_f64() / target_secs,
+            );
+        }
     }
 }
 
@@ -1701,6 +1778,7 @@ pub struct AppState {
     pub avg_disk_write_bps: u64,
     pub avg_disk_write_completed_bps: u64,
     pub effective_download_limit_bps: u64,
+    pub active_peer_limit: Option<usize>,
 
     pub disk_read_history: Vec<u64>,
     pub disk_write_history: Vec<u64>,
@@ -1777,6 +1855,154 @@ pub struct AppState {
     pub pending_watch_commands: VecDeque<AppCommand>,
     pub cluster_role_label: Option<String>,
     pub cluster_runtime_label: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct WakeLagPeerThrottle {
+    effective_peer_limit: Option<usize>,
+    good_ticks: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WakeLagPeerThrottleChange {
+    previous_peer_limit: usize,
+    current_peer_limit: usize,
+    action: &'static str,
+}
+
+impl WakeLagPeerThrottle {
+    fn additive_step(base_peer_limit: usize) -> usize {
+        base_peer_limit
+            .saturating_mul(WAKE_LAG_PEER_THROTTLE_ADDITIVE_STEP_PERCENT)
+            .saturating_div(100)
+            .clamp(1, WAKE_LAG_PEER_THROTTLE_ADDITIVE_STEP_PEERS)
+    }
+
+    fn effective_peer_limit(self, base_peer_limit: usize, floor_peer_limit: usize) -> usize {
+        if base_peer_limit == 0 {
+            return 0;
+        }
+
+        self.effective_peer_limit
+            .unwrap_or(base_peer_limit)
+            .clamp(floor_peer_limit.min(base_peer_limit), base_peer_limit)
+    }
+
+    fn update(
+        &mut self,
+        wake_lag_frame_ratio: Option<f64>,
+        base_peer_limit: usize,
+        floor_peer_limit: usize,
+        connected_peers: usize,
+    ) -> Option<WakeLagPeerThrottleChange> {
+        if base_peer_limit == 0 {
+            self.effective_peer_limit = None;
+            self.good_ticks = 0;
+            return None;
+        }
+
+        let floor_peer_limit = floor_peer_limit.min(base_peer_limit);
+        let previous_peer_limit = self.effective_peer_limit(base_peer_limit, floor_peer_limit);
+        self.effective_peer_limit =
+            (previous_peer_limit < base_peer_limit).then_some(previous_peer_limit);
+
+        let wake_lag_ratio = wake_lag_frame_ratio.filter(|ratio| ratio.is_finite());
+        wake_lag_ratio?;
+
+        let mut current_peer_limit = previous_peer_limit;
+        let mut action = None;
+
+        let wake_lag_bad =
+            wake_lag_ratio.is_some_and(|ratio| ratio >= WAKE_LAG_PEER_THROTTLE_BAD_RATIO);
+        let wake_lag_good =
+            wake_lag_ratio.is_none_or(|ratio| ratio < WAKE_LAG_PEER_THROTTLE_GOOD_RATIO);
+
+        if wake_lag_bad {
+            self.good_ticks = 0;
+            let pressure_peer_limit = if connected_peers == 0 {
+                current_peer_limit
+            } else {
+                current_peer_limit.min(connected_peers)
+            };
+            current_peer_limit = pressure_peer_limit.saturating_div(2).max(floor_peer_limit);
+            if current_peer_limit < previous_peer_limit {
+                action = Some("halve_wake_lag");
+            }
+        } else if wake_lag_good {
+            self.good_ticks = self.good_ticks.saturating_add(1);
+            if self.good_ticks >= WAKE_LAG_PEER_THROTTLE_GOOD_TICKS
+                && current_peer_limit < base_peer_limit
+            {
+                current_peer_limit = current_peer_limit
+                    .saturating_add(Self::additive_step(base_peer_limit))
+                    .min(base_peer_limit);
+                if current_peer_limit
+                    >= connected_peers
+                        .saturating_add(WAKE_LAG_PEER_THROTTLE_RECOVERY_HEADROOM_PEERS)
+                {
+                    current_peer_limit = base_peer_limit;
+                    action = Some("clear");
+                } else {
+                    action = Some("increase");
+                }
+            }
+        } else {
+            self.good_ticks = 0;
+        }
+
+        self.effective_peer_limit =
+            (current_peer_limit < base_peer_limit).then_some(current_peer_limit);
+
+        if current_peer_limit != previous_peer_limit {
+            Some(WakeLagPeerThrottleChange {
+                previous_peer_limit,
+                current_peer_limit,
+                action: action.unwrap_or("adjust"),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupRollInPressureReason {
+    Warmup,
+    WakeLag,
+    DrawCost,
+    Cpu,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StartupRollInPressureStats {
+    total_deferrals: usize,
+    warmup_deferrals: usize,
+    peer_limit_deferrals: usize,
+    wake_lag_deferrals: usize,
+    draw_cost_deferrals: usize,
+    cpu_deferrals: usize,
+    total_delay_secs: u64,
+}
+
+impl StartupRollInPressureStats {
+    fn record(&mut self, reason: StartupRollInPressureReason, delay: Duration) {
+        self.total_deferrals = self.total_deferrals.saturating_add(1);
+        self.total_delay_secs = self.total_delay_secs.saturating_add(delay.as_secs());
+        match reason {
+            StartupRollInPressureReason::Warmup => {
+                self.warmup_deferrals = self.warmup_deferrals.saturating_add(1);
+            }
+            StartupRollInPressureReason::WakeLag => {
+                self.wake_lag_deferrals = self.wake_lag_deferrals.saturating_add(1);
+            }
+            StartupRollInPressureReason::DrawCost => {
+                self.draw_cost_deferrals = self.draw_cost_deferrals.saturating_add(1);
+            }
+            StartupRollInPressureReason::Cpu => {
+                self.cpu_deferrals = self.cpu_deferrals.saturating_add(1);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1990,9 +2216,14 @@ pub struct App {
 
     pub torrent_manager_incoming_peer_txs: HashMap<Vec<u8>, Sender<(PeerConnection, Vec<u8>)>>,
     pub torrent_manager_command_txs: HashMap<Vec<u8>, Sender<ManagerCommand>>,
+    incoming_peer_handshake_tx: mpsc::Sender<IncomingPeerHandshake>,
+    incoming_peer_handshake_rx: mpsc::Receiver<IncomingPeerHandshake>,
     pub dht_service: DhtService,
     pub dht_status_rx: watch::Receiver<DhtStatus>,
     pub resource_manager: ResourceManagerClient,
+    wake_lag_peer_throttle: WakeLagPeerThrottle,
+    last_applied_resource_limits: Option<CalculatedLimits>,
+    last_applied_peer_queue_size: Option<usize>,
     pub global_dl_bucket: Arc<TokenBucket>,
     pub global_ul_bucket: Arc<TokenBucket>,
     disk_write_download_throttle: DiskBackpressureDownloadThrottle,
@@ -2031,6 +2262,7 @@ pub struct App {
     pub startup_loaded_torrent_count: usize,
     pub startup_load_summary_logged: bool,
     pub next_startup_load_at: Option<time::Instant>,
+    startup_roll_in_pressure_stats: StartupRollInPressureStats,
     pub last_dht_peer_slot_usage: Option<(usize, usize)>,
 }
 
@@ -2381,6 +2613,8 @@ impl App {
 
         let (manager_event_tx, manager_event_rx) = mpsc::channel::<ManagerEvent>(1000);
         let (app_command_tx, app_command_rx) = mpsc::channel::<AppCommand>(10);
+        let (incoming_peer_handshake_tx, incoming_peer_handshake_rx) =
+            mpsc::channel::<IncomingPeerHandshake>(INCOMING_PEER_HANDSHAKE_QUEUE_SIZE);
         let (rss_sync_tx, rss_sync_rx) = mpsc::channel::<()>(8);
         let (rss_downloaded_entry_tx, rss_downloaded_entry_rx) =
             mpsc::channel::<RssHistoryEntry>(64);
@@ -2419,7 +2653,7 @@ impl App {
         );
         rm_limits.insert(
             ResourceType::DiskWrite,
-            (limits.disk_write_permits, limits.disk_read_permits * 2),
+            (limits.disk_write_permits, limits.disk_write_permits * 2),
         );
         let (resource_manager, resource_manager_client) =
             ResourceManager::new(rm_limits, shutdown_tx.clone());
@@ -2515,9 +2749,14 @@ impl App {
             listener,
             torrent_manager_incoming_peer_txs: HashMap::new(),
             torrent_manager_command_txs: HashMap::new(),
+            incoming_peer_handshake_tx,
+            incoming_peer_handshake_rx,
             dht_service,
             dht_status_rx,
             resource_manager: resource_manager_client,
+            wake_lag_peer_throttle: WakeLagPeerThrottle::default(),
+            last_applied_resource_limits: Some(limits.clone()),
+            last_applied_peer_queue_size: Some(limits.max_connected_peers.saturating_mul(2)),
             global_dl_bucket,
             global_ul_bucket,
             disk_write_download_throttle: DiskBackpressureDownloadThrottle::new(
@@ -2557,6 +2796,7 @@ impl App {
             startup_loaded_torrent_count: 0,
             startup_load_summary_logged: false,
             next_startup_load_at: None,
+            startup_roll_in_pressure_stats: StartupRollInPressureStats::default(),
             last_dht_peer_slot_usage: None,
         };
         app.sync_cluster_role_label();
@@ -2566,14 +2806,12 @@ impl App {
 
         let mut torrents_to_load = app.client_configs.torrents.clone();
         torrents_to_load.sort_by_key(|t| !t.validation_status);
-        let mut startup_running_torrents_started = 0usize;
         for torrent_config in torrents_to_load {
             let should_defer_running_torrent = matches!(
                 torrent_config.torrent_control_state,
                 TorrentControlState::Running
-            ) && startup_running_torrents_started
-                >= STARTUP_ROLLING_BATCH_SIZE
-                && !app.should_suppress_follower_runtime_for_torrent(&torrent_config);
+            ) && !app
+                .should_suppress_follower_runtime_for_torrent(&torrent_config);
 
             if should_defer_running_torrent {
                 if let Some(info_hash) =
@@ -2590,17 +2828,8 @@ impl App {
                         app.startup_loaded_torrent_count =
                             app.startup_loaded_torrent_count.saturating_add(1);
                     }
-                    startup_running_torrents_started =
-                        startup_running_torrents_started.saturating_add(1);
                 }
             } else {
-                if matches!(
-                    torrent_config.torrent_control_state,
-                    TorrentControlState::Running
-                ) {
-                    startup_running_torrents_started =
-                        startup_running_torrents_started.saturating_add(1);
-                }
                 if app.load_runtime_torrent_from_settings(torrent_config).await {
                     app.startup_loaded_torrent_count =
                         app.startup_loaded_torrent_count.saturating_add(1);
@@ -2610,7 +2839,10 @@ impl App {
         app.reschedule_startup_load_deadline();
         app.maybe_log_startup_load_summary();
 
-        if app.app_state.torrents.is_empty() && app.app_state.lifetime_downloaded_from_config == 0 {
+        if app.app_state.torrents.is_empty()
+            && app.startup_deferred_load_queue.is_empty()
+            && app.app_state.lifetime_downloaded_from_config == 0
+        {
             app.app_state.mode = AppMode::Welcome;
         }
 
@@ -3524,6 +3756,96 @@ impl App {
         self.process_pending_commands().await;
     }
 
+    fn wake_lag_peer_throttle_floor(&self, base_peer_limit: usize) -> usize {
+        if base_peer_limit == 0 {
+            return 0;
+        }
+
+        WAKE_LAG_PEER_THROTTLE_MIN_PEERS.min(base_peer_limit)
+    }
+
+    fn effective_resource_limits(&self) -> CalculatedLimits {
+        let mut limits = self.app_state.limits.clone();
+        let floor_peer_limit = self.wake_lag_peer_throttle_floor(limits.max_connected_peers);
+        limits.max_connected_peers = self
+            .wake_lag_peer_throttle
+            .effective_peer_limit(limits.max_connected_peers, floor_peer_limit);
+        limits
+    }
+
+    fn peer_admission_stress_active_for(&self, effective_limits: &CalculatedLimits) -> bool {
+        effective_limits.max_connected_peers < self.app_state.limits.max_connected_peers
+    }
+
+    fn peer_admission_stress_active(&self) -> bool {
+        self.peer_admission_stress_active_for(&self.effective_resource_limits())
+    }
+
+    fn effective_peer_queue_size(&self, effective_limits: &CalculatedLimits) -> usize {
+        if self.peer_admission_stress_active_for(effective_limits) {
+            0
+        } else {
+            self.app_state.limits.max_connected_peers.saturating_mul(2)
+        }
+    }
+
+    async fn apply_effective_resource_limits(&mut self) {
+        let effective_limits = self.effective_resource_limits();
+        let peer_queue_size = self.effective_peer_queue_size(&effective_limits);
+        self.app_state.active_peer_limit = (effective_limits.max_connected_peers
+            < self.app_state.limits.max_connected_peers)
+            .then_some(effective_limits.max_connected_peers);
+        if self.last_applied_resource_limits.as_ref() == Some(&effective_limits)
+            && self.last_applied_peer_queue_size == Some(peer_queue_size)
+        {
+            return;
+        }
+
+        self.last_applied_resource_limits = Some(effective_limits.clone());
+        self.last_applied_peer_queue_size = Some(peer_queue_size);
+        self.last_dht_peer_slot_usage = None;
+        self.sync_dht_peer_slot_usage();
+        let _ = self
+            .resource_manager
+            .update_limits_and_queue_sizes(
+                effective_limits.into_map_with_peer_queue(peer_queue_size),
+            )
+            .await;
+    }
+
+    fn update_wake_lag_peer_throttle(&mut self) {
+        let wake_lag_frame_ratio = self.app_state.ui.frame_wake_lag_ratio_ema;
+        let base_peer_limit = self.app_state.limits.max_connected_peers;
+        let floor_peer_limit = self.wake_lag_peer_throttle_floor(base_peer_limit);
+        let connected_peers = self.total_successfully_connected_peers();
+        let change = self.wake_lag_peer_throttle.update(
+            wake_lag_frame_ratio,
+            base_peer_limit,
+            floor_peer_limit,
+            connected_peers,
+        );
+        let effective_peer_limit = self
+            .wake_lag_peer_throttle
+            .effective_peer_limit(base_peer_limit, floor_peer_limit);
+
+        if let Some(change) = change {
+            tracing_event!(
+                target: "superseedr::wake_lag_peer_throttle",
+                Level::INFO,
+                wake_lag_frame_ratio = ?wake_lag_frame_ratio,
+                action = change.action,
+                previous_peer_limit = change.previous_peer_limit,
+                current_peer_limit = change.current_peer_limit,
+                base_peer_limit,
+                floor_peer_limit,
+                effective_peer_limit,
+                connected_peers,
+                good_ticks = self.wake_lag_peer_throttle.good_ticks,
+                "wake_lag_peer_throttle"
+            );
+        }
+    }
+
     pub async fn run(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<Stdout>>,
@@ -3586,6 +3908,9 @@ impl App {
                     self.handle_incoming_peer(connection).await;
 
                 }
+                Some(incoming) = self.incoming_peer_handshake_rx.recv() => {
+                    self.route_incoming_peer_handshake(incoming);
+                }
                 Some(event) = self.manager_event_rx.recv() => {
                     self.handle_manager_event(event);
                     self.app_state.ui.needs_redraw = true;
@@ -3631,7 +3956,7 @@ impl App {
                 }
 
                 _ = stats_interval.tick() => {
-                    self.calculate_stats(&mut sys);
+                    self.calculate_stats(&mut sys).await;
                     self.app_state.ui.needs_redraw = true;
                 }
 
@@ -3666,9 +3991,14 @@ impl App {
                 _ = integrity_scheduler_interval.tick() => {
                     self.advance_integrity_scheduler(INTEGRITY_SCHEDULER_TICK_INTERVAL);
                 }
-
                 _ = time::sleep_until(next_draw_time.into()) => {
+                    let scheduled_frame_time = next_draw_time;
                     let frame_started_at = Instant::now();
+                    self.app_state.ui.record_frame_wake(
+                        scheduled_frame_time,
+                        frame_started_at,
+                        current_target_framerate,
+                    );
                     Self::advance_next_draw_time(
                         &mut next_draw_time,
                         frame_started_at,
@@ -3697,6 +4027,7 @@ impl App {
                         self.tick_ui_effects_clock();
                         let dht_status = self.dht_service.current_status();
                         let dht_wave_telemetry = self.dht_service.current_wave_telemetry();
+                        let draw_started_at = Instant::now();
                         terminal.draw(|f| {
                             draw(
                                 f,
@@ -3706,6 +4037,10 @@ impl App {
                                 &self.client_configs,
                             );
                         })?;
+                        self.app_state.ui.record_draw_duration(
+                            draw_started_at.elapsed(),
+                            current_target_framerate,
+                        );
                         self.app_state.ui.needs_redraw = false;
                     } else if matches!(self.app_state.mode, AppMode::Normal) {
                         next_draw_time = frame_started_at
@@ -4155,65 +4490,109 @@ impl App {
         }
     }
 
-    async fn handle_incoming_peer(&mut self, mut connection: PeerConnection) {
-        let torrent_manager_incoming_peer_txs_clone =
-            self.torrent_manager_incoming_peer_txs.clone();
-        let resource_manager_clone = self.resource_manager.clone();
+    fn route_incoming_peer_handshake(&mut self, incoming: IncomingPeerHandshake) {
+        let IncomingPeerHandshake {
+            connection,
+            buffer,
+            permit,
+        } = incoming;
+        if buffer.len() < 48 {
+            return;
+        }
+
+        let peer_addr = connection.remote_addr;
+        let peer_info_hash = buffer[28..48].to_vec();
+        let peer_info_hash_hex = hex::encode(&peer_info_hash);
+
+        let Some(torrent_manager_tx) = self.torrent_manager_incoming_peer_txs.get(&peer_info_hash)
+        else {
+            tracing::trace!(
+                "ROUTING FAIL: No manager registered for hash: {}",
+                peer_info_hash_hex
+            );
+            return;
+        };
+
+        let torrent_manager_tx = torrent_manager_tx.clone();
         let app_command_tx = self.app_command_tx.clone();
+        tokio::spawn(async move {
+            let session_permit = permit;
+            let send_result = torrent_manager_tx.send((connection, buffer)).await;
+            drop(session_permit);
+            match send_result {
+                Ok(()) => {
+                    let _ = app_command_tx.try_send(AppCommand::MarkPortOpen(peer_addr));
+                }
+                Err(_) => {
+                    tracing::trace!(
+                        "ROUTING FAIL: Manager channel closed for hash: {}",
+                        peer_info_hash_hex
+                    );
+                }
+            }
+        });
+    }
+
+    async fn handle_incoming_peer(&mut self, mut connection: PeerConnection) {
+        let resource_manager_clone = self.resource_manager.clone();
+        let incoming_peer_handshake_tx = self.incoming_peer_handshake_tx.clone();
         let mut permit_shutdown_rx = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
-            let peer_addr = connection.remote_addr;
-            let Some(_session_permit) = (tokio::select! {
+            let session_permit = tokio::select! {
                 permit_result = resource_manager_clone.acquire_peer_connection() => {
                     match permit_result {
                         Ok(permit) => Some(permit),
-                        Err(_) => {
+                        Err(ResourceManagerError::QueueFull) => {
+                            tracing_event!(
+                                Level::DEBUG,
+                                peer_ip = %connection.remote_addr,
+                                "Incoming peer dropped because peer permit capacity is saturated."
+                            );
+                            None
+                        }
+                        Err(ResourceManagerError::ManagerShutdown) => {
                             tracing_event!(Level::DEBUG, "Failed to acquire permit. Manager shut down?");
                             None
                         }
                     }
                 }
-                _ = permit_shutdown_rx.recv() => {
-                    None
-                }
-            }) else {
+                _ = permit_shutdown_rx.recv() => None
+            };
+            let Some(permit) = session_permit else {
                 return;
             };
+            let peer_addr = connection.remote_addr;
             let mut buffer = vec![0u8; 68];
-            if matches!(
+            let read_ok = matches!(
                 time::timeout(
                     Duration::from_secs(INCOMING_HANDSHAKE_TIMEOUT_SECS),
                     connection.stream.read_exact(&mut buffer)
                 )
                 .await,
                 Ok(Ok(_))
-            ) {
-                if !is_valid_incoming_bittorrent_handshake(&buffer) {
-                    tracing::trace!(
-                        "Rejected inbound TCP connection with invalid BitTorrent handshake."
-                    );
-                    return;
-                }
+            );
+            if !read_ok {
+                return;
+            }
 
-                let peer_info_hash = &buffer[28..48];
+            if !is_valid_incoming_bittorrent_handshake(&buffer) {
+                tracing::trace!(
+                    "Rejected inbound TCP connection with invalid BitTorrent handshake."
+                );
+                return;
+            }
 
-                if let Some(torrent_manager_tx) =
-                    torrent_manager_incoming_peer_txs_clone.get(peer_info_hash)
-                {
-                    let torrent_manager_tx_clone = torrent_manager_tx.clone();
-                    if torrent_manager_tx_clone
-                        .send((connection, buffer))
-                        .await
-                        .is_ok()
-                    {
-                        let _ = app_command_tx.try_send(AppCommand::MarkPortOpen(peer_addr));
-                    }
-                } else {
-                    tracing::trace!(
-                        "ROUTING FAIL: No manager registered for hash: {}",
-                        hex::encode(peer_info_hash)
-                    );
-                }
+            let incoming = IncomingPeerHandshake {
+                connection,
+                buffer,
+                permit,
+            };
+            if incoming_peer_handshake_tx.send(incoming).await.is_err() {
+                tracing_event!(
+                    Level::DEBUG,
+                    peer_ip = %peer_addr,
+                    "Incoming peer routing queue closed; dropping connection."
+                );
             }
         });
     }
@@ -4545,6 +4924,31 @@ impl App {
         self.app_state.ui.needs_redraw = true;
     }
 
+    fn mark_peer_port_open(&mut self, peer_addr: SocketAddr) {
+        let highlight_until = Some(Instant::now() + PORT_FAMILY_HIGHLIGHT_DURATION);
+        let open_flag = match peer_addr {
+            SocketAddr::V4(_) => {
+                self.app_state.externally_accessable_port_v4_highlight_until = highlight_until;
+                &mut self.app_state.externally_accessable_port_v4
+            }
+            SocketAddr::V6(addr) if addr.ip().to_ipv4_mapped().is_some() => {
+                self.app_state.externally_accessable_port_v4_highlight_until = highlight_until;
+                &mut self.app_state.externally_accessable_port_v4
+            }
+            SocketAddr::V6(_) => {
+                self.app_state.externally_accessable_port_v6_highlight_until = highlight_until;
+                &mut self.app_state.externally_accessable_port_v6
+            }
+        };
+        let just_opened = !*open_flag;
+        if just_opened {
+            *open_flag = true;
+            let info_hashes = self.active_running_torrents_for_dht_announce();
+            self.announce_torrents_to_dht(info_hashes);
+        }
+        self.app_state.ui.needs_redraw = true;
+    }
+
     async fn handle_app_command(&mut self, command: AppCommand) {
         match command {
             AppCommand::AddTorrentFromFile(path) => {
@@ -4563,31 +4967,7 @@ impl App {
                     .await;
             }
             AppCommand::MarkPortOpen(peer_addr) => {
-                let highlight_until = Some(Instant::now() + PORT_FAMILY_HIGHLIGHT_DURATION);
-                let open_flag = match peer_addr {
-                    SocketAddr::V4(_) => {
-                        self.app_state.externally_accessable_port_v4_highlight_until =
-                            highlight_until;
-                        &mut self.app_state.externally_accessable_port_v4
-                    }
-                    SocketAddr::V6(addr) if addr.ip().to_ipv4_mapped().is_some() => {
-                        self.app_state.externally_accessable_port_v4_highlight_until =
-                            highlight_until;
-                        &mut self.app_state.externally_accessable_port_v4
-                    }
-                    SocketAddr::V6(_) => {
-                        self.app_state.externally_accessable_port_v6_highlight_until =
-                            highlight_until;
-                        &mut self.app_state.externally_accessable_port_v6
-                    }
-                };
-                let just_opened = !*open_flag;
-                if just_opened {
-                    *open_flag = true;
-                    let info_hashes = self.active_running_torrents_for_dht_announce();
-                    self.announce_torrents_to_dht(info_hashes);
-                }
-                self.app_state.ui.needs_redraw = true;
+                self.mark_peer_port_open(peer_addr);
             }
             AppCommand::SubmitControlRequest(request) => {
                 if let Err(error) = self
@@ -5336,7 +5716,7 @@ impl App {
         }
     }
 
-    fn calculate_stats(&mut self, sys: &mut System) {
+    async fn calculate_stats(&mut self, sys: &mut System) {
         let was_seeding = self.app_state.is_seeding;
         let previous_torrent_sort = self.app_state.torrent_sort;
         let previous_peer_sort = self.app_state.peer_sort;
@@ -5353,15 +5733,11 @@ impl App {
         NetworkHistoryTelemetry::on_second_tick(&mut self.app_state);
         self.tuning_controller.on_second_tick();
         self.app_state.tuning_countdown = self.tuning_controller.countdown_secs();
+        self.update_wake_lag_peer_throttle();
         if was_seeding != self.app_state.is_seeding {
             self.reset_tuning_for_objective_change();
-
-            let rm = self.resource_manager.clone();
-            let limits_map = self.app_state.limits.clone().into_map();
-            tokio::spawn(async move {
-                let _ = rm.update_limits(limits_map).await;
-            });
         }
+        self.apply_effective_resource_limits().await;
 
         let history = if !self.app_state.is_seeding {
             &self.app_state.avg_download_history
@@ -5534,7 +5910,7 @@ impl App {
 
     fn sync_dht_peer_slot_usage(&mut self) {
         let total_peers = self.total_successfully_connected_peers();
-        let max_connected_peers = self.app_state.limits.max_connected_peers;
+        let max_connected_peers = self.effective_resource_limits().max_connected_peers;
         let usage = (total_peers, max_connected_peers);
         if self.last_dht_peer_slot_usage == Some(usage) {
             return;
@@ -5555,6 +5931,17 @@ impl App {
     }
 
     async fn tuning_resource_limits(&mut self) {
+        if self.peer_admission_stress_active() {
+            tracing_event!(
+                Level::DEBUG,
+                base_peer_limit = self.app_state.limits.max_connected_peers,
+                effective_peer_limit = self.effective_resource_limits().max_connected_peers,
+                "Self-Tune: paused while wake-lag peer throttle is active"
+            );
+            self.apply_effective_resource_limits().await;
+            return;
+        }
+
         let history = if !self.app_state.is_seeding {
             &self.app_state.avg_download_history
         } else {
@@ -5587,10 +5974,7 @@ impl App {
                 tracing_event!(Level::DEBUG, "Self-Tune: REVERTING. Score {} (raw: {}, penalty: {:.2}x) was not better than {}. (Baseline is {})", evaluation.new_score, evaluation.new_raw_score, evaluation.penalty_factor, evaluation.best_score_before, evaluation.baseline_u64);
             }
 
-            let _ = self
-                .resource_manager
-                .update_limits(self.app_state.limits.clone().into_map())
-                .await;
+            self.apply_effective_resource_limits().await;
         }
 
         let (next_limits, desc) =
@@ -5598,10 +5982,7 @@ impl App {
         self.app_state.limits = next_limits;
 
         tracing_event!(Level::DEBUG, "Self-Tune: Trying next change... {}", desc);
-        let _ = self
-            .resource_manager
-            .update_limits(self.app_state.limits.clone().into_map())
-            .await;
+        self.apply_effective_resource_limits().await;
     }
 
     fn reschedule_tuning_deadline(&mut self) {
@@ -5973,19 +6354,7 @@ impl App {
         }
 
         self.persist_torrent_metadata_snapshot(&info_hash, &torrent, &file_priorities);
-
-        let number_of_pieces_total = if !torrent.info.pieces.is_empty() {
-            (torrent.info.pieces.len() / 20) as u32
-        } else {
-            // Handle v2 torrents (empty pieces list)
-            let total_len = torrent.info.total_length();
-            if torrent.info.piece_length > 0 {
-                // ceil(total_len / piece_length)
-                ((total_len as f64) / (torrent.info.piece_length as f64)).ceil() as u32
-            } else {
-                0
-            }
-        };
+        let number_of_pieces_total = torrent_piece_count(&torrent);
 
         let resolved_torrent_name = torrent.info.name.clone();
         let placeholder_state = TorrentDisplayState {
@@ -7181,11 +7550,47 @@ impl App {
     }
 
     fn reschedule_startup_load_deadline(&mut self) {
+        self.reschedule_startup_load_deadline_after(Duration::from_secs(
+            STARTUP_ROLLING_BATCH_INTERVAL_SECS,
+        ));
+    }
+
+    fn reschedule_startup_load_deadline_after(&mut self, delay: Duration) {
         self.next_startup_load_at = if self.startup_deferred_load_queue.is_empty() {
             None
         } else {
-            Some(time::Instant::now() + Duration::from_secs(STARTUP_ROLLING_BATCH_INTERVAL_SECS))
+            Some(time::Instant::now() + delay)
         };
+    }
+
+    fn startup_roll_in_pressure_reason(&self) -> Option<StartupRollInPressureReason> {
+        let ui = &self.app_state.ui;
+
+        if ui
+            .frame_wake_lag_ratio_ema
+            .is_some_and(|ratio| ratio.is_finite() && ratio >= STARTUP_ROLLING_WAKE_HOLD_RATIO)
+        {
+            return Some(StartupRollInPressureReason::WakeLag);
+        }
+
+        if ui
+            .frame_draw_ratio_ema
+            .is_some_and(|ratio| ratio.is_finite() && ratio >= STARTUP_ROLLING_DRAW_HOLD_RATIO)
+        {
+            return Some(StartupRollInPressureReason::DrawCost);
+        }
+
+        if self.app_state.cpu_usage.is_finite()
+            && self.app_state.cpu_usage >= STARTUP_ROLLING_CPU_HOLD_PERCENT
+        {
+            return Some(StartupRollInPressureReason::Cpu);
+        }
+
+        if ui.frame_wake_lag_ratio_ema.is_none() || ui.frame_draw_ratio_ema.is_none() {
+            return Some(StartupRollInPressureReason::Warmup);
+        }
+
+        None
     }
 
     fn maybe_log_startup_load_summary(&mut self) {
@@ -7196,15 +7601,22 @@ impl App {
             return;
         }
 
-        tracing_event!(
-            Level::INFO,
-            count = self.startup_loaded_torrent_count,
-            "Loaded startup torrents"
-        );
         self.startup_load_summary_logged = true;
     }
 
     async fn load_next_startup_batch(&mut self) {
+        if let Some(reason) = self.startup_roll_in_pressure_reason() {
+            let delay = match reason {
+                StartupRollInPressureReason::Warmup => {
+                    Duration::from_secs(STARTUP_ROLLING_WARMUP_DELAY_SECS)
+                }
+                _ => Duration::from_secs(STARTUP_ROLLING_PRESSURE_DELAY_SECS),
+            };
+            self.startup_roll_in_pressure_stats.record(reason, delay);
+            self.reschedule_startup_load_deadline_after(delay);
+            return;
+        }
+
         let mut loaded_count = 0usize;
 
         for _ in 0..STARTUP_ROLLING_LOADS_PER_INTERVAL {
@@ -7266,12 +7678,6 @@ impl App {
         self.reschedule_startup_load_deadline();
 
         if loaded_count > 0 {
-            tracing_event!(
-                Level::DEBUG,
-                loaded = loaded_count,
-                remaining = self.startup_deferred_load_queue.len(),
-                "Loaded deferred startup torrent batch"
-            );
             self.app_state.ui.needs_redraw = true;
             self.save_state_to_disk();
         }
@@ -7440,6 +7846,19 @@ fn torrent_file_count(torrent: &crate::torrent_file::Torrent) -> usize {
         1
     } else {
         torrent.info.files.len()
+    }
+}
+
+fn torrent_piece_count(torrent: &crate::torrent_file::Torrent) -> u32 {
+    if !torrent.info.pieces.is_empty() {
+        return (torrent.info.pieces.len() / 20) as u32;
+    }
+
+    let total_len = torrent.info.total_length();
+    if torrent.info.piece_length > 0 {
+        ((total_len as f64) / (torrent.info.piece_length as f64)).ceil() as u32
+    } else {
+        0
     }
 }
 
@@ -7944,8 +8363,8 @@ mod tests {
         DiskBackpressureSample, FilePriority, IngestSource, ListenerSet, PeerInfo,
         PeerListenerTransportMode, PeerSortColumn, PersistPayload, SelectedHeader, SortDirection,
         SwarmAvailabilityFlashState, TorrentControlState, TorrentDisplayState, TorrentMetrics,
-        TorrentPreviewPayload, TorrentSortColumn, UiState, BITTORRENT_PROTOCOL_STR,
-        DHT_WAVE_PHASE_WRAP_PERIOD, DISK_WRITE_THROTTLE_MIN_BYTES_PER_SEC,
+        TorrentPreviewPayload, TorrentSortColumn, UiState, WakeLagPeerThrottle,
+        BITTORRENT_PROTOCOL_STR, DHT_WAVE_PHASE_WRAP_PERIOD, DISK_WRITE_THROTTLE_MIN_BYTES_PER_SEC,
         DISK_WRITE_THROTTLE_START_BYTES_PER_SEC, DISK_WRITE_THROTTLE_STEP_MAX,
         DISK_WRITE_THROTTLE_STEP_MIN, DISK_WRITE_THROTTLE_TARGET_LATENCY_SECS,
         DISK_WRITE_THROTTLE_WINDOW_TICKS, SWARM_AVAILABILITY_FLASH_DURATION,
@@ -8395,6 +8814,11 @@ mod tests {
         let data_dir = dir.path().join("data");
         set_app_paths_override_for_tests(Some((config_dir, data_dir)));
         dir
+    }
+
+    fn mark_startup_roll_in_responsiveness_ready(app: &mut App) {
+        app.app_state.ui.frame_wake_lag_ratio_ema = Some(0.0);
+        app.app_state.ui.frame_draw_ratio_ema = Some(0.0);
     }
 
     async fn wait_for_peer_slot_usages(
@@ -8975,6 +9399,43 @@ mod tests {
         }
 
         assert_eq!(ui.measured_fps, Some(44.0));
+    }
+
+    #[test]
+    fn ui_responsiveness_metrics_measure_wake_lag_and_draw_cost() {
+        let mut ui = UiState::default();
+        let start = Instant::now();
+        let frame_interval = Duration::from_millis(20);
+
+        ui.record_frame_wake(start, start + Duration::from_millis(5), frame_interval);
+        ui.record_draw_duration(Duration::from_millis(10), frame_interval);
+
+        assert_eq!(ui.frame_wake_lag_ratio_ema, Some(0.25));
+        assert_eq!(ui.frame_draw_ratio_ema, Some(0.5));
+    }
+
+    #[test]
+    fn wake_lag_peer_throttle_does_not_reduce_below_minimum() {
+        let mut throttle = WakeLagPeerThrottle::default();
+
+        let change = throttle
+            .update(
+                Some(super::WAKE_LAG_PEER_THROTTLE_BAD_RATIO),
+                65,
+                super::WAKE_LAG_PEER_THROTTLE_MIN_PEERS,
+                10,
+            )
+            .expect("throttle should reduce under bad wake lag");
+
+        assert_eq!(change.previous_peer_limit, 65);
+        assert_eq!(
+            change.current_peer_limit,
+            super::WAKE_LAG_PEER_THROTTLE_MIN_PEERS
+        );
+        assert_eq!(
+            throttle.effective_peer_limit(65, super::WAKE_LAG_PEER_THROTTLE_MIN_PEERS),
+            super::WAKE_LAG_PEER_THROTTLE_MIN_PEERS
+        );
     }
 
     fn test_dht_wave_targets(
@@ -9947,20 +10408,12 @@ mod tests {
         assert!(!app.app_state.externally_accessable_port_v4);
         assert!(!app.app_state.externally_accessable_port_v6);
 
-        app.handle_app_command(AppCommand::MarkPortOpen(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            6681,
-        )))
-        .await;
+        app.mark_peer_port_open(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6681));
 
         assert!(app.app_state.externally_accessable_port_v4);
         assert!(!app.app_state.externally_accessable_port_v6);
 
-        app.handle_app_command(AppCommand::MarkPortOpen(SocketAddr::new(
-            IpAddr::V6(Ipv6Addr::LOCALHOST),
-            6681,
-        )))
-        .await;
+        app.mark_peer_port_open(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 6681));
 
         assert!(app.app_state.externally_accessable_port_v4);
         assert!(app.app_state.externally_accessable_port_v6);
@@ -9980,8 +10433,7 @@ mod tests {
         assert!(!app.app_state.externally_accessable_port_v6);
 
         let mapped_addr = SocketAddr::new(IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()), 6681);
-        app.handle_app_command(AppCommand::MarkPortOpen(mapped_addr))
-            .await;
+        app.mark_peer_port_open(mapped_addr);
 
         assert!(app.app_state.externally_accessable_port_v4);
         assert!(!app.app_state.externally_accessable_port_v6);
@@ -10097,11 +10549,7 @@ mod tests {
             .torrents
             .insert(paused_hash.clone(), paused_display);
 
-        app.handle_app_command(AppCommand::MarkPortOpen(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            6681,
-        )))
-        .await;
+        app.mark_peer_port_open(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6681));
         tokio::task::yield_now().await;
 
         assert_eq!(
@@ -10109,11 +10557,7 @@ mod tests {
             vec![(running_hash.clone(), Some(6681))]
         );
 
-        app.handle_app_command(AppCommand::MarkPortOpen(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            6681,
-        )))
-        .await;
+        app.mark_peer_port_open(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6681));
         tokio::task::yield_now().await;
 
         assert_eq!(
@@ -10121,11 +10565,7 @@ mod tests {
             vec![(running_hash.clone(), Some(6681))]
         );
 
-        app.handle_app_command(AppCommand::MarkPortOpen(SocketAddr::new(
-            IpAddr::V6(Ipv6Addr::LOCALHOST),
-            6681,
-        )))
-        .await;
+        app.mark_peer_port_open(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 6681));
         tokio::task::yield_now().await;
 
         assert_eq!(
@@ -10346,6 +10786,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tuning_resource_limits_pauses_while_peer_admission_stress_is_active() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        app.app_state.limits = super::CalculatedLimits {
+            reserve_permits: 100,
+            max_connected_peers: 10,
+            disk_read_permits: 8,
+            disk_write_permits: 8,
+        };
+        app.wake_lag_peer_throttle.effective_peer_limit = Some(4);
+        let before_limits = app.app_state.limits.clone();
+        let before_tuning = app.tuning_controller.state().clone();
+
+        app.tuning_resource_limits().await;
+
+        assert_eq!(app.app_state.limits, before_limits);
+        assert_eq!(app.app_state.active_peer_limit, Some(8));
+
+        let after_tuning = app.tuning_controller.state();
+        assert_eq!(
+            after_tuning.last_tuning_score,
+            before_tuning.last_tuning_score
+        );
+        assert_eq!(
+            after_tuning.current_tuning_score,
+            before_tuning.current_tuning_score
+        );
+        assert_eq!(
+            after_tuning.last_tuning_limits,
+            before_tuning.last_tuning_limits
+        );
+        assert_eq!(
+            after_tuning.baseline_speed_ema,
+            before_tuning.baseline_speed_ema
+        );
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
     async fn handle_manager_event_file_probe_status_marks_data_unavailable() {
         let settings = crate::config::Settings {
             client_port: 0,
@@ -10400,6 +10885,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_restore_queues_running_torrents_before_first_main_loop_tick() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            torrents: vec![
+                TorrentSettings {
+                    torrent_or_magnet: format!("magnet:?xt=urn:btih:{}", "1".repeat(40)),
+                    name: "Synthetic Start One".to_string(),
+                    torrent_control_state: TorrentControlState::Running,
+                    ..Default::default()
+                },
+                TorrentSettings {
+                    torrent_or_magnet: format!("magnet:?xt=urn:btih:{}", "2".repeat(40)),
+                    name: "Synthetic Start Two".to_string(),
+                    torrent_control_state: TorrentControlState::Running,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+
+        assert!(app.app_state.torrents.is_empty());
+        assert_eq!(app.startup_deferred_load_queue.len(), 2);
+        assert_eq!(app.startup_loaded_torrent_count, 0);
+        assert!(app.next_startup_load_at.is_some());
+        assert!(!matches!(app.app_state.mode, AppMode::Welcome));
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
     async fn load_next_startup_batch_loads_only_one_deferred_torrent() {
         let mut settings = crate::config::Settings {
             client_port: 0,
@@ -10433,6 +10952,7 @@ mod tests {
             .iter()
             .filter_map(|torrent| info_hash_from_torrent_source(&torrent.torrent_or_magnet))
             .collect();
+        mark_startup_roll_in_responsiveness_ready(&mut app);
 
         app.load_next_startup_batch().await;
 
@@ -10441,6 +10961,129 @@ mod tests {
         assert_eq!(app.startup_loaded_torrent_count, 1);
         assert!(!app.startup_load_summary_logged);
         assert!(app.next_startup_load_at.is_some());
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn load_next_startup_batch_defers_when_runtime_pressure_is_high() {
+        let info_hash_hex = "1".repeat(40);
+        let torrent = TorrentSettings {
+            torrent_or_magnet: format!("magnet:?xt=urn:btih:{info_hash_hex}"),
+            name: "pressure-start".to_string(),
+            torrent_control_state: TorrentControlState::Running,
+            ..Default::default()
+        };
+
+        let mut app = App::new(
+            crate::config::Settings {
+                client_port: 0,
+                ..Default::default()
+            },
+            AppRuntimeMode::Normal,
+        )
+        .await
+        .expect("build app");
+        app.client_configs.torrents = vec![torrent.clone()];
+        app.startup_deferred_load_queue =
+            VecDeque::from([info_hash_from_torrent_source(&torrent.torrent_or_magnet)
+                .expect("derive info hash")]);
+        app.app_state.ui.frame_wake_lag_ratio_ema = Some(super::STARTUP_ROLLING_WAKE_HOLD_RATIO);
+        app.app_state.ui.frame_draw_ratio_ema = Some(0.0);
+
+        app.load_next_startup_batch().await;
+
+        assert!(app.app_state.torrents.is_empty());
+        assert_eq!(app.startup_deferred_load_queue.len(), 1);
+        assert_eq!(app.startup_loaded_torrent_count, 0);
+        assert_eq!(app.startup_roll_in_pressure_stats.total_deferrals, 1);
+        assert_eq!(app.startup_roll_in_pressure_stats.wake_lag_deferrals, 1);
+        assert_eq!(
+            app.startup_roll_in_pressure_stats.total_delay_secs,
+            super::STARTUP_ROLLING_PRESSURE_DELAY_SECS
+        );
+        assert!(app.next_startup_load_at.is_some());
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn load_next_startup_batch_waits_for_initial_responsiveness_samples() {
+        let info_hash_hex = "1".repeat(40);
+        let torrent = TorrentSettings {
+            torrent_or_magnet: format!("magnet:?xt=urn:btih:{info_hash_hex}"),
+            name: "warmup-start".to_string(),
+            torrent_control_state: TorrentControlState::Running,
+            ..Default::default()
+        };
+
+        let mut app = App::new(
+            crate::config::Settings {
+                client_port: 0,
+                ..Default::default()
+            },
+            AppRuntimeMode::Normal,
+        )
+        .await
+        .expect("build app");
+        app.client_configs.torrents = vec![torrent.clone()];
+        app.startup_deferred_load_queue =
+            VecDeque::from([info_hash_from_torrent_source(&torrent.torrent_or_magnet)
+                .expect("derive info hash")]);
+
+        app.load_next_startup_batch().await;
+
+        assert!(app.app_state.torrents.is_empty());
+        assert_eq!(app.startup_deferred_load_queue.len(), 1);
+        assert_eq!(app.startup_loaded_torrent_count, 0);
+        assert_eq!(app.startup_roll_in_pressure_stats.total_deferrals, 1);
+        assert_eq!(app.startup_roll_in_pressure_stats.warmup_deferrals, 1);
+        assert_eq!(
+            app.startup_roll_in_pressure_stats.total_delay_secs,
+            super::STARTUP_ROLLING_WARMUP_DELAY_SECS
+        );
+        assert!(app.next_startup_load_at.is_some());
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn load_next_startup_batch_keeps_loading_when_effective_peer_limit_is_active() {
+        let info_hash_hex = "1".repeat(40);
+        let torrent = TorrentSettings {
+            torrent_or_magnet: format!("magnet:?xt=urn:btih:{info_hash_hex}"),
+            name: "peer-limit-start".to_string(),
+            torrent_control_state: TorrentControlState::Running,
+            ..Default::default()
+        };
+
+        let mut app = App::new(
+            crate::config::Settings {
+                client_port: 0,
+                ..Default::default()
+            },
+            AppRuntimeMode::Normal,
+        )
+        .await
+        .expect("build app");
+        app.client_configs.torrents = vec![torrent.clone()];
+        app.startup_deferred_load_queue =
+            VecDeque::from([info_hash_from_torrent_source(&torrent.torrent_or_magnet)
+                .expect("derive info hash")]);
+        app.app_state.limits.max_connected_peers = 10;
+        app.app_state.active_peer_limit = None;
+        app.wake_lag_peer_throttle.effective_peer_limit = Some(4);
+        mark_startup_roll_in_responsiveness_ready(&mut app);
+
+        app.load_next_startup_batch().await;
+
+        assert_eq!(app.app_state.torrents.len(), 1);
+        assert!(app.startup_deferred_load_queue.is_empty());
+        assert_eq!(app.startup_loaded_torrent_count, 1);
+        assert_eq!(app.startup_roll_in_pressure_stats.total_deferrals, 0);
+        assert_eq!(app.startup_roll_in_pressure_stats.peer_limit_deferrals, 0);
+        assert_eq!(app.startup_roll_in_pressure_stats.total_delay_secs, 0);
+        assert!(app.next_startup_load_at.is_none());
 
         let _ = app.shutdown_tx.send(());
     }
@@ -10479,6 +11122,7 @@ mod tests {
             .iter()
             .filter_map(|torrent| info_hash_from_torrent_source(&torrent.torrent_or_magnet))
             .collect();
+        mark_startup_roll_in_responsiveness_ready(&mut app);
 
         app.load_next_startup_batch().await;
         assert_eq!(app.startup_loaded_torrent_count, 1);
@@ -10520,6 +11164,7 @@ mod tests {
         app.startup_deferred_load_queue =
             VecDeque::from([info_hash_from_torrent_source(&torrent.torrent_or_magnet)
                 .expect("derive info hash from path")]);
+        mark_startup_roll_in_responsiveness_ready(&mut app);
 
         app.load_next_startup_batch().await;
 
@@ -10574,6 +11219,7 @@ mod tests {
         app.client_configs.torrents = vec![failed_torrent.clone(), deferred_running_torrent];
         app.startup_deferred_load_queue =
             VecDeque::from([failed_info_hash.clone(), deferred_running_hash.clone()]);
+        mark_startup_roll_in_responsiveness_ready(&mut app);
 
         app.load_next_startup_batch().await;
         assert_eq!(

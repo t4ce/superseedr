@@ -3288,55 +3288,38 @@ pub fn draw_stats_panel(
     let dl_limit = app_state.effective_download_limit_bps;
     let dl_auto_limited = auto_download_limit_applied(settings.global_download_limit_bps, dl_limit);
 
-    let mut dl_spans = vec![
-        Span::styled(
-            "DL Speed: ",
-            ctx.apply(Style::default().fg(ctx.metric_download()).bold()),
-        ),
-        Span::styled(
-            format_speed(dl_speed),
-            ctx.apply(Style::default().fg(ctx.metric_download()).bold()),
-        ),
-        Span::raw(" / "),
-    ];
-    if dl_auto_limited || (dl_limit > 0 && dl_speed >= dl_limit) {
-        dl_spans.push(Span::styled(
-            format_limit_bps(dl_limit),
-            ctx.apply(Style::default().fg(ctx.state_error())),
-        ));
-    } else {
-        dl_spans.push(Span::styled(
-            format_limit_bps(dl_limit),
-            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
-        ));
-    }
+    let dl_spans = build_limit_value_spans(
+        ctx,
+        "DL Speed: ".to_string(),
+        format_speed(dl_speed),
+        format_limit_bps(dl_limit),
+        ctx.metric_download(),
+        dl_auto_limited || (dl_limit > 0 && dl_speed >= dl_limit),
+    );
 
     let ul_speed = *app_state.avg_upload_history.last().unwrap_or(&0);
     let ul_limit = settings.global_upload_limit_bps;
+    let peer_slot_limit = app_state
+        .active_peer_limit
+        .unwrap_or(app_state.limits.max_connected_peers);
+    let tuning_paused = app_state.active_peer_limit.is_some();
+    let limiter_held_peer_permits = app_state
+        .limits
+        .max_connected_peers
+        .saturating_sub(peer_slot_limit);
+    let displayed_reserve_slots = app_state
+        .limits
+        .reserve_permits
+        .saturating_add(limiter_held_peer_permits);
 
-    let mut ul_spans = vec![
-        Span::styled(
-            "UL Speed: ",
-            ctx.apply(Style::default().fg(ctx.metric_upload()).bold()),
-        ),
-        Span::styled(
-            format_speed(ul_speed),
-            ctx.apply(Style::default().fg(ctx.metric_upload()).bold()),
-        ),
-        Span::raw(" / "),
-    ];
-
-    if ul_limit > 0 && ul_speed >= ul_limit {
-        ul_spans.push(Span::styled(
-            format_limit_bps(ul_limit),
-            ctx.apply(Style::default().fg(ctx.state_error())),
-        ));
-    } else {
-        ul_spans.push(Span::styled(
-            format_limit_bps(ul_limit),
-            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
-        ));
-    }
+    let ul_spans = build_limit_value_spans(
+        ctx,
+        "UL Speed: ".to_string(),
+        format_speed(ul_speed),
+        format_limit_bps(ul_limit),
+        ctx.metric_upload(),
+        ul_limit > 0 && ul_speed >= ul_limit,
+    );
 
     let thrash_value_text: String;
     let thrash_delta_text: String;
@@ -3378,14 +3361,30 @@ pub fn draw_stats_panel(
         }
     }
 
-    let tune_delta_pct = if app_state.last_tuning_score > 0 {
+    let tune_delta_pct = if tuning_paused {
+        None
+    } else if app_state.last_tuning_score > 0 {
         let best = app_state.last_tuning_score as f64;
         let current = app_state.current_tuning_score as f64;
         Some(((current - best) / best) * 100.0)
     } else {
         Some(0.0)
     };
-    let tune_header = format!("Self-Tune({}s): ", app_state.tuning_countdown);
+    let tune_header = if tuning_paused {
+        "Self-Tune(0s): ".to_string()
+    } else {
+        format!("Self-Tune({}s): ", app_state.tuning_countdown)
+    };
+    let tune_value_text = if tuning_paused {
+        "paused".to_string()
+    } else {
+        app_state.current_tuning_score.to_string()
+    };
+    let tune_value_style = if tuning_paused {
+        ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0))
+    } else {
+        ctx.apply(Style::default().fg(ctx.theme.semantic.text))
+    };
     let stats_text = vec![
         Line::from(vec![
             Span::styled(
@@ -3566,10 +3565,7 @@ pub fn draw_stats_panel(
                 tune_header,
                 ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
             ),
-            Span::styled(
-                app_state.current_tuning_score.to_string(),
-                ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
-            ),
+            Span::styled(tune_value_text, tune_value_style),
             if let Some(delta_pct) = tune_delta_pct {
                 let delta_style = if delta_pct > 0.0 {
                     ctx.apply(Style::default().fg(ctx.state_success()))
@@ -3594,15 +3590,18 @@ pub fn draw_stats_panel(
         build_tuning_numeric_line(
             ctx,
             "Reserve Slots:",
-            app_state.limits.reserve_permits,
+            displayed_reserve_slots,
             app_state.last_tuning_limits.reserve_permits,
             ctx.accent_teal(),
+            tuning_paused,
         ),
         build_tuning_peer_line(
             ctx,
             total_peers,
+            peer_slot_limit,
             app_state.limits.max_connected_peers,
             app_state.last_tuning_limits.max_connected_peers,
+            tuning_paused,
         ),
         build_tuning_numeric_line(
             ctx,
@@ -3610,6 +3609,7 @@ pub fn draw_stats_panel(
             app_state.limits.disk_read_permits,
             app_state.last_tuning_limits.disk_read_permits,
             ctx.state_success(),
+            tuning_paused,
         ),
         build_tuning_numeric_line(
             ctx,
@@ -3617,6 +3617,7 @@ pub fn draw_stats_panel(
             app_state.limits.disk_write_permits,
             app_state.last_tuning_limits.disk_write_permits,
             ctx.accent_sky(),
+            tuning_paused,
         ),
     ];
 
@@ -3678,16 +3679,21 @@ fn build_tuning_numeric_line(
     current: usize,
     last: usize,
     label_color: Color,
+    tuning_paused: bool,
 ) -> Line<'static> {
     let delta = current as isize - last as isize;
-    let delta_style = if delta > 0 {
+    let delta_style = if tuning_paused {
+        ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0))
+    } else if delta > 0 {
         ctx.apply(Style::default().fg(ctx.state_success()))
     } else if delta < 0 {
         ctx.apply(Style::default().fg(ctx.state_error()))
     } else {
         ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0))
     };
-    let delta_text = if delta > 0 {
+    let delta_text = if tuning_paused {
+        " (held)".to_string()
+    } else if delta > 0 {
         format!(" (+{})", delta)
     } else if delta < 0 {
         format!(" ({})", delta)
@@ -3705,36 +3711,67 @@ fn build_tuning_numeric_line(
     ])
 }
 
+fn build_limit_value_spans(
+    ctx: &ThemeContext,
+    label: String,
+    value: String,
+    limit: String,
+    value_color: Color,
+    limit_is_hot: bool,
+) -> Vec<Span<'static>> {
+    let value_style = ctx.apply(Style::default().fg(value_color).bold());
+    let limit_style = if limit_is_hot {
+        ctx.apply(Style::default().fg(ctx.state_error()))
+    } else {
+        ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0))
+    };
+    vec![
+        Span::styled(label, value_style),
+        Span::styled(value, value_style),
+        Span::raw(" / "),
+        Span::styled(limit, limit_style),
+    ]
+}
+
 fn build_tuning_peer_line(
     ctx: &ThemeContext,
     used: usize,
+    displayed_limit: usize,
     current_limit: usize,
     last_limit: usize,
+    tuning_paused: bool,
 ) -> Line<'static> {
     let delta = current_limit as isize - last_limit as isize;
-    let delta_style = if delta > 0 {
+    let delta_style = if tuning_paused {
+        ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0))
+    } else if delta > 0 {
         ctx.apply(Style::default().fg(ctx.state_success()))
     } else if delta < 0 {
         ctx.apply(Style::default().fg(ctx.state_error()))
     } else {
         ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0))
     };
-    let delta_text = if delta > 0 {
+    let delta_text = if tuning_paused {
+        " (held)".to_string()
+    } else if delta > 0 {
         format!(" (+{})", delta)
     } else if delta < 0 {
         format!(" ({})", delta)
     } else {
         String::new()
     };
-    Line::from(vec![
-        Span::styled(
-            format!("{:<TUNING_LABEL_WIDTH$}", "Peer Slots:"),
-            ctx.apply(Style::default().fg(ctx.state_selected())),
-        ),
-        Span::raw(" "),
-        Span::raw(format!("{} / {}", used, current_limit)),
-        Span::styled(delta_text, delta_style),
-    ])
+    let mut spans = build_limit_value_spans(
+        ctx,
+        format!("{:<TUNING_LABEL_WIDTH$} ", "Peer Slots:"),
+        used.to_string(),
+        displayed_limit.to_string(),
+        ctx.state_selected(),
+        displayed_limit < current_limit
+            || (displayed_limit > 0 && used >= displayed_limit)
+            || (displayed_limit == 0 && used > 0),
+    );
+    spans.push(Span::styled(delta_text, delta_style));
+    Line::from(spans)
 }
 
 fn rss_sync_countdown_label(next_sync_at: &str) -> Option<String> {

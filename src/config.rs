@@ -532,7 +532,7 @@ static APP_PATHS_OVERRIDE: OnceLock<Mutex<Option<(PathBuf, PathBuf)>>> = OnceLoc
 #[cfg(test)]
 thread_local! {
     static HUMAN_BACKUP_ROOT_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
-        std::cell::RefCell::new(None);
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -1638,12 +1638,12 @@ fn backup_shared_catalog_before_write(
 fn human_backup_root_dir() -> io::Result<PathBuf> {
     #[cfg(test)]
     {
-        return human_backup_root_override().ok_or_else(|| {
+        human_backup_root_override().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 "Test backup root override is not configured",
             )
-        });
+        })
     }
 
     #[cfg(not(test))]

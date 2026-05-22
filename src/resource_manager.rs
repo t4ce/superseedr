@@ -45,6 +45,21 @@ pub struct ResourceManagerClient {
     control_tx: mpsc::UnboundedSender<ControlCommand>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceLimitUpdate {
+    pub limit: usize,
+    pub max_queue_size: Option<usize>,
+}
+
+impl ResourceLimitUpdate {
+    pub fn limit_and_queue(limit: usize, max_queue_size: usize) -> Self {
+        Self {
+            limit,
+            max_queue_size: Some(max_queue_size),
+        }
+    }
+}
+
 #[cfg(feature = "synthetic-load")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResourceUsage {
@@ -71,11 +86,43 @@ impl ResourceManagerClient {
         self.acquire(ResourceType::DiskWrite).await
     }
 
+    #[allow(dead_code)]
     pub async fn update_limits(
         &self,
         new_limits: HashMap<ResourceType, usize>,
     ) -> Result<(), ResourceManagerError> {
-        let command = ControlCommand::UpdateLimits { limits: new_limits };
+        let limits = new_limits
+            .into_iter()
+            .map(|(resource, limit)| {
+                (
+                    resource,
+                    ResourceLimitUpdate {
+                        limit,
+                        max_queue_size: None,
+                    },
+                )
+            })
+            .collect();
+        let command = ControlCommand::UpdateLimits { limits };
+        self.control_tx
+            .send(command)
+            .map_err(|_| ResourceManagerError::ManagerShutdown)
+    }
+
+    pub async fn update_limits_and_queue_sizes(
+        &self,
+        new_limits: HashMap<ResourceType, (usize, usize)>,
+    ) -> Result<(), ResourceManagerError> {
+        let limits = new_limits
+            .into_iter()
+            .map(|(resource, (limit, max_queue_size))| {
+                (
+                    resource,
+                    ResourceLimitUpdate::limit_and_queue(limit, max_queue_size),
+                )
+            })
+            .collect();
+        let command = ControlCommand::UpdateLimits { limits };
         self.control_tx
             .send(command)
             .map_err(|_| ResourceManagerError::ManagerShutdown)
@@ -118,7 +165,7 @@ pub enum ControlCommand {
         resource: ResourceType,
     },
     UpdateLimits {
-        limits: HashMap<ResourceType, usize>,
+        limits: HashMap<ResourceType, ResourceLimitUpdate>,
     },
     ProcessQueue {
         resource: ResourceType,
@@ -270,13 +317,25 @@ impl ResourceManager {
             .send(ControlCommand::ProcessQueue { resource });
     }
 
-    fn handle_update_limits(&mut self, limits: HashMap<ResourceType, usize>) {
-        for (resource, new_limit) in limits {
+    fn handle_update_limits(&mut self, limits: HashMap<ResourceType, ResourceLimitUpdate>) {
+        for (resource, update) in limits {
             if let Some(state) = self.resources.get_mut(&resource) {
-                state.limit = new_limit;
+                state.limit = update.limit;
+                if let Some(max_queue_size) = update.max_queue_size {
+                    state.max_queue_size = max_queue_size;
+                    Self::trim_wait_queue(state);
+                }
                 let _ = self
                     .control_tx
                     .send(ControlCommand::ProcessQueue { resource });
+            }
+        }
+    }
+
+    fn trim_wait_queue(state: &mut ResourceState) {
+        while state.wait_queue.len() > state.max_queue_size {
+            if let Some(waiter) = state.wait_queue.pop_back() {
+                let _ = waiter.send(Err(ResourceManagerError::QueueFull));
             }
         }
     }
@@ -507,6 +566,71 @@ mod tests {
         // Cleanup
         drop(guard1);
         let _ = acquire_task2.await;
+    }
+
+    #[tokio::test]
+    async fn update_limits_and_queue_sizes_zero_queue_clears_waiters_and_blocks_queueing() {
+        let limits = create_limits((1, 2), (0, 0), (0, 0));
+        let (client, _handle) = setup_manager(limits);
+
+        let guard = client.acquire_peer_connection().await.unwrap();
+
+        let client_clone = client.clone();
+        let queued_task = tokio::spawn(async move { client_clone.acquire_peer_connection().await });
+
+        sleep(Duration::from_millis(50)).await;
+        assert!(!queued_task.is_finished());
+
+        let mut stress_limits = HashMap::new();
+        stress_limits.insert(ResourceType::PeerConnection, (1, 0));
+        client
+            .update_limits_and_queue_sizes(stress_limits)
+            .await
+            .unwrap();
+
+        let queued_result = timeout(Duration::from_millis(100), queued_task)
+            .await
+            .expect("queued waiter did not complete")
+            .expect("queued task join failed");
+        assert!(matches!(
+            queued_result,
+            Err(ResourceManagerError::QueueFull)
+        ));
+
+        let saturated_result = client.acquire_peer_connection().await;
+        assert!(matches!(
+            saturated_result,
+            Err(ResourceManagerError::QueueFull)
+        ));
+
+        drop(guard);
+        let guard = timeout(Duration::from_millis(100), client.acquire_peer_connection())
+            .await
+            .expect("acquire timed out after release")
+            .expect("acquire failed after release");
+
+        let mut normal_limits = HashMap::new();
+        normal_limits.insert(ResourceType::PeerConnection, (1, 2));
+        client
+            .update_limits_and_queue_sizes(normal_limits)
+            .await
+            .unwrap();
+
+        let client_clone = client.clone();
+        let queued_task = tokio::spawn(async move { client_clone.acquire_peer_connection().await });
+
+        sleep(Duration::from_millis(50)).await;
+        assert!(
+            !queued_task.is_finished(),
+            "restored queue should allow waiter to block"
+        );
+
+        drop(guard);
+        let queued_result = timeout(Duration::from_millis(100), queued_task)
+            .await
+            .expect("queued waiter did not wake after normal queue restore")
+            .expect("queued task join failed");
+        assert!(queued_result.is_ok());
     }
 
     #[tokio::test]
