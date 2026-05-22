@@ -1113,6 +1113,25 @@ fn pane_block<'a>(title: &'a str, active: bool, ctx: &crate::theme::ThemeContext
         .border_style(border_style)
 }
 
+fn draw_empty_pane_values(
+    f: &mut Frame,
+    area: Rect,
+    block: Block<'_>,
+    messages: &[&'static str],
+    ctx: &crate::theme::ThemeContext,
+) {
+    let empty_rows: Vec<ListItem<'static>> = messages
+        .iter()
+        .map(|message| {
+            ListItem::new(Line::from(Span::styled(
+                *message,
+                ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0)),
+            )))
+        })
+        .collect();
+    f.render_widget(List::new(empty_rows).block(block), area);
+}
+
 fn draw_links(f: &mut Frame, area: Rect, screen: &ScreenContext<'_>, active: bool) {
     let perf_start = Instant::now();
     let app_state = screen.app.state;
@@ -1209,6 +1228,24 @@ fn draw_links(f: &mut Frame, area: Rect, screen: &ScreenContext<'_>, active: boo
         }
     }
     let errors_ms = errors_start.elapsed().as_millis();
+
+    if lines.is_empty() {
+        let render_start = Instant::now();
+        draw_empty_pane_values(
+            f,
+            area,
+            pane_block("Links", active, screen.theme),
+            &["No RSS links configured", "[a] add RSS link"],
+            screen.theme,
+        );
+        let render_ms = render_start.elapsed().as_millis();
+        let _ = perf_start;
+        let _ = selected_item_ms;
+        let _ = lines_ms;
+        let _ = errors_ms;
+        let _ = render_ms;
+        return;
+    }
 
     let items: Vec<ListItem<'static>> = lines.into_iter().map(ListItem::new).collect();
     let mut state = ListState::default();
@@ -1636,6 +1673,25 @@ fn draw_filters(f: &mut Frame, area: Rect, screen: &ScreenContext<'_>, active: b
         )])));
     }
     let rows_ms = rows_start.elapsed().as_millis();
+    if items.is_empty() {
+        let render_start = Instant::now();
+        draw_empty_pane_values(
+            f,
+            area,
+            pane_block("Filters", active, screen.theme),
+            &["No RSS filters configured"],
+            screen.theme,
+        );
+        let render_ms = render_start.elapsed().as_millis();
+        let _ = perf_start;
+        let _ = crosswire_ms;
+        let _ = sort_ms;
+        let _ = stats_ms;
+        let _ = rows_ms;
+        let _ = render_ms;
+        return;
+    }
+
     let mut state = ListState::default();
     if !items.is_empty() {
         state.select(Some(selected.min(items.len() - 1)));
@@ -1907,6 +1963,32 @@ fn draw_explorer(f: &mut Frame, area: Rect, screen: &ScreenContext<'_>, active: 
         })
         .collect();
     let rows_ms = rows_start.elapsed().as_millis();
+    if list_items.is_empty() {
+        let messages: &[&str] = if app_state.ui.rss.search_query.trim().is_empty() {
+            &[
+                "No RSS items",
+                "1. Press [Tab] to focus Links, then [a] add RSS link",
+                "2. Press [Tab] to focus Filters, then [a] add title filter",
+                "3. Press [Tab] back to Explorer to review matches",
+            ]
+        } else {
+            &["No RSS items match search"]
+        };
+        let render_start = Instant::now();
+        draw_empty_pane_values(
+            f,
+            area,
+            pane_block("Explorer", active, screen.theme),
+            messages,
+            screen.theme,
+        );
+        let render_ms = render_start.elapsed().as_millis();
+        let _ = perf_start;
+        let _ = compute_ms;
+        let _ = rows_ms;
+        let _ = render_ms;
+        return;
+    }
 
     let mut state = ListState::default();
     if active && !items.is_empty() {
@@ -1965,6 +2047,16 @@ fn draw_history(f: &mut Frame, area: Rect, screen: &ScreenContext<'_>) {
             ))
         })
         .collect();
+
+    if lines.is_empty() {
+        let message = if app_state.ui.rss.search_query.trim().is_empty() {
+            "No RSS download history"
+        } else {
+            "No RSS history matches search"
+        };
+        draw_empty_pane_values(f, area, pane_block("History", true, ctx), &[message], ctx);
+        return;
+    }
 
     let items: Vec<ListItem<'static>> = lines.into_iter().map(ListItem::new).collect();
     let mut state = ListState::default();
