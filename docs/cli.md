@@ -203,6 +203,9 @@ superseedr show-configs --all
 Show resolved absolute paths and short descriptions for the effective config,
 log, status, journal, lock, and watch paths.
 
+See [`configuration-and-backups.md`](configuration-and-backups.md) for the
+configuration and backup file map, including backup cadence and retention.
+
 Behavior:
 
 - default mode: reports only the effective paths Superseedr is actually using

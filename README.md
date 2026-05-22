@@ -262,9 +262,10 @@ superseedr to-standalone
 superseedr stop-client
 ```
 
-See [`docs/cli.md`](docs/cli.md) for full CLI command behavior, and
+See [`docs/cli.md`](docs/cli.md) for full CLI command behavior,
 [`docs/shared-config.md`](docs/shared-config.md) for shared leader/follower
-routing.
+routing, and [`docs/configuration-and-backups.md`](docs/configuration-and-backups.md)
+for configuration and backup file locations.
 
 ### 3. Status API & Monitoring
 For external dashboards, health checks, and lightweight automation, Superseedr
@@ -307,7 +308,9 @@ Shared mode gives you an OS- and machine-agnostic torrent catalog and settings
 that live alongside your data on the NAS or shared root. Any Superseedr client
 that mounts that shared root can connect and reuse the same catalog in real time.
 Superseedr CLI commands work against that shared config both online and offline. See
-[`docs/shared-config.md`](docs/shared-config.md) for the full shared-mode guide.
+[`docs/shared-config.md`](docs/shared-config.md) for the full shared-mode guide
+and [`docs/configuration-and-backups.md`](docs/configuration-and-backups.md) for
+configuration and backup file locations.
 
 ```text
 Same shared root, different local mount paths
@@ -456,5 +459,4 @@ Superseedr implements the following BitTorrent Enhancement Proposals (BEPs):
 * **BEP 52:** The BitTorrent Protocol v2
 
 </details>
-
 

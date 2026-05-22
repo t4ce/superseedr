@@ -73,6 +73,10 @@ Superseedr stores its cluster files under:
 Payload data still lives under the shared root itself, not under
 `superseedr-config/`.
 
+For a complete map of shared config files, local launcher sidecars, recovery
+mirrors, and backup cadence, see
+[`configuration-and-backups.md`](configuration-and-backups.md).
+
 ### 2. Configure Each Host
 
 You can use environment variables:
