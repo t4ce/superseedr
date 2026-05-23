@@ -38,6 +38,18 @@ pub enum Commands {
     #[command(about = "Add one or more torrent paths or magnet links")]
     Add {
         #[arg(
+            long,
+            alias = "validate",
+            help = "Trust the added torrent data as already validated"
+        )]
+        validated: bool,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Use an existing download directory for all added inputs"
+        )]
+        path: Option<PathBuf>,
+        #[arg(
             value_name = "INPUT",
             num_args = 1..,
             help = "Torrent file path(s) or magnet link(s)"
@@ -711,7 +723,12 @@ pub fn require_cli_targets(values: &[String], command_name: &str) -> Result<Vec<
 pub fn expand_add_inputs(inputs: &[String]) -> Vec<String> {
     let mut expanded = Vec::new();
     for input in inputs {
-        if input.starts_with("magnet:") || Path::new(input).exists() {
+        if input.starts_with("magnet:") {
+            expanded.extend(split_comma_joined_magnets(input));
+            continue;
+        }
+
+        if Path::new(input).exists() {
             expanded.push(input.clone());
             continue;
         }
@@ -734,6 +751,22 @@ pub fn expand_add_inputs(inputs: &[String]) -> Vec<String> {
         }
     }
     expanded
+}
+
+fn split_comma_joined_magnets(input: &str) -> Vec<String> {
+    input
+        .split(",magnet:?")
+        .enumerate()
+        .map(|(index, value)| {
+            if index == 0 {
+                value.to_string()
+            } else {
+                format!("magnet:?{}", value)
+            }
+        })
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect()
 }
 
 pub fn write_control_command(request: &ControlRequest, watch_path: &Path) -> io::Result<PathBuf> {
@@ -1000,6 +1033,23 @@ mod tests {
     }
 
     #[test]
+    fn add_command_expands_comma_joined_magnet_inputs() {
+        let expanded = expand_add_inputs(&[concat!(
+            "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&tr=udp%3A%2F%2Ftracker.example",
+            ",magnet:?xt=urn:btih:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&dn=beta"
+        )
+        .to_string()]);
+
+        assert_eq!(expanded.len(), 2);
+        assert!(expanded[0].starts_with("magnet:?xt=urn:btih:aaaaaaaa"));
+        assert!(expanded[0].contains("&tr=udp%3A%2F%2Ftracker.example"));
+        assert_eq!(
+            expanded[1],
+            "magnet:?xt=urn:btih:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&dn=beta"
+        );
+    }
+
+    #[test]
     fn cli_priority_command_parses_without_panicking() {
         Cli::command().debug_assert();
 
@@ -1050,6 +1100,56 @@ mod tests {
                 info_hash_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()
             }]
         );
+    }
+
+    #[test]
+    fn cli_add_command_accepts_validated_aliases() {
+        Cli::command().debug_assert();
+
+        for flag in ["--validated", "--validate"] {
+            let parsed = Cli::try_parse_from(["superseedr", "add", flag, "sample.bin"])
+                .expect("add command should parse validated flag");
+
+            match parsed.command.expect("subcommand") {
+                Commands::Add {
+                    inputs,
+                    validated,
+                    path,
+                } => {
+                    assert!(validated);
+                    assert_eq!(path, None);
+                    assert_eq!(inputs, vec!["sample.bin".to_string()]);
+                }
+                other => panic!("unexpected command: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn cli_add_command_accepts_download_path() {
+        Cli::command().debug_assert();
+
+        let parsed = Cli::try_parse_from([
+            "superseedr",
+            "add",
+            "--path",
+            "/tmp/superseedr-downloads",
+            "sample.bin",
+        ])
+        .expect("add command should parse path option");
+
+        match parsed.command.expect("subcommand") {
+            Commands::Add {
+                inputs,
+                validated,
+                path,
+            } => {
+                assert!(!validated);
+                assert_eq!(path, Some(PathBuf::from("/tmp/superseedr-downloads")));
+                assert_eq!(inputs, vec!["sample.bin".to_string()]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]

@@ -591,12 +591,14 @@ pub enum ControlExecutionPlan {
         source_path: PathBuf,
         download_path: Option<PathBuf>,
         container_name: Option<String>,
+        validation_status: bool,
         file_priorities: HashMap<usize, FilePriority>,
     },
     AddMagnet {
         magnet_link: String,
         download_path: Option<PathBuf>,
         container_name: Option<String>,
+        validation_status: bool,
         file_priorities: HashMap<usize, FilePriority>,
     },
 }
@@ -704,25 +706,35 @@ pub fn plan_control_request(
             source_path,
             download_path,
             container_name,
+            validation_status,
             file_priorities,
         } => Ok(ControlExecutionPlan::AddTorrentFile {
             source_path: source_path.clone(),
-            download_path: download_path.clone(),
+            download_path: effective_add_download_path(settings, download_path),
             container_name: container_name.clone(),
+            validation_status: *validation_status,
             file_priorities: file_priorities_to_map(file_priorities),
         }),
         ControlRequest::AddMagnet {
             magnet_link,
             download_path,
             container_name,
+            validation_status,
             file_priorities,
         } => Ok(ControlExecutionPlan::AddMagnet {
             magnet_link: magnet_link.clone(),
-            download_path: download_path.clone(),
+            download_path: effective_add_download_path(settings, download_path),
             container_name: container_name.clone(),
+            validation_status: *validation_status,
             file_priorities: file_priorities_to_map(file_priorities),
         }),
     }
+}
+
+fn effective_add_download_path(settings: &Settings, explicit: &Option<PathBuf>) -> Option<PathBuf> {
+    explicit
+        .clone()
+        .or_else(|| settings.default_download_folder.clone())
 }
 
 pub fn resolve_priority_file_index(
@@ -782,6 +794,7 @@ pub fn apply_offline_control_request(
             source_path,
             download_path,
             container_name,
+            validation_status,
             file_priorities,
         } => {
             let name = source_path
@@ -795,6 +808,7 @@ pub fn apply_offline_control_request(
                 download_path,
                 container_name,
                 file_priorities,
+                validation_status,
                 ..TorrentSettings::default()
             });
             Ok(format!(
@@ -806,19 +820,42 @@ pub fn apply_offline_control_request(
             magnet_link,
             download_path,
             container_name,
+            validation_status,
             file_priorities,
         } => {
+            let name =
+                magnet_display_name(&magnet_link).unwrap_or_else(|| "Queued Magnet".to_string());
             settings.torrents.push(TorrentSettings {
                 torrent_or_magnet: magnet_link,
-                name: "Queued Magnet".to_string(),
+                name,
                 download_path,
                 container_name,
                 file_priorities,
+                validation_status,
                 ..TorrentSettings::default()
             });
             Ok("Queued magnet for the next runtime".to_string())
         }
     }
+}
+
+fn magnet_display_name(magnet_link: &str) -> Option<String> {
+    for raw_part in magnet_link.split('&') {
+        let part = raw_part.strip_prefix("magnet:?").unwrap_or(raw_part);
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        if key.eq_ignore_ascii_case("dn") {
+            let value_for_decode = value.replace('+', "%20");
+            if let Ok(decoded) = urlencoding::decode(&value_for_decode) {
+                let name = decoded.trim();
+                if !name.is_empty() {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1100,6 +1137,76 @@ mod tests {
                     crate::app::TorrentControlState::Deleting
                 );
                 assert!(next_settings.torrents[0].delete_files);
+            }
+            other => panic!("unexpected plan: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn offline_add_control_preserves_validation_status() {
+        let _guard = shared_env_guard().lock().unwrap();
+        let mut settings = Settings::default();
+        let request = ControlRequest::AddMagnet {
+            magnet_link: "magnet:?xt=urn:btih:2222222222222222222222222222222222222222".to_string(),
+            download_path: None,
+            container_name: None,
+            validation_status: true,
+            file_priorities: Vec::new(),
+        };
+
+        apply_offline_control_request(&mut settings, &request).expect("apply add");
+
+        assert_eq!(settings.torrents.len(), 1);
+        assert!(settings.torrents[0].validation_status);
+    }
+
+    #[test]
+    fn add_control_uses_default_download_folder_when_path_is_absent() {
+        let _guard = shared_env_guard().lock().unwrap();
+        let mut settings = Settings {
+            default_download_folder: Some(PathBuf::from("/downloads/default")),
+            ..Default::default()
+        };
+        let request = ControlRequest::AddMagnet {
+            magnet_link: "magnet:?xt=urn:btih:3333333333333333333333333333333333333333".to_string(),
+            download_path: None,
+            container_name: None,
+            validation_status: true,
+            file_priorities: Vec::new(),
+        };
+
+        match plan_control_request(&settings, &request).expect("plan add") {
+            ControlExecutionPlan::AddMagnet { download_path, .. } => {
+                assert_eq!(download_path, Some(PathBuf::from("/downloads/default")));
+            }
+            other => panic!("unexpected plan: {:?}", other),
+        }
+
+        apply_offline_control_request(&mut settings, &request).expect("apply add");
+        assert_eq!(
+            settings.torrents[0].download_path,
+            Some(PathBuf::from("/downloads/default"))
+        );
+    }
+
+    #[test]
+    fn add_control_explicit_download_path_overrides_default() {
+        let _guard = shared_env_guard().lock().unwrap();
+        let settings = Settings {
+            default_download_folder: Some(PathBuf::from("/downloads/default")),
+            ..Default::default()
+        };
+        let request = ControlRequest::AddTorrentFile {
+            source_path: PathBuf::from("/tmp/sample.torrent"),
+            download_path: Some(PathBuf::from("/downloads/explicit")),
+            container_name: None,
+            validation_status: true,
+            file_priorities: Vec::new(),
+        };
+
+        match plan_control_request(&settings, &request).expect("plan add") {
+            ControlExecutionPlan::AddTorrentFile { download_path, .. } => {
+                assert_eq!(download_path, Some(PathBuf::from("/downloads/explicit")));
             }
             other => panic!("unexpected plan: {:?}", other),
         }

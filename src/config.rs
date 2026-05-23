@@ -688,6 +688,12 @@ impl TorrentMetadataEntry {
     fn placeholder_from_settings(settings: &TorrentSettings) -> Option<Self> {
         let info_hash =
             crate::torrent_identity::info_hash_from_torrent_source(&settings.torrent_or_magnet)?;
+        if settings.torrent_or_magnet.starts_with("magnet:") {
+            return Some(magnet_metadata_placeholder_from_settings(
+                settings, info_hash,
+            ));
+        }
+
         Some(Self {
             info_hash_hex: hex::encode(info_hash),
             torrent_name: settings.name.clone(),
@@ -704,6 +710,65 @@ impl TorrentMetadataEntry {
         }
         self.file_priorities = settings.file_priorities.clone();
     }
+}
+
+fn magnet_metadata_placeholder_from_settings(
+    settings: &TorrentSettings,
+    info_hash: Vec<u8>,
+) -> TorrentMetadataEntry {
+    let display_name = extract_magnet_query_value(&settings.torrent_or_magnet, "dn")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| settings.name.clone());
+    let length = extract_magnet_query_value(&settings.torrent_or_magnet, "xl")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_default();
+    let files = if !display_name.is_empty() && length > 0 {
+        vec![TorrentMetadataFileEntry {
+            relative_path: normalize_magnet_file_name(&display_name),
+            length,
+        }]
+    } else {
+        Vec::new()
+    };
+
+    TorrentMetadataEntry {
+        info_hash_hex: hex::encode(info_hash),
+        torrent_name: display_name,
+        total_size: length,
+        is_multi_file: false,
+        files,
+        file_priorities: settings.file_priorities.clone(),
+    }
+}
+
+fn extract_magnet_query_value(magnet_link: &str, target_key: &str) -> Option<String> {
+    for raw_part in magnet_link.split('&') {
+        let part = raw_part.strip_prefix("magnet:?").unwrap_or(raw_part);
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        if key.eq_ignore_ascii_case(target_key) {
+            let value_for_decode = value.replace('+', "%20");
+            if let Ok(decoded) = urlencoding::decode(&value_for_decode) {
+                let value = decoded.trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn normalize_magnet_file_name(name: &str) -> String {
+    name.replace('\\', "/")
+        .split('/')
+        .filter(|segment| {
+            let segment = segment.trim();
+            !segment.is_empty() && segment != "." && segment != ".."
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn sync_torrent_metadata_with_settings(
@@ -2263,11 +2328,12 @@ impl ConfigBackend {
         match self {
             ConfigBackend::Normal(backend) => {
                 let mut metadata = read_torrent_metadata_or_default(&backend.paths.metadata_path)?;
-                upsert_torrent_metadata_entry(&mut metadata, entry);
-                let _ = write_toml_atomically_with_fingerprint(
-                    &backend.paths.metadata_path,
-                    &metadata,
-                )?;
+                if upsert_torrent_metadata_entry(&mut metadata, entry) {
+                    let _ = write_toml_atomically_with_fingerprint(
+                        &backend.paths.metadata_path,
+                        &metadata,
+                    )?;
+                }
                 Ok(())
             }
             ConfigBackend::Shared(backend) => {
@@ -2275,11 +2341,12 @@ impl ConfigBackend {
                 // single-writer model. If concurrent shared writers are added
                 // later, restore conflict detection here before writing.
                 let mut metadata = read_torrent_metadata_or_default(&backend.paths.metadata_path)?;
-                upsert_torrent_metadata_entry(&mut metadata, entry);
-                let _ = write_toml_atomically_with_fingerprint(
-                    &backend.paths.metadata_path,
-                    &metadata,
-                )?;
+                if upsert_torrent_metadata_entry(&mut metadata, entry) {
+                    let _ = write_toml_atomically_with_fingerprint(
+                        &backend.paths.metadata_path,
+                        &metadata,
+                    )?;
+                }
                 Ok(())
             }
         }
@@ -2289,15 +2356,20 @@ impl ConfigBackend {
 fn upsert_torrent_metadata_entry(
     metadata: &mut TorrentMetadataConfig,
     entry: TorrentMetadataEntry,
-) {
+) -> bool {
     if let Some(existing) = metadata
         .torrents
         .iter_mut()
         .find(|existing| existing.info_hash_hex == entry.info_hash_hex)
     {
+        if *existing == entry {
+            return false;
+        }
         *existing = entry;
+        true
     } else {
         metadata.torrents.push(entry);
+        true
     }
 }
 
@@ -2385,6 +2457,7 @@ pub fn set_persisted_shared_config(path: &Path) -> io::Result<SharedConfigSelect
     }
 
     let (mount_root, config_root) = resolve_shared_mount_and_config_root(path.to_path_buf());
+    initialize_persisted_shared_config_defaults(&mount_root, &config_root)?;
     let sidecar_path = launcher_shared_config_path()?;
     if let Some(parent) = sidecar_path.parent() {
         fs::create_dir_all(parent)?;
@@ -2402,6 +2475,19 @@ pub fn set_persisted_shared_config(path: &Path) -> io::Result<SharedConfigSelect
         mount_root,
         config_root,
     })
+}
+
+fn initialize_persisted_shared_config_defaults(
+    mount_root: &Path,
+    config_root: &Path,
+) -> io::Result<()> {
+    fs::create_dir_all(config_root)?;
+    let settings_path = config_root.join("settings.toml");
+    let mut settings: SharedSettingsConfig = read_toml_or_default(&settings_path)?;
+    settings.default_download_folder = Some(PathBuf::new());
+    let _ = write_toml_atomically_with_fingerprint(&settings_path, &settings)?;
+    fs::create_dir_all(mount_root)?;
+    Ok(())
 }
 
 pub fn clear_persisted_shared_config() -> io::Result<bool> {
@@ -4925,6 +5011,48 @@ mod tests {
     }
 
     #[test]
+    fn test_save_settings_seeds_single_file_magnet_metadata() {
+        let dir = tempdir().expect("create tempdir");
+        let backend = NormalConfigBackend {
+            paths: NormalConfigPaths {
+                settings_path: dir.path().join("settings.toml"),
+                metadata_path: dir.path().join("torrent_metadata.toml"),
+                backup_dir: dir.path().join("backups_settings_files"),
+                data_dir: dir.path().join("data"),
+            },
+        };
+        let settings = Settings {
+            torrents: vec![TorrentSettings {
+                torrent_or_magnet: concat!(
+                    "magnet:?xt=urn:btih:2222222222222222222222222222222222222222",
+                    "&dn=Sample%20Node.mkv",
+                    "&xl=12345"
+                )
+                .to_string(),
+                validation_status: true,
+                ..TorrentSettings::default()
+            }],
+            ..Settings::default()
+        };
+
+        backend.save_settings(&settings).expect("save settings");
+
+        let saved_metadata: TorrentMetadataConfig =
+            read_toml_or_default(&backend.paths.metadata_path).expect("load metadata");
+        assert_eq!(saved_metadata.torrents.len(), 1);
+        let entry = &saved_metadata.torrents[0];
+        assert_eq!(
+            entry.info_hash_hex,
+            "2222222222222222222222222222222222222222"
+        );
+        assert_eq!(entry.torrent_name, "Sample Node.mkv");
+        assert_eq!(entry.total_size, 12345);
+        assert_eq!(entry.files.len(), 1);
+        assert_eq!(entry.files[0].relative_path, "Sample Node.mkv");
+        assert_eq!(entry.files[0].length, 12345);
+    }
+
+    #[test]
     fn test_upsert_torrent_metadata_overwrites_invalid_metadata() {
         let dir = tempdir().expect("create tempdir");
         let backend = NormalConfigBackend {
@@ -4956,6 +5084,31 @@ mod tests {
             "2222222222222222222222222222222222222222"
         );
         assert_eq!(saved_metadata.torrents[0].torrent_name, "Queued Sample");
+    }
+
+    #[test]
+    fn test_upsert_torrent_metadata_entry_reports_unchanged_entries() {
+        let entry = TorrentMetadataEntry {
+            info_hash_hex: "2222222222222222222222222222222222222222".to_string(),
+            torrent_name: "Queued Sample".to_string(),
+            ..TorrentMetadataEntry::default()
+        };
+        let mut metadata = TorrentMetadataConfig {
+            torrents: vec![entry.clone()],
+        };
+
+        assert!(!upsert_torrent_metadata_entry(&mut metadata, entry.clone()));
+        assert_eq!(metadata.torrents, vec![entry.clone()]);
+
+        let changed_entry = TorrentMetadataEntry {
+            torrent_name: "Updated Sample".to_string(),
+            ..entry
+        };
+        assert!(upsert_torrent_metadata_entry(
+            &mut metadata,
+            changed_entry.clone()
+        ));
+        assert_eq!(metadata.torrents, vec![changed_entry]);
     }
 
     fn watch_env_guard() -> &'static std::sync::Mutex<()> {
@@ -4991,6 +5144,58 @@ mod tests {
             .expect("resolve effective shared config")
             .expect("shared config enabled");
         assert_eq!(effective, selection);
+
+        set_app_paths_override_for_tests(None);
+        clear_shared_config_state();
+    }
+
+    #[test]
+    fn test_set_persisted_shared_config_defaults_download_folder_to_mount_root() {
+        let _guard = shared_backend_guard().lock().unwrap();
+        let temp = set_temp_app_paths();
+        let shared_root = temp.path().join("shared-root");
+
+        let selection =
+            set_persisted_shared_config(&shared_root).expect("persist shared config path");
+
+        let settings_path = selection.config_root.join("settings.toml");
+        let raw_settings: SharedSettingsConfig =
+            read_toml_or_default(&settings_path).expect("read shared settings");
+        assert_eq!(raw_settings.default_download_folder, Some(PathBuf::new()));
+
+        let loaded = load_settings().expect("load shared settings");
+        assert_eq!(loaded.default_download_folder, Some(selection.mount_root));
+
+        set_app_paths_override_for_tests(None);
+        clear_shared_config_state();
+    }
+
+    #[test]
+    fn test_set_persisted_shared_config_repairs_existing_default_download_folder() {
+        let _guard = shared_backend_guard().lock().unwrap();
+        let temp = set_temp_app_paths();
+        let shared_root = temp.path().join("shared-root");
+        let explicit_config_root = shared_root.join(SHARED_CONFIG_SUBDIR);
+        fs::create_dir_all(&explicit_config_root).expect("create shared config root");
+        write_toml_atomically(
+            &explicit_config_root.join("settings.toml"),
+            &SharedSettingsConfig {
+                default_download_folder: Some(PathBuf::from("old-downloads")),
+                ..SharedSettingsConfig::default()
+            },
+        )
+        .expect("write stale shared settings");
+
+        let selection = set_persisted_shared_config(&explicit_config_root)
+            .expect("persist explicit shared config path");
+
+        let raw_settings: SharedSettingsConfig =
+            read_toml_or_default(&selection.config_root.join("settings.toml"))
+                .expect("read shared settings");
+        assert_eq!(raw_settings.default_download_folder, Some(PathBuf::new()));
+
+        let loaded = load_settings().expect("load shared settings");
+        assert_eq!(loaded.default_download_folder, Some(shared_root));
 
         set_app_paths_override_for_tests(None);
         clear_shared_config_state();

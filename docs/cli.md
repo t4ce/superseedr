@@ -115,6 +115,9 @@ Behavior:
 
 ```bash
 superseedr add <INPUT>...
+superseedr add --path <PATH> <INPUT>...
+superseedr add --validated <INPUT>...
+superseedr add 'magnet:?xt=...,magnet:?xt=...'
 ```
 
 Add one or more torrent file paths or magnet links.
@@ -123,6 +126,15 @@ Inputs can be:
 
 - `.torrent` paths
 - magnet links
+- comma-joined magnet links with no whitespace between entries
+  (`magnet:?xt=...,magnet:?xt=...`)
+
+Use `--validated` (alias: `--validate`) when rebuilding a catalog from data
+that has already been verified and should be persisted with
+`validation_status = true`.
+
+Use `--path` to persist an existing download path for the added inputs. The
+path must be non-empty and must already exist as a directory.
 
 In shared mode, cross-host `.path` adds are portable when the `.torrent` file
 is on the shared root.

@@ -20,10 +20,11 @@ use strum_macros::EnumIter;
 use crate::torrent_manager::DiskIoOperation;
 
 use crate::config::{
-    classify_shared_mode_settings_change, host_watch_paths, runtime_watch_paths, save_settings,
-    shared_host_id, shared_inbox_path, shared_root_path, upsert_torrent_metadata, FeedSyncError,
-    PeerSortColumn, RssFilterMode, RssHistoryEntry, Settings, SettingsChangeScope, SortDirection,
-    TorrentMetadataEntry, TorrentMetadataFileEntry, TorrentSettings, TorrentSortColumn,
+    classify_shared_mode_settings_change, host_watch_paths, load_torrent_metadata,
+    runtime_watch_paths, save_settings, shared_host_id, shared_inbox_path, shared_root_path,
+    upsert_torrent_metadata, FeedSyncError, PeerSortColumn, RssFilterMode, RssHistoryEntry,
+    Settings, SettingsChangeScope, SortDirection, TorrentMetadataEntry, TorrentMetadataFileEntry,
+    TorrentSettings, TorrentSortColumn,
 };
 use crate::control_service::{
     control_event_details, online_control_success_message, plan_control_request,
@@ -2323,6 +2324,7 @@ pub struct App {
     pub next_startup_load_at: Option<time::Instant>,
     startup_roll_in_pressure_stats: StartupRollInPressureStats,
     pub last_dht_peer_slot_usage: Option<(usize, usize)>,
+    persisted_torrent_metadata_cache: HashMap<Vec<u8>, TorrentMetadataEntry>,
 }
 
 #[derive(Clone)]
@@ -2796,6 +2798,19 @@ impl App {
         let watcher = watcher::create_watcher(&watched_paths, true, notify_tx)?;
         let initial_tuning_deadline =
             time::Instant::now() + Duration::from_secs(tuning_controller.cadence_secs());
+        let persisted_torrent_metadata_cache = load_torrent_metadata()
+            .map(|metadata| {
+                metadata
+                    .torrents
+                    .into_iter()
+                    .filter_map(|entry| {
+                        hex::decode(&entry.info_hash_hex)
+                            .ok()
+                            .map(|info_hash| (info_hash, entry))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let mut app = Self {
             app_state,
@@ -2857,6 +2872,7 @@ impl App {
             next_startup_load_at: None,
             startup_roll_in_pressure_stats: StartupRollInPressureStats::default(),
             last_dht_peer_slot_usage: None,
+            persisted_torrent_metadata_cache,
         };
         app.sync_cluster_role_label();
         app.refresh_system_warning();
@@ -3280,6 +3296,7 @@ impl App {
             source_path: request_source_path,
             download_path,
             container_name,
+            validation_status: false,
             file_priorities: Self::control_priority_overrides(&file_priorities),
         })
     }
@@ -3295,6 +3312,7 @@ impl App {
             magnet_link,
             download_path,
             container_name,
+            validation_status: false,
             file_priorities: Self::control_priority_overrides(&file_priorities),
         }
     }
@@ -5316,23 +5334,25 @@ impl App {
                     self.apply_settings_update(new_settings, true).await;
                 }
             }
-            AppCommand::ReloadClusterState(_path) => match crate::config::load_settings() {
-                Ok(new_settings) => {
-                    if self.is_current_shared_leader() {
-                        return;
+            AppCommand::ReloadClusterState(_path) => {
+                if self.is_current_shared_leader() {
+                    return;
+                }
+                match crate::config::load_settings() {
+                    Ok(new_settings) => {
+                        if new_settings != self.client_configs {
+                            self.apply_settings_update(new_settings, false).await;
+                        }
                     }
-                    if new_settings != self.client_configs {
-                        self.apply_settings_update(new_settings, false).await;
+                    Err(error) => {
+                        tracing_event!(
+                            Level::ERROR,
+                            "Failed to reload shared cluster state: {}",
+                            error
+                        );
                     }
                 }
-                Err(error) => {
-                    tracing_event!(
-                        Level::ERROR,
-                        "Failed to reload shared cluster state: {}",
-                        error
-                    );
-                }
-            },
+            }
             AppCommand::UpdateVersionAvailable(latest_version) => {
                 self.app_state.update_available = Some(latest_version);
             }
@@ -6562,6 +6582,12 @@ impl App {
         };
         let resolved_name = resolve_magnet_torrent_name(&torrent_name, &magnet_link, &info_hash);
         let resolved_torrent_name = resolved_name.clone();
+        self.persist_magnet_metadata_snapshot(
+            &info_hash,
+            &magnet_link,
+            &resolved_torrent_name,
+            &file_priorities,
+        );
 
         if self.app_state.torrents.contains_key(&info_hash) {
             if !self.has_live_runtime_for_torrent(&info_hash) {
@@ -6751,7 +6777,7 @@ impl App {
     }
 
     fn persist_torrent_metadata_snapshot(
-        &self,
+        &mut self,
         info_hash: &[u8],
         torrent: &crate::torrent_file::Torrent,
         file_priorities: &HashMap<usize, FilePriority>,
@@ -6776,13 +6802,71 @@ impl App {
             file_priorities: file_priorities.clone(),
         };
 
-        if let Err(error) = upsert_torrent_metadata(entry) {
+        if self
+            .persisted_torrent_metadata_cache
+            .get(info_hash)
+            .is_some_and(|persisted| persisted == &entry)
+        {
+            return;
+        }
+
+        if let Err(error) = upsert_torrent_metadata(entry.clone()) {
             tracing_event!(
                 Level::WARN,
                 "Failed to persist torrent metadata snapshot: {}",
                 error
             );
+            return;
         }
+
+        self.persisted_torrent_metadata_cache
+            .insert(info_hash.to_vec(), entry);
+    }
+
+    fn persist_magnet_metadata_snapshot(
+        &mut self,
+        info_hash: &[u8],
+        magnet_link: &str,
+        torrent_name: &str,
+        file_priorities: &HashMap<usize, FilePriority>,
+    ) {
+        let Some(length) = extract_magnet_exact_length(magnet_link) else {
+            return;
+        };
+        let Some(file_name) = extract_magnet_display_name(magnet_link) else {
+            return;
+        };
+        let entry = TorrentMetadataEntry {
+            info_hash_hex: hex::encode(info_hash),
+            torrent_name: torrent_name.to_string(),
+            total_size: length,
+            is_multi_file: false,
+            files: vec![TorrentMetadataFileEntry {
+                relative_path: normalize_magnet_metadata_path(&file_name),
+                length,
+            }],
+            file_priorities: file_priorities.clone(),
+        };
+
+        if self
+            .persisted_torrent_metadata_cache
+            .get(info_hash)
+            .is_some_and(|persisted| persisted == &entry)
+        {
+            return;
+        }
+
+        if let Err(error) = upsert_torrent_metadata(entry.clone()) {
+            tracing_event!(
+                Level::WARN,
+                "Failed to persist magnet metadata snapshot: {}",
+                error
+            );
+            return;
+        }
+
+        self.persisted_torrent_metadata_cache
+            .insert(info_hash.to_vec(), entry);
     }
 
     fn record_ingest_queued(
@@ -7157,13 +7241,14 @@ impl App {
                 source_path,
                 download_path,
                 container_name,
+                validation_status,
                 file_priorities,
             } => {
                 let ingest_result = self
                     .add_torrent_from_file(
                         source_path.clone(),
                         download_path,
-                        false,
+                        validation_status,
                         TorrentControlState::Running,
                         file_priorities,
                         container_name,
@@ -7183,6 +7268,7 @@ impl App {
                 magnet_link,
                 download_path,
                 container_name,
+                validation_status,
                 file_priorities,
             } => {
                 let ingest_result = self
@@ -7190,7 +7276,7 @@ impl App {
                         "Fetching name...".to_string(),
                         magnet_link,
                         download_path,
-                        false,
+                        validation_status,
                         TorrentControlState::Running,
                         file_priorities,
                         container_name,
@@ -7938,6 +8024,30 @@ fn extract_magnet_display_name(magnet_link: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn extract_magnet_exact_length(magnet_link: &str) -> Option<u64> {
+    for raw_part in magnet_link.split('&') {
+        let part = raw_part.strip_prefix("magnet:?").unwrap_or(raw_part);
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        if key.eq_ignore_ascii_case("xl") {
+            return value.parse::<u64>().ok();
+        }
+    }
+    None
+}
+
+fn normalize_magnet_metadata_path(name: &str) -> String {
+    name.replace('\\', "/")
+        .split('/')
+        .filter(|segment| {
+            let segment = segment.trim();
+            !segment.is_empty() && segment != "." && segment != ".."
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 pub(crate) fn clamp_selected_indices_in_state(app_state: &mut AppState) {
