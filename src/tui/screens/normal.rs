@@ -6495,11 +6495,19 @@ fn draw_swarm_heatmap(
 
     let availability = swarm_availability_counts(peers, total_pieces);
     let total_pieces_usize = availability.len();
-    let (display_availability, _has_complete_peer) =
+    let (base_display_availability, _has_complete_peer) =
         swarm_heatmap_display_availability_counts(peers, total_pieces_usize);
+    let render_availability = flash.map_or_else(
+        || base_display_availability.clone(),
+        |flash| {
+            flash
+                .state
+                .display_availability(flash.info_hash, &base_display_availability, flash.now)
+        },
+    );
 
     let max_avail = availability.iter().max().copied().unwrap_or(0);
-    let display_max_avail = display_availability.iter().max().copied().unwrap_or(0);
+    let display_max_avail = render_availability.iter().max().copied().unwrap_or(0);
     let pieces_available_in_swarm = availability.iter().filter(|&&count| count > 0).count();
     let is_swarm_complete =
         total_pieces_usize > 0 && pieces_available_in_swarm == total_pieces_usize;
@@ -6587,7 +6595,7 @@ fn draw_swarm_heatmap(
                 spans.push(Span::raw(" "));
                 continue;
             }
-            let display_count = display_availability[piece_index];
+            let display_count = render_availability[piece_index];
             let (piece_char, style) = if display_count == 0 {
                 (
                     shade_light,

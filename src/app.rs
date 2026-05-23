@@ -1202,6 +1202,7 @@ pub struct SwarmAvailabilityFlashState {
     pub previous_availability: Vec<u32>,
     pub flash_start: Vec<Option<Instant>>,
     pub flash_until: Vec<Option<Instant>>,
+    pub flash_pending_availability: Vec<Option<u32>>,
     previous_peer_bitfields: HashMap<String, Vec<bool>>,
 }
 
@@ -1260,6 +1261,7 @@ impl SwarmAvailabilityFlashState {
             self.previous_availability = current_availability;
             self.flash_start = vec![None; self.previous_availability.len()];
             self.flash_until = vec![None; self.previous_availability.len()];
+            self.flash_pending_availability = vec![None; self.previous_availability.len()];
             self.previous_peer_bitfields = current_peer_bitfields;
             return;
         }
@@ -1302,6 +1304,7 @@ impl SwarmAvailabilityFlashState {
             self.previous_availability = current_availability;
             self.flash_start = vec![None; self.previous_availability.len()];
             self.flash_until = vec![None; self.previous_availability.len()];
+            self.flash_pending_availability = vec![None; self.previous_availability.len()];
             self.previous_peer_bitfields.clear();
             return;
         }
@@ -1311,6 +1314,10 @@ impl SwarmAvailabilityFlashState {
         }
         if self.flash_until.len() != current_availability.len() {
             self.flash_until.resize(current_availability.len(), None);
+        }
+        if self.flash_pending_availability.len() != current_availability.len() {
+            self.flash_pending_availability
+                .resize(current_availability.len(), None);
         }
 
         let increased_count = self
@@ -1333,8 +1340,32 @@ impl SwarmAvailabilityFlashState {
                 let delay =
                     swarm_availability_flash_rollout_delay(rank, increased_count, flash_duration);
                 let start = now + delay;
-                self.flash_start[idx] = Some(start);
-                self.flash_until[idx] = Some(start + flash_duration);
+                let deadline = start + flash_duration;
+                match self.flash_start[idx] {
+                    Some(existing_start) if existing_start <= now => {
+                        self.flash_until[idx] = Some(
+                            self.flash_until[idx].map_or(deadline, |until| until.max(deadline)),
+                        );
+                    }
+                    Some(existing_start) => {
+                        let merged_start = existing_start.min(start);
+                        self.flash_start[idx] = Some(merged_start);
+                        self.flash_until[idx] = Some(
+                            self.flash_until[idx].map_or(deadline, |until| until.max(deadline)),
+                        );
+                        if merged_start > now && self.flash_pending_availability[idx].is_none() {
+                            self.flash_pending_availability[idx] = Some(previous);
+                        }
+                        if merged_start <= now {
+                            self.flash_pending_availability[idx] = None;
+                        }
+                    }
+                    None => {
+                        self.flash_start[idx] = Some(start);
+                        self.flash_until[idx] = Some(deadline);
+                        self.flash_pending_availability[idx] = (start > now).then_some(previous);
+                    }
+                }
                 rank += 1;
             }
         }
@@ -1366,12 +1397,40 @@ impl SwarmAvailabilityFlashState {
             .any(|&deadline| deadline > now)
     }
 
+    pub fn display_availability(
+        &self,
+        info_hash: &[u8],
+        current_availability: &[u32],
+        now: Instant,
+    ) -> Vec<u32> {
+        if self.info_hash.as_slice() != info_hash {
+            return current_availability.to_vec();
+        }
+
+        current_availability
+            .iter()
+            .enumerate()
+            .map(|(idx, &current)| {
+                match (
+                    self.flash_pending_availability.get(idx).copied().flatten(),
+                    self.flash_start.get(idx).copied().flatten(),
+                ) {
+                    (Some(pending), Some(start)) if now < start => pending,
+                    _ => current,
+                }
+            })
+            .collect()
+    }
+
     fn clear_expired(&mut self, now: Instant) {
         for idx in 0..self.flash_until.len() {
             if self.flash_until[idx].is_some_and(|deadline| deadline <= now) {
                 self.flash_until[idx] = None;
                 if let Some(start) = self.flash_start.get_mut(idx) {
                     *start = None;
+                }
+                if let Some(pending) = self.flash_pending_availability.get_mut(idx) {
+                    *pending = None;
                 }
             }
         }
@@ -9068,6 +9127,41 @@ mod tests {
         let third_start = next + duration;
         assert!(!state.is_piece_flashing(b"torrent-a", 0, third_start));
         assert!(state.is_piece_flashing(b"torrent-a", 3, third_start));
+    }
+
+    #[test]
+    fn swarm_availability_flash_holds_pending_piece_until_delayed_flash_starts() {
+        let now = Instant::now();
+        let duration = Duration::from_millis(300);
+        let mut state = SwarmAvailabilityFlashState::default();
+
+        state.update(b"torrent-a", vec![0, 0, 0, 0], now, duration);
+
+        let first_update = now + Duration::from_millis(10);
+        state.update(b"torrent-a", vec![1, 1, 0, 1], first_update, duration);
+        assert_eq!(
+            state.display_availability(b"torrent-a", &[1, 1, 0, 1], first_update),
+            vec![1, 0, 0, 0]
+        );
+
+        let second_update = first_update + Duration::from_millis(50);
+        state.update(b"torrent-a", vec![1, 2, 0, 2], second_update, duration);
+        assert_eq!(
+            state.display_availability(b"torrent-a", &[1, 2, 0, 2], second_update),
+            vec![1, 2, 0, 0]
+        );
+
+        let second_start = first_update + Duration::from_millis(150);
+        assert_eq!(
+            state.display_availability(b"torrent-a", &[1, 2, 0, 2], second_start),
+            vec![1, 2, 0, 0]
+        );
+
+        let third_start = first_update + duration;
+        assert_eq!(
+            state.display_availability(b"torrent-a", &[1, 2, 0, 2], third_start),
+            vec![1, 2, 0, 2]
+        );
     }
 
     #[test]
