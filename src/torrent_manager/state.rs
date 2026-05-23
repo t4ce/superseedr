@@ -41,9 +41,6 @@ const UPLOAD_SLOTS_DEFAULT: usize = 4;
 const DEFAULT_ANNOUNCE_INTERVAL_SECS: u64 = 60;
 pub const MAX_PIPELINE_DEPTH: usize = 512;
 const KNOWN_SEEDER_TTL: Duration = Duration::from_secs(60 * 60);
-const PEER_RETENTION_LOG_INTERVAL: Duration = Duration::from_secs(60);
-const PEER_RETENTION_LOG_THRESHOLD: usize = 25;
-
 // Quality gate: once we have this many connected peers, pause admitting new peers
 // to avoid churn storms. This is intentionally independent of resource-manager limits.
 const PEER_ADMISSION_QUALITY_THRESHOLD: usize = 400;
@@ -366,7 +363,6 @@ pub struct TorrentState {
     pub pending_disconnects: Vec<String>,
     pub pending_failures: Vec<String>,
     pub accepting_new_peers: bool,
-    peer_retention_last_logged_at: Option<Instant>,
     pending_download_file_activity: Vec<FileActivityInterval>,
     pending_upload_file_activity: Vec<FileActivityInterval>,
 }
@@ -411,7 +407,6 @@ impl Default for TorrentState {
             pending_disconnects: Vec::with_capacity(100),
             pending_failures: Vec::with_capacity(100),
             accepting_new_peers: true,
-            peer_retention_last_logged_at: None,
             pending_download_file_activity: Vec::with_capacity(64),
             pending_upload_file_activity: Vec::with_capacity(64),
         }
@@ -1166,12 +1161,6 @@ impl TorrentState {
 
                 for pid in batch {
                     if let Some(removed_peer) = self.peers.remove(&pid) {
-                        let peer_age_secs = self
-                            .now
-                            .saturating_duration_since(removed_peer.created_at)
-                            .as_secs();
-                        let moved_payload = removed_peer.total_bytes_downloaded > 0
-                            || removed_peer.total_bytes_uploaded > 0;
                         for piece_index in removed_peer.pending_requests {
                             if self.piece_manager.bitfield.get(piece_index as usize)
                                 != Some(&PieceStatus::Done)
@@ -1180,18 +1169,6 @@ impl TorrentState {
                                     .release_pending_peer_or_requeue(piece_index, &pid);
                             }
                         }
-                        tracing::info!(
-                            target: "superseedr::peer_retention",
-                            torrent = %hex::encode(&self.info_hash),
-                            peer_id = %pid,
-                            peer_age_secs,
-                            moved_payload,
-                            am_interested = removed_peer.am_interested,
-                            peer_interested = removed_peer.peer_is_interested_in_us,
-                            total_downloaded = removed_peer.total_bytes_downloaded,
-                            total_uploaded = removed_peer.total_bytes_uploaded,
-                            "removing peer from torrent state"
-                        );
                         effects.push(Effect::DisconnectPeerSession {
                             peer_id: pid,
                             peer_tx: removed_peer.peer_tx,
@@ -2049,8 +2026,6 @@ impl TorrentState {
                     self.v2_pending_data.clear();
                 }
 
-                self.maybe_log_peer_retention_snapshot();
-
                 let mut stuck_peers = Vec::new();
                 for (id, peer) in &self.peers {
                     if peer.peer_id.is_empty()
@@ -2061,19 +2036,8 @@ impl TorrentState {
                     }
                 }
 
-                let stuck_peer_count = stuck_peers.len();
                 for peer_id in stuck_peers {
                     self.pending_disconnects.push(peer_id);
-                }
-
-                if stuck_peer_count > 0 {
-                    tracing::info!(
-                        target: "superseedr::peer_retention",
-                        torrent = %hex::encode(&self.info_hash),
-                        stuck_peers = stuck_peer_count,
-                        total_peers = self.peers.len(),
-                        "cleanup queued handshake-stuck peers for disconnect"
-                    );
                 }
 
                 effects.extend(self.update(Action::PeerDisconnected {
@@ -2112,22 +2076,10 @@ impl TorrentState {
                             );
                             peers_to_disconnect.push(peer_id.clone());
                         } else if mutually_uninterested {
-                            tracing::info!(
-                                target: "superseedr::peer_retention",
-                                torrent = %hex::encode(&self.info_hash),
-                                peer_id = %peer_id,
-                                "complete torrent cleanup disconnecting mutually uninterested peer"
-                            );
                             peers_to_disconnect.push(peer_id.clone());
                         }
                     }
                     for peer_id in peers_to_disconnect {
-                        tracing::info!(
-                            target: "superseedr::peer_retention",
-                            torrent = %hex::encode(&self.info_hash),
-                            peer_id = %peer_id,
-                            "complete torrent cleanup disconnecting peer with full bitfield"
-                        );
                         effects.push(Effect::DisconnectPeer { peer_id });
                     }
                 }
@@ -2731,75 +2683,6 @@ impl TorrentState {
             file_start = file_end;
         }
         piece_vec
-    }
-
-    fn maybe_log_peer_retention_snapshot(&mut self) {
-        if self.torrent_status != TorrentStatus::Done {
-            return;
-        }
-
-        let peer_count = self.peers.len();
-        if peer_count < PEER_RETENTION_LOG_THRESHOLD {
-            return;
-        }
-
-        if self.peer_retention_last_logged_at.is_some_and(|last| {
-            self.now.saturating_duration_since(last) < PEER_RETENTION_LOG_INTERVAL
-        }) {
-            return;
-        }
-
-        let mut payloadless_peers = 0usize;
-        let mut zero_speed_peers = 0usize;
-        let mut neither_interested_peers = 0usize;
-        let mut full_bitfield_peers = 0usize;
-        let mut missing_handshake_peers = 0usize;
-        let mut older_than_5m = 0usize;
-        let mut older_than_30m = 0usize;
-
-        for peer in self.peers.values() {
-            if peer.total_bytes_downloaded == 0 && peer.total_bytes_uploaded == 0 {
-                payloadless_peers += 1;
-            }
-            if peer.download_speed_bps == 0 && peer.upload_speed_bps == 0 {
-                zero_speed_peers += 1;
-            }
-            if !peer.am_interested && !peer.peer_is_interested_in_us {
-                neither_interested_peers += 1;
-            }
-            if peer.peer_id.is_empty() {
-                missing_handshake_peers += 1;
-            }
-            if !peer.bitfield.is_empty() && peer.bitfield.iter().all(|&has_piece| has_piece) {
-                full_bitfield_peers += 1;
-            }
-
-            let age = self.now.saturating_duration_since(peer.created_at);
-            if age >= Duration::from_secs(5 * 60) {
-                older_than_5m += 1;
-            }
-            if age >= Duration::from_secs(30 * 60) {
-                older_than_30m += 1;
-            }
-        }
-
-        tracing::info!(
-            target: "superseedr::peer_retention",
-            torrent = %hex::encode(&self.info_hash),
-            peers = peer_count,
-            payloadless_peers,
-            zero_speed_peers,
-            neither_interested_peers,
-            full_bitfield_peers,
-            missing_handshake_peers,
-            older_than_5m,
-            older_than_30m,
-            pending_disconnects = self.pending_disconnects.len(),
-            timed_out_backoff = self.timed_out_peers.len(),
-            "complete torrent peer retention snapshot"
-        );
-
-        self.peer_retention_last_logged_at = Some(self.now);
     }
 }
 

@@ -323,14 +323,6 @@ impl PeerSession {
 
                 _ = speed_adjustment_timer.tick() => {
                     if self.last_payload_activity.elapsed() > Duration::from_secs(120) {
-                        tracing::info!(
-                            target: "superseedr::peer_retention",
-                            peer = %self.peer_ip_port,
-                            connection_type = ?self.connection_type,
-                            peer_session_established = self.peer_session_established,
-                            current_window_size = self.current_window_size,
-                            "peer session hit payload inactivity timeout"
-                        );
                         break 'session Err("Timeout".into());
                     }
                     if !self.adjust_window_size() {
@@ -507,17 +499,7 @@ impl PeerSession {
         command: TorrentCommand,
     ) -> Result<bool, Box<dyn StdError + Send + Sync>> {
         match command {
-            TorrentCommand::Disconnect(_) => {
-                tracing::info!(
-                    target: "superseedr::peer_retention",
-                    peer = %self.peer_ip_port,
-                    connection_type = ?self.connection_type,
-                    peer_session_established = self.peer_session_established,
-                    current_window_size = self.current_window_size,
-                    "peer session received disconnect command"
-                );
-                return Ok(false);
-            }
+            TorrentCommand::Disconnect(_) => return Ok(false),
 
             TorrentCommand::PeerChoke | TorrentCommand::Choke(_) => {
                 let _ = self.writer_tx.try_send(Message::Choke);

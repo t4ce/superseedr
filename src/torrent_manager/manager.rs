@@ -828,13 +828,6 @@ impl TorrentManager {
             }
 
             Effect::DisconnectPeer { peer_id } => {
-                tracing::info!(
-                    target: "superseedr::peer_retention",
-                    torrent = %hex::encode(&self.state.info_hash),
-                    peer_id = %peer_id,
-                    peer_present = self.state.peers.contains_key(&peer_id),
-                    "manager handling disconnect effect"
-                );
                 if let Some(peer) = self.state.peers.get(&peer_id) {
                     let _ = peer
                         .peer_tx
