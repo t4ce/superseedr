@@ -166,6 +166,7 @@ const PORT_FAMILY_HIGHLIGHT_DURATION: Duration = Duration::from_millis(450);
 const UI_FPS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 const UI_RESPONSIVENESS_EMA_ALPHA: f64 = 0.35;
 const WAKE_LAG_PEER_THROTTLE_BAD_RATIO: f64 = 0.25;
+const WAKE_LAG_PEER_THROTTLE_BAD_MIN_DELAY: Duration = Duration::from_millis(20);
 const WAKE_LAG_PEER_THROTTLE_GOOD_RATIO: f64 = 0.12;
 const WAKE_LAG_PEER_THROTTLE_GOOD_TICKS: u8 = 3;
 const WAKE_LAG_PEER_THROTTLE_ADDITIVE_STEP_PEERS: usize = 256;
@@ -1445,6 +1446,7 @@ pub struct UiState {
     pub fps_sample_started_at: Option<Instant>,
     pub fps_sample_frames: u32,
     pub frame_wake_lag_ratio_ema: Option<f64>,
+    pub frame_wake_lag_secs_ema: Option<f64>,
     pub frame_draw_ratio_ema: Option<f64>,
     pub file_activity_download_phase: f64,
     pub file_activity_upload_phase: f64,
@@ -1504,6 +1506,7 @@ impl UiState {
         target_frame_interval: Duration,
     ) {
         let wake_lag = woke_at.saturating_duration_since(scheduled_at);
+        Self::update_responsiveness_ema(&mut self.frame_wake_lag_secs_ema, wake_lag.as_secs_f64());
         let target_secs = target_frame_interval.as_secs_f64();
         if target_secs > 0.0 {
             Self::update_responsiveness_ema(
@@ -1888,6 +1891,7 @@ impl WakeLagPeerThrottle {
     fn update(
         &mut self,
         wake_lag_frame_ratio: Option<f64>,
+        wake_lag_secs: Option<f64>,
         base_peer_limit: usize,
         floor_peer_limit: usize,
         connected_peers: usize,
@@ -1904,15 +1908,22 @@ impl WakeLagPeerThrottle {
             (previous_peer_limit < base_peer_limit).then_some(previous_peer_limit);
 
         let wake_lag_ratio = wake_lag_frame_ratio.filter(|ratio| ratio.is_finite());
+        let wake_lag_secs = wake_lag_secs.filter(|secs| secs.is_finite());
         wake_lag_ratio?;
 
         let mut current_peer_limit = previous_peer_limit;
         let mut action = None;
 
-        let wake_lag_bad =
-            wake_lag_ratio.is_some_and(|ratio| ratio >= WAKE_LAG_PEER_THROTTLE_BAD_RATIO);
-        let wake_lag_good =
-            wake_lag_ratio.is_none_or(|ratio| ratio < WAKE_LAG_PEER_THROTTLE_GOOD_RATIO);
+        let wake_lag_bad = wake_lag_ratio.is_some_and(|ratio| {
+            ratio >= WAKE_LAG_PEER_THROTTLE_BAD_RATIO
+                && wake_lag_secs
+                    .is_some_and(|secs| secs >= WAKE_LAG_PEER_THROTTLE_BAD_MIN_DELAY.as_secs_f64())
+        });
+        let wake_lag_good = wake_lag_ratio.is_none_or(|ratio| {
+            ratio < WAKE_LAG_PEER_THROTTLE_GOOD_RATIO
+                || wake_lag_secs
+                    .is_some_and(|secs| secs < WAKE_LAG_PEER_THROTTLE_BAD_MIN_DELAY.as_secs_f64())
+        });
 
         if wake_lag_bad {
             self.good_ticks = 0;
@@ -3809,11 +3820,13 @@ impl App {
 
     fn update_wake_lag_peer_throttle(&mut self) {
         let wake_lag_frame_ratio = self.app_state.ui.frame_wake_lag_ratio_ema;
+        let wake_lag_secs = self.app_state.ui.frame_wake_lag_secs_ema;
         let base_peer_limit = self.app_state.limits.max_connected_peers;
         let floor_peer_limit = self.wake_lag_peer_throttle_floor(base_peer_limit);
         let connected_peers = self.total_successfully_connected_peers();
         let change = self.wake_lag_peer_throttle.update(
             wake_lag_frame_ratio,
+            wake_lag_secs,
             base_peer_limit,
             floor_peer_limit,
             connected_peers,
@@ -3827,6 +3840,7 @@ impl App {
                 target: "superseedr::wake_lag_peer_throttle",
                 Level::INFO,
                 wake_lag_frame_ratio = ?wake_lag_frame_ratio,
+                wake_lag_secs = ?wake_lag_secs,
                 action = change.action,
                 previous_peer_limit = change.previous_peer_limit,
                 current_peer_limit = change.current_peer_limit,
@@ -9455,6 +9469,7 @@ mod tests {
         ui.record_draw_duration(Duration::from_millis(10), frame_interval);
 
         assert_eq!(ui.frame_wake_lag_ratio_ema, Some(0.25));
+        assert_eq!(ui.frame_wake_lag_secs_ema, Some(0.005));
         assert_eq!(ui.frame_draw_ratio_ema, Some(0.5));
     }
 
@@ -9465,6 +9480,7 @@ mod tests {
         let change = throttle
             .update(
                 Some(super::WAKE_LAG_PEER_THROTTLE_BAD_RATIO),
+                Some(super::WAKE_LAG_PEER_THROTTLE_BAD_MIN_DELAY.as_secs_f64()),
                 65,
                 super::WAKE_LAG_PEER_THROTTLE_MIN_PEERS,
                 10,
@@ -9483,6 +9499,22 @@ mod tests {
     }
 
     #[test]
+    fn wake_lag_peer_throttle_ignores_high_ratio_with_small_absolute_delay() {
+        let mut throttle = WakeLagPeerThrottle::default();
+
+        let change = throttle.update(
+            Some(super::WAKE_LAG_PEER_THROTTLE_BAD_RATIO),
+            Some(super::WAKE_LAG_PEER_THROTTLE_BAD_MIN_DELAY.as_secs_f64() / 2.0),
+            65,
+            super::WAKE_LAG_PEER_THROTTLE_MIN_PEERS,
+            10,
+        );
+
+        assert_eq!(change, None);
+        assert_eq!(throttle.effective_peer_limit(65, 8), 65);
+    }
+
+    #[test]
     fn wake_lag_peer_throttle_uses_download_floor_when_provided() {
         let mut throttle = WakeLagPeerThrottle::default();
         let base_peer_limit: usize = 100;
@@ -9493,6 +9525,7 @@ mod tests {
         let change = throttle
             .update(
                 Some(super::WAKE_LAG_PEER_THROTTLE_BAD_RATIO),
+                Some(super::WAKE_LAG_PEER_THROTTLE_BAD_MIN_DELAY.as_secs_f64()),
                 base_peer_limit,
                 download_floor,
                 10,
