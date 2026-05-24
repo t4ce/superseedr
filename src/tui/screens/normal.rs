@@ -1018,6 +1018,30 @@ fn swarm_heatmap_flash<'a>(app_state: &'a AppState, info_hash: &'a [u8]) -> Swar
     }
 }
 
+fn swarm_heatmap_flashing_peer_addresses(
+    flash: Option<SwarmHeatmapFlash<'_>>,
+    peers: &[PeerInfo],
+    total_pieces: usize,
+) -> HashSet<String> {
+    let Some(flash) = flash else {
+        return HashSet::new();
+    };
+
+    let mut addresses = HashSet::new();
+    for piece_index in 0..total_pieces {
+        if !flash
+            .state
+            .is_piece_flashing(flash.info_hash, piece_index, flash.now)
+        {
+            continue;
+        }
+        if let Some(peer) = swarm_heatmap_flash_peer(peers, total_pieces, piece_index) {
+            addresses.insert(peer.address.clone());
+        }
+    }
+    addresses
+}
+
 #[derive(Debug, Clone, Copy)]
 struct DhtWaveProfile {
     amplitude: f64,
@@ -4786,11 +4810,17 @@ fn draw_peers_table_impl(
     {
         if let Some(torrent) = app_state.torrents.get(info_hash) {
             let state = &torrent.latest_state;
+            let heatmap_flash = swarm_heatmap_flash(app_state, info_hash);
 
             if peers_chunk.height > 0 {
                 let (sort_by, sort_direction) = app_state.peer_sort;
                 let peer_rows_to_display =
                     displayed_peers_for_table(state, sort_by, sort_direction);
+                let flashing_peer_addresses = swarm_heatmap_flashing_peer_addresses(
+                    Some(heatmap_flash),
+                    &state.peers,
+                    state.number_of_pieces_total as usize,
+                );
 
                 let all_peer_cols = get_peer_columns();
                 let (constraints, visible_indices) =
@@ -4813,7 +4843,7 @@ fn draw_peers_table_impl(
                         &state.peers,
                         state.number_of_pieces_total,
                         peers_chunk,
-                        Some(swarm_heatmap_flash(app_state, info_hash)),
+                        Some(heatmap_flash),
                     );
                 } else {
                     let header_cells: Vec<Cell> = visible_indices
@@ -4859,6 +4889,13 @@ fn draw_peers_table_impl(
                                         ctx.theme.semantic.surface1
                                     } else {
                                         ip_to_color(ctx, &peer.address)
+                                    };
+                                    let row_style = if flashing_peer_addresses
+                                        .contains(&peer.address)
+                                    {
+                                        Style::default().fg(row_color).add_modifier(Modifier::BOLD)
+                                    } else {
+                                        Style::default().fg(row_color)
                                     };
 
                                     let cells: Vec<Cell> = visible_indices
@@ -4971,7 +5008,7 @@ fn draw_peers_table_impl(
                                             }
                                         })
                                         .collect();
-                                    (cells, Style::default().fg(row_color))
+                                    (cells, row_style)
                                 }
                                 PeerTableRow::InactiveSummary { count } => (
                                     inactive_peer_summary_cells(
@@ -5016,7 +5053,7 @@ fn draw_peers_table_impl(
                             &state.peers,
                             state.number_of_pieces_total,
                             layout_chunks[1],
-                            Some(swarm_heatmap_flash(app_state, info_hash)),
+                            Some(heatmap_flash),
                         );
                     } else {
                         let inner_peers_area = peers_block.inner(peers_chunk);
@@ -7359,6 +7396,46 @@ mod tests {
         let color = swarm_heatmap_flash_color(&ctx, &peers, 2, 0);
 
         assert_eq!(color, ip_to_color(&ctx, "127.0.0.1:7001"));
+    }
+
+    #[test]
+    fn swarm_heatmap_flashing_peer_addresses_tracks_active_piece_source() {
+        let mut state = SwarmAvailabilityFlashState::default();
+        let now = Instant::now();
+        let duration = Duration::from_millis(200);
+        let baseline_peers = vec![
+            PeerInfo {
+                address: "127.0.0.1:7001".to_string(),
+                bitfield: vec![true, false, false],
+                download_speed_bps: 1,
+                ..Default::default()
+            },
+            PeerInfo {
+                address: "127.0.0.1:7002".to_string(),
+                bitfield: vec![false, false, false],
+                download_speed_bps: 1,
+                ..Default::default()
+            },
+        ];
+        let current_peers = vec![
+            baseline_peers[0].clone(),
+            PeerInfo {
+                bitfield: vec![false, true, false],
+                ..baseline_peers[1].clone()
+            },
+        ];
+        state.update_from_peers(b"torrent-a", &baseline_peers, 3, now, duration);
+        state.update_from_peers(b"torrent-a", &current_peers, 3, now, duration);
+
+        let flash = SwarmHeatmapFlash {
+            info_hash: b"torrent-a",
+            state: &state,
+            now,
+        };
+        let addresses = swarm_heatmap_flashing_peer_addresses(Some(flash), &current_peers, 3);
+
+        assert!(addresses.contains("127.0.0.1:7002"));
+        assert!(!addresses.contains("127.0.0.1:7001"));
     }
 
     #[test]
