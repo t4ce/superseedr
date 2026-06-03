@@ -22,6 +22,12 @@ $InstallerScript = Join-Path $RepoRoot "packaging\windows\superseedr-user.iss"
 $OutputDir = Join-Path $RepoRoot "target\installer\windows"
 $BinaryPath = Join-Path $RepoRoot "target\release\superseedr.exe"
 $IconPath = Join-Path $RepoRoot "assets\app_icon.ico"
+$IsPrivateBuild = $Flavor -eq "private"
+$AppDisplayName = if ($IsPrivateBuild) { "superseedr private" } else { "superseedr" }
+$InstallFolderName = if ($IsPrivateBuild) { "superseedr-private" } else { "superseedr" }
+$InstalledExeName = if ($IsPrivateBuild) { "superseedr-private.exe" } else { "superseedr.exe" }
+$ShortcutName = if ($IsPrivateBuild) { "superseedr private" } else { "superseedr" }
+$RegisterAssociations = -not $IsPrivateBuild
 
 function Get-ManifestVersion {
     $cargoToml = Get-Content (Join-Path $RepoRoot "Cargo.toml")
@@ -88,12 +94,13 @@ function Write-LocalInstallScript {
         [Parameter(Mandatory = $true)][string]$Path
     )
 
-    @'
+    $script = @'
 $ErrorActionPreference = "Stop"
 
-$InstallDir = Join-Path $env:LOCALAPPDATA "Programs\superseedr"
-$ExePath = Join-Path $InstallDir "superseedr.exe"
+$InstallDir = Join-Path $env:LOCALAPPDATA "Programs\__INSTALL_FOLDER_NAME__"
+$ExePath = Join-Path $InstallDir "__INSTALLED_EXE_NAME__"
 $IconPath = Join-Path $InstallDir "app_icon.ico"
+$RegisterAssociations = __REGISTER_ASSOCIATIONS__
 
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 Copy-Item -Force -Path (Join-Path $PSScriptRoot "superseedr.exe") -Destination $ExePath
@@ -160,26 +167,28 @@ function Add-UserPath {
 }
 
 $OpenCommand = "`"$ExePath`" `"%1`""
-Set-RegistryDefault "Software\Classes\magnet" "URL:Magnet Protocol"
-Set-RegistryValue "Software\Classes\magnet" "URL Protocol" ""
-Set-RegistryDefault "Software\Classes\magnet\DefaultIcon" "`"$IconPath`",0"
-Set-RegistryDefault "Software\Classes\magnet\shell\open\command" $OpenCommand
+if ($RegisterAssociations) {
+    Set-RegistryDefault "Software\Classes\magnet" "URL:Magnet Protocol"
+    Set-RegistryValue "Software\Classes\magnet" "URL Protocol" ""
+    Set-RegistryDefault "Software\Classes\magnet\DefaultIcon" "`"$IconPath`",0"
+    Set-RegistryDefault "Software\Classes\magnet\shell\open\command" $OpenCommand
 
-Set-RegistryDefault "Software\Classes\.torrent" "superseedr.torrent"
-Set-RegistryValue "Software\Classes\.torrent" "Content Type" "application/x-bittorrent"
-Set-RegistryDefault "Software\Classes\superseedr.torrent" "Torrent File (superseedr)"
-Set-RegistryDefault "Software\Classes\superseedr.torrent\DefaultIcon" "`"$IconPath`",0"
-Set-RegistryDefault "Software\Classes\superseedr.torrent\shell\open\command" $OpenCommand
+    Set-RegistryDefault "Software\Classes\.torrent" "superseedr.torrent"
+    Set-RegistryValue "Software\Classes\.torrent" "Content Type" "application/x-bittorrent"
+    Set-RegistryDefault "Software\Classes\superseedr.torrent" "Torrent File (superseedr)"
+    Set-RegistryDefault "Software\Classes\superseedr.torrent\DefaultIcon" "`"$IconPath`",0"
+    Set-RegistryDefault "Software\Classes\superseedr.torrent\shell\open\command" $OpenCommand
 
-Set-RegistryValue "Software\Classes\Applications\superseedr.exe" "FriendlyAppName" "superseedr"
-Set-RegistryDefault "Software\Classes\Applications\superseedr.exe\SupportedTypes" ""
-Set-RegistryValue "Software\Classes\Applications\superseedr.exe\SupportedTypes" ".torrent" ""
-Set-RegistryDefault "Software\Classes\Applications\superseedr.exe\shell\open\command" $OpenCommand
+    Set-RegistryValue "Software\Classes\Applications\__INSTALLED_EXE_NAME__" "FriendlyAppName" "__APP_DISPLAY_NAME__"
+    Set-RegistryDefault "Software\Classes\Applications\__INSTALLED_EXE_NAME__\SupportedTypes" ""
+    Set-RegistryValue "Software\Classes\Applications\__INSTALLED_EXE_NAME__\SupportedTypes" ".torrent" ""
+    Set-RegistryDefault "Software\Classes\Applications\__INSTALLED_EXE_NAME__\shell\open\command" $OpenCommand
+}
 
 $ProgramsDir = [Environment]::GetFolderPath("Programs")
-$ShortcutDir = Join-Path $ProgramsDir "superseedr"
+$ShortcutDir = Join-Path $ProgramsDir "__SHORTCUT_NAME__"
 New-Item -ItemType Directory -Force -Path $ShortcutDir | Out-Null
-$ShortcutPath = Join-Path $ShortcutDir "superseedr.lnk"
+$ShortcutPath = Join-Path $ShortcutDir "__SHORTCUT_NAME__.lnk"
 $Shell = New-Object -ComObject WScript.Shell
 $Shortcut = $Shell.CreateShortcut($ShortcutPath)
 $Shortcut.TargetPath = $ExePath
@@ -207,7 +216,15 @@ if ($PathChanged) {
 [SuperseedrShellNotify]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)
 
 Start-Process -FilePath $ExePath -WorkingDirectory $InstallDir
-'@ | Set-Content -Path $Path -Encoding UTF8
+'@
+
+    $registerAssociationsLiteral = if ($RegisterAssociations) { '$true' } else { '$false' }
+    $script = $script.Replace("__INSTALL_FOLDER_NAME__", $InstallFolderName)
+    $script = $script.Replace("__INSTALLED_EXE_NAME__", $InstalledExeName)
+    $script = $script.Replace("__REGISTER_ASSOCIATIONS__", $registerAssociationsLiteral)
+    $script = $script.Replace("__APP_DISPLAY_NAME__", $AppDisplayName)
+    $script = $script.Replace("__SHORTCUT_NAME__", $ShortcutName)
+    $script | Set-Content -Path $Path -Encoding UTF8
 }
 
 function Build-WithIExpress {
@@ -344,40 +361,43 @@ static class Program
         try
         {
             string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-            string installDir = Path.Combine(localAppData, "Programs", "superseedr");
-            string exePath = Path.Combine(installDir, "superseedr.exe");
+            string installDir = Path.Combine(localAppData, "Programs", "__INSTALL_FOLDER_NAME__");
+            string exePath = Path.Combine(installDir, "__INSTALLED_EXE_NAME__");
             string iconPath = Path.Combine(installDir, "app_icon.ico");
 
             Directory.CreateDirectory(installDir);
             ExtractResource("superseedr.exe", exePath);
             ExtractResource("app_icon.ico", iconPath);
 
-            string openCommand = $"\"{exePath}\" \"%1\"";
-            SetDefault(@"Software\Classes\magnet", "URL:Magnet Protocol");
-            SetValue(@"Software\Classes\magnet", "URL Protocol", "");
-            SetDefault(@"Software\Classes\magnet\DefaultIcon", $"\"{iconPath}\",0");
-            SetDefault(@"Software\Classes\magnet\shell\open\command", openCommand);
+            if (__REGISTER_ASSOCIATIONS__)
+            {
+                string openCommand = $"\"{exePath}\" \"%1\"";
+                SetDefault(@"Software\Classes\magnet", "URL:Magnet Protocol");
+                SetValue(@"Software\Classes\magnet", "URL Protocol", "");
+                SetDefault(@"Software\Classes\magnet\DefaultIcon", $"\"{iconPath}\",0");
+                SetDefault(@"Software\Classes\magnet\shell\open\command", openCommand);
 
-            SetDefault(@"Software\Classes\.torrent", "superseedr.torrent");
-            SetValue(@"Software\Classes\.torrent", "Content Type", "application/x-bittorrent");
-            SetDefault(@"Software\Classes\superseedr.torrent", "Torrent File (superseedr)");
-            SetDefault(@"Software\Classes\superseedr.torrent\DefaultIcon", $"\"{iconPath}\",0");
-            SetDefault(@"Software\Classes\superseedr.torrent\shell\open\command", openCommand);
+                SetDefault(@"Software\Classes\.torrent", "superseedr.torrent");
+                SetValue(@"Software\Classes\.torrent", "Content Type", "application/x-bittorrent");
+                SetDefault(@"Software\Classes\superseedr.torrent", "Torrent File (superseedr)");
+                SetDefault(@"Software\Classes\superseedr.torrent\DefaultIcon", $"\"{iconPath}\",0");
+                SetDefault(@"Software\Classes\superseedr.torrent\shell\open\command", openCommand);
 
-            SetValue(@"Software\Classes\Applications\superseedr.exe", "FriendlyAppName", "superseedr");
-            SetValue(@"Software\Classes\Applications\superseedr.exe\SupportedTypes", ".torrent", "");
-            SetDefault(@"Software\Classes\Applications\superseedr.exe\shell\open\command", openCommand);
+                SetValue(@"Software\Classes\Applications\__INSTALLED_EXE_NAME__", "FriendlyAppName", "__APP_DISPLAY_NAME__");
+                SetValue(@"Software\Classes\Applications\__INSTALLED_EXE_NAME__\SupportedTypes", ".torrent", "");
+                SetDefault(@"Software\Classes\Applications\__INSTALLED_EXE_NAME__\shell\open\command", openCommand);
+            }
 
-            CreateStartMenuShortcut(exePath, iconPath, installDir);
+            CreateStartMenuShortcut(exePath, iconPath, installDir, "__SHORTCUT_NAME__");
             if (AddToUserPath(installDir))
             {
                 BroadcastEnvironmentChange();
-                Console.WriteLine("Added superseedr to the user PATH. Restart open terminals before running superseedr by name.");
+                Console.WriteLine("Added __APP_DISPLAY_NAME__ to the user PATH. Restart open terminals before running it by name.");
             }
             SHChangeNotify(0x08000000, 0, IntPtr.Zero, IntPtr.Zero);
 
             Process.Start(new ProcessStartInfo(exePath) { WorkingDirectory = installDir, UseShellExecute = true });
-            Console.WriteLine($"Installed superseedr to {installDir}");
+            Console.WriteLine($"Installed __APP_DISPLAY_NAME__ to {installDir}");
             return 0;
         }
         catch (Exception ex)
@@ -485,10 +505,10 @@ static class Program
         SendMessageTimeout(new IntPtr(HWND_BROADCAST), WM_SETTINGCHANGE, UIntPtr.Zero, "Environment", SMTO_ABORTIFHUNG, 5000, out result);
     }
 
-    private static void CreateStartMenuShortcut(string exePath, string iconPath, string installDir)
+    private static void CreateStartMenuShortcut(string exePath, string iconPath, string installDir, string shortcutName)
     {
         string programs = Environment.GetFolderPath(Environment.SpecialFolder.Programs);
-        string shortcutDir = Path.Combine(programs, "superseedr");
+        string shortcutDir = Path.Combine(programs, shortcutName);
         Directory.CreateDirectory(shortcutDir);
 
         Type shellType = Type.GetTypeFromProgID("WScript.Shell");
@@ -503,7 +523,7 @@ static class Program
             BindingFlags.InvokeMethod,
             null,
             shell,
-            new object[] { Path.Combine(shortcutDir, "superseedr.lnk") });
+            new object[] { Path.Combine(shortcutDir, shortcutName + ".lnk") });
         Type shortcutType = shortcut.GetType();
         shortcutType.InvokeMember("TargetPath", BindingFlags.SetProperty, null, shortcut, new object[] { exePath });
         shortcutType.InvokeMember("WorkingDirectory", BindingFlags.SetProperty, null, shortcut, new object[] { installDir });
@@ -512,6 +532,12 @@ static class Program
     }
 }
 '@
+
+    $program = $program.Replace("__INSTALL_FOLDER_NAME__", $InstallFolderName)
+    $program = $program.Replace("__INSTALLED_EXE_NAME__", $InstalledExeName)
+    $program = $program.Replace("__REGISTER_ASSOCIATIONS__", $RegisterAssociations.ToString().ToLowerInvariant())
+    $program = $program.Replace("__APP_DISPLAY_NAME__", $AppDisplayName)
+    $program = $program.Replace("__SHORTCUT_NAME__", $ShortcutName)
 
     $programPath = Join-Path $stageDir "Program.cs"
     Set-Content -Path $programPath -Value $program -Encoding UTF8
