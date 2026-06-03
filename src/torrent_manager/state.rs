@@ -8172,7 +8172,7 @@ mod tests {
         assert!(state.peers.is_empty());
         assert!(effects
             .iter()
-            .any(|e| matches!(e, Effect::DisconnectPeer { .. })));
+            .any(|e| matches!(e, Effect::DisconnectPeerSession { .. })));
         assert!(effects.iter().any(|e| matches!(
             e,
             Effect::EmitManagerEvent(ManagerEvent::PeerDisconnected { .. })

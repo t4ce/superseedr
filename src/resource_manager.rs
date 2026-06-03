@@ -604,6 +604,17 @@ mod tests {
         ));
 
         drop(guard);
+        for _ in 0..10 {
+            let snapshot = client.snapshot().await.expect("snapshot failed");
+            let peer_usage = snapshot
+                .resources
+                .get(&ResourceType::PeerConnection)
+                .expect("missing peer resource snapshot");
+            if peer_usage.in_use == 0 {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
         let guard = timeout(Duration::from_millis(100), client.acquire_peer_connection())
             .await
             .expect("acquire timed out after release")

@@ -12725,6 +12725,12 @@ mod tests {
             .await
             .expect("build app");
         let info_hash = info_hash_from_torrent_source(&magnet).expect("info hash");
+        let display_state = app
+            .display_state_from_torrent_settings(&app.client_configs.torrents[0])
+            .expect("display state");
+        app.app_state
+            .torrents
+            .insert(info_hash.clone(), display_state);
         let runtime = app
             .app_state
             .torrents
@@ -12796,6 +12802,12 @@ mod tests {
             .await
             .expect("build app");
         let info_hash = info_hash_from_torrent_source(&magnet).expect("info hash");
+        let display_state = app
+            .display_state_from_torrent_settings(&app.client_configs.torrents[0])
+            .expect("display state");
+        app.app_state
+            .torrents
+            .insert(info_hash.clone(), display_state);
         let runtime = app
             .app_state
             .torrents

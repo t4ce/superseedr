@@ -4600,13 +4600,16 @@ mod resource_tests {
         manager.state.accepting_new_peers = true;
 
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let peer_id = addr.to_string();
 
         manager.handle_effect(Effect::ConnectToPeer { addr });
 
         assert!(
-            manager.state.peers.contains_key(&peer_id),
-            "peer admission guard should allow new outgoing peers when open"
+            manager.state.accepting_new_peers,
+            "peer admission guard should remain open for outgoing peers"
+        );
+        assert!(
+            manager.state.peers.is_empty(),
+            "outgoing peers are registered only after transport connection succeeds"
         );
     }
 
