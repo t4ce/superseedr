@@ -604,21 +604,21 @@ mod tests {
         ));
 
         drop(guard);
+        let mut reacquired_guard = None;
         for _ in 0..10 {
-            let snapshot = client.snapshot().await.expect("snapshot failed");
-            let peer_usage = snapshot
-                .resources
-                .get(&ResourceType::PeerConnection)
-                .expect("missing peer resource snapshot");
-            if peer_usage.in_use == 0 {
-                break;
+            match timeout(Duration::from_millis(100), client.acquire_peer_connection()).await {
+                Ok(Ok(guard)) => {
+                    reacquired_guard = Some(guard);
+                    break;
+                }
+                Ok(Err(ResourceManagerError::QueueFull)) => {
+                    sleep(Duration::from_millis(10)).await;
+                }
+                Ok(Err(error)) => panic!("acquire failed after release: {error:?}"),
+                Err(_) => panic!("acquire timed out after release"),
             }
-            sleep(Duration::from_millis(10)).await;
         }
-        let guard = timeout(Duration::from_millis(100), client.acquire_peer_connection())
-            .await
-            .expect("acquire timed out after release")
-            .expect("acquire failed after release");
+        let guard = reacquired_guard.expect("acquire failed after release");
 
         let mut normal_limits = HashMap::new();
         normal_limits.insert(ResourceType::PeerConnection, (1, 2));
