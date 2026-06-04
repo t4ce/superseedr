@@ -6,8 +6,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub fn rate_limit_bps_to_bucket_bytes_per_sec(limit_bps: u64) -> f64 {
-    if limit_bps == 0 {
-        0.0
+    if limit_bps == 0 || limit_bps >= i64::MAX as u64 {
+        f64::INFINITY
     } else {
         limit_bps as f64 / 8.0
     }
@@ -34,7 +34,7 @@ impl TokenBucket {
         let sane_fill_rate = fill_rate.max(0.0);
         let sane_capacity = capacity.max(0.0);
 
-        let infinite = sane_fill_rate == 0.0 || !sane_fill_rate.is_finite();
+        let infinite = !sane_fill_rate.is_finite();
 
         let (initial_tokens, initial_capacity) = if infinite {
             (f64::INFINITY, f64::INFINITY)
@@ -57,7 +57,7 @@ impl TokenBucket {
 
     pub fn set_rate(&self, new_fill_rate: f64) {
         let rate = new_fill_rate.max(0.0);
-        let infinite = !rate.is_finite() || rate == 0.0;
+        let infinite = !rate.is_finite();
 
         self.is_infinite.store(infinite, Ordering::Relaxed);
 
@@ -80,7 +80,7 @@ impl TokenBucket {
 
     pub fn set_rate_with_capacity_preserving_tokens(&self, new_fill_rate: f64, new_capacity: f64) {
         let rate = new_fill_rate.max(0.0);
-        let infinite = !rate.is_finite() || rate == 0.0;
+        let infinite = !rate.is_finite();
 
         self.is_infinite.store(infinite, Ordering::Relaxed);
 
@@ -152,7 +152,7 @@ pub async fn consume_tokens(bucket: &TokenBucket, amount_tokens: f64) {
         return;
     }
 
-    if amount_tokens < 0.0 || !amount_tokens.is_finite() {
+    if amount_tokens <= 0.0 || !amount_tokens.is_finite() {
         return;
     }
 
@@ -164,37 +164,40 @@ pub async fn consume_tokens(bucket: &TokenBucket, amount_tokens: f64) {
         (guard.fill_rate, guard.capacity)
     };
 
-    if current_fill_rate > 0.0 && current_fill_rate.is_finite() {
-        if amount_tokens > current_capacity {
-            let required_duration = Duration::from_secs_f64(amount_tokens / current_fill_rate);
-            if required_duration < Duration::from_secs(60 * 5) {
-                tokio::time::sleep(required_duration).await;
-            } else {
-                tracing::warn!(
-                    ?required_duration,
-                    "Calculated sleep time for large token-bucket request exceeds limit"
-                );
+    if current_fill_rate <= 0.0 || !current_fill_rate.is_finite() {
+        std::future::pending::<()>().await;
+        return;
+    }
+
+    if amount_tokens > current_capacity {
+        let required_duration = Duration::from_secs_f64(amount_tokens / current_fill_rate);
+        if required_duration < Duration::from_secs(60 * 5) {
+            tokio::time::sleep(required_duration).await;
+        } else {
+            tracing::warn!(
+                ?required_duration,
+                "Calculated sleep time for large token-bucket request exceeds limit"
+            );
+        }
+        return;
+    }
+
+    loop {
+        let wait_time = {
+            let mut guard = bucket.inner.lock().unwrap();
+            guard.refill();
+
+            if guard.tokens >= amount_tokens {
+                guard.tokens -= amount_tokens;
+                break;
             }
-            return;
-        }
 
-        loop {
-            let wait_time = {
-                let mut guard = bucket.inner.lock().unwrap();
-                guard.refill();
+            let tokens_needed = amount_tokens - guard.tokens;
+            let wait_duration_secs = tokens_needed / current_fill_rate;
+            Duration::from_secs_f64(wait_duration_secs.max(0.001))
+        };
 
-                if guard.tokens >= amount_tokens {
-                    guard.tokens -= amount_tokens;
-                    break;
-                }
-
-                let tokens_needed = amount_tokens - guard.tokens;
-                let wait_duration_secs = tokens_needed / current_fill_rate;
-                Duration::from_secs_f64(wait_duration_secs.max(0.001))
-            };
-
-            tokio::time::sleep(wait_time).await;
-        }
+        tokio::time::sleep(wait_time).await;
     }
 }
 
@@ -218,8 +221,22 @@ mod tests {
     #[test]
     fn test_token_bucket_new_zero_rate() {
         let bucket = TokenBucket::new(100.0, 0.0);
-        assert!(bucket.get_capacity().is_infinite());
+        assert!((bucket.get_capacity() - 100.0).abs() < TOLERANCE);
         assert!(bucket.get_fill_rate() == 0.0);
+        assert!((bucket.get_tokens() - 100.0).abs() < TOLERANCE);
+        assert!(!bucket.is_infinite.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn rate_limit_zero_bps_maps_to_unlimited_bucket_rate() {
+        assert!(rate_limit_bps_to_bucket_bytes_per_sec(0).is_infinite());
+    }
+
+    #[test]
+    fn test_token_bucket_new_infinite_rate() {
+        let bucket = TokenBucket::new(f64::INFINITY, f64::INFINITY);
+        assert!(bucket.get_capacity().is_infinite());
+        assert!(bucket.get_fill_rate().is_infinite());
         assert!(bucket.get_tokens().is_infinite());
         assert!(bucket.is_infinite.load(Ordering::Relaxed));
     }
@@ -275,9 +292,9 @@ mod tests {
         bucket.set_tokens(50.0);
         bucket.set_rate(0.0);
         assert!(bucket.get_fill_rate() == 0.0);
-        assert!(bucket.get_capacity().is_infinite());
-        assert!(bucket.get_tokens().is_infinite());
-        assert!(bucket.is_infinite.load(Ordering::Relaxed));
+        assert!(bucket.get_capacity() == 0.0);
+        assert!(bucket.get_tokens() == 0.0);
+        assert!(!bucket.is_infinite.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -303,13 +320,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_consume_tokens_unlimited_zero_rate_direct() {
-        // Note: No Mutex wrapper needed for the Arc now
-        let bucket = Arc::new(TokenBucket::new(100.0, 0.0));
+    async fn test_consume_tokens_unlimited_infinite_rate_direct() {
+        let bucket = Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY));
         let start = Instant::now();
         consume_tokens(&bucket, 1_000_000.0).await;
         let elapsed = start.elapsed();
         assert!(elapsed < Duration::from_millis(50)); // Should be near-instant
+    }
+
+    #[tokio::test]
+    async fn test_consume_tokens_zero_rate_blocks_direct() {
+        let bucket = Arc::new(TokenBucket::new(0.0, 0.0));
+        let result =
+            tokio::time::timeout(Duration::from_millis(25), consume_tokens(&bucket, 1.0)).await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]

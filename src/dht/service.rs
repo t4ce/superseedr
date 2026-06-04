@@ -29,6 +29,7 @@ mod commands;
 mod config;
 mod driver;
 mod effects;
+pub(crate) mod fuzzing;
 mod lifecycle;
 mod monitor;
 mod planner;

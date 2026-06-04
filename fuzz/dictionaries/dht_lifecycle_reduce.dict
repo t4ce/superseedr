@@ -1,0 +1,12 @@
+# DHT lifecycle action/effect reducer tokens
+"startup"
+"bootstrap"
+"maintenance"
+"health"
+"shutdown"
+"warning"
+"retry"
+"status"
+"runtime"
+"failed"
+"succeeded"

@@ -9,12 +9,23 @@ use crate::torrent_file::Torrent;
 
 use crate::tracker::TrackerResponse;
 
+use crate::networking::transport::PeerTransportKind;
 use crate::networking::BlockInfo;
+use tokio::sync::mpsc::Sender;
 
-#[derive(Debug, PartialEq, Clone)]
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
 pub enum TorrentCommand {
+    RegisterPeer {
+        peer_id: String,
+        tx: Sender<TorrentCommand>,
+    },
     SuccessfullyConnected(String),
     PeerId(String, Vec<u8>),
+    PeerTransportSelected {
+        peer_id: String,
+        transport: PeerTransportKind,
+    },
 
     Choke(String),
     Unchoke(String),

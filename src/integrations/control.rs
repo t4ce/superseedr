@@ -64,12 +64,16 @@ pub enum ControlRequest {
         download_path: Option<PathBuf>,
         container_name: Option<String>,
         #[serde(default)]
+        validation_status: bool,
+        #[serde(default)]
         file_priorities: Vec<ControlFilePriorityOverride>,
     },
     AddMagnet {
         magnet_link: String,
         download_path: Option<PathBuf>,
         container_name: Option<String>,
+        #[serde(default)]
+        validation_status: bool,
         #[serde(default)]
         file_priorities: Vec<ControlFilePriorityOverride>,
     },

@@ -1,0 +1,24 @@
+{
+  "name": "superseedr_to_libtorrent_v1_multi_file",
+  "description": "Superseedr seeds a deterministic v1 multi-file fixture and libtorrent downloads it over TCP.",
+  "seed_client": "superseedr",
+  "leech_client": "libtorrent",
+  "mode": "v1",
+  "torrent": "multi_file.torrent",
+  "payload": "multi_file",
+  "download_name": "multi_file",
+  "timeout_secs": 180,
+  "seed_listen_port": 26881,
+  "leech_listen_port": 26882,
+  "superseedr_peer_transport": "tcp",
+  "libtorrent_settings": {
+    "enable_dht": false,
+    "enable_lsd": false,
+    "enable_natpmp": false,
+    "enable_upnp": false,
+    "enable_incoming_tcp": true,
+    "enable_outgoing_tcp": true,
+    "enable_incoming_utp": false,
+    "enable_outgoing_utp": false
+  }
+}

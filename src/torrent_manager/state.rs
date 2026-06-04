@@ -5,6 +5,7 @@ use tracing::event;
 use tracing::Level;
 
 use crate::command::TorrentCommand;
+use crate::networking::transport::PeerTransportKind;
 use crate::networking::BlockInfo;
 use crate::storage::MultiFileInfo;
 use crate::torrent_manager::FileActivityDirection;
@@ -40,7 +41,6 @@ const UPLOAD_SLOTS_DEFAULT: usize = 4;
 const DEFAULT_ANNOUNCE_INTERVAL_SECS: u64 = 60;
 pub const MAX_PIPELINE_DEPTH: usize = 512;
 const KNOWN_SEEDER_TTL: Duration = Duration::from_secs(60 * 60);
-
 // Quality gate: once we have this many connected peers, pause admitting new peers
 // to avoid churn storms. This is intentionally independent of resource-manager limits.
 const PEER_ADMISSION_QUALITY_THRESHOLD: usize = 400;
@@ -67,6 +67,10 @@ pub enum Action {
     RegisterPeer {
         peer_id: String,
         tx: Sender<TorrentCommand>,
+    },
+    PeerTransportSelected {
+        peer_id: String,
+        transport: PeerTransportKind,
     },
     PeerSuccessfullyConnected {
         peer_id: String,
@@ -1114,6 +1118,13 @@ impl TorrentState {
                 vec![Effect::DoNothing]
             }
 
+            Action::PeerTransportSelected { peer_id, transport } => {
+                if let Some(peer) = self.peers.get_mut(&peer_id) {
+                    peer.transport_kind = transport;
+                }
+                vec![Effect::DoNothing]
+            }
+
             // --- Peer Lifecycle Actions ---
             Action::PeerSuccessfullyConnected { peer_id } => {
                 self.timed_out_peers.remove(&peer_id);
@@ -1158,7 +1169,10 @@ impl TorrentState {
                                     .release_pending_peer_or_requeue(piece_index, &pid);
                             }
                         }
-                        effects.push(Effect::DisconnectPeer { peer_id: pid });
+                        effects.push(Effect::DisconnectPeerSession {
+                            peer_id: pid,
+                            peer_tx: removed_peer.peer_tx,
+                        });
                         effects.push(Effect::EmitManagerEvent(ManagerEvent::PeerDisconnected {
                             info_hash: self.info_hash.clone(),
                         }));
@@ -2046,9 +2060,11 @@ impl TorrentState {
                 if am_seeding {
                     let mut peers_to_disconnect = Vec::new();
                     for (peer_id, peer) in &self.peers {
-                        if !peer.bitfield.is_empty()
-                            && peer.bitfield.iter().all(|&has_piece| has_piece)
-                        {
+                        let mutually_uninterested =
+                            !peer.am_interested && !peer.peer_is_interested_in_us;
+                        let peer_has_full_bitfield = !peer.bitfield.is_empty()
+                            && peer.bitfield.iter().all(|&has_piece| has_piece);
+                        if peer_has_full_bitfield {
                             self.known_seeders
                                 .insert(peer_id.clone(), self.now + KNOWN_SEEDER_TTL);
                             tracing::debug!(
@@ -2058,6 +2074,8 @@ impl TorrentState {
                                 known_seeders = self.known_seeders.len(),
                                 "observed full-bitfield seeder while already seeding"
                             );
+                            peers_to_disconnect.push(peer_id.clone());
+                        } else if mutually_uninterested {
                             peers_to_disconnect.push(peer_id.clone());
                         }
                     }
@@ -2728,6 +2746,7 @@ pub fn calculate_deletion_lists(
 #[derive(Debug, Clone)]
 pub struct PeerState {
     pub ip_port: String,
+    pub transport_kind: PeerTransportKind,
     pub peer_id: Vec<u8>,
     pub bitfield: Vec<bool>,
     pub am_choking: ChokeStatus,
@@ -2758,6 +2777,7 @@ impl PeerState {
     pub fn new(ip_port: String, peer_tx: Sender<TorrentCommand>, created_at: Instant) -> Self {
         Self {
             ip_port,
+            transport_kind: PeerTransportKind::Tcp,
             peer_id: Vec::new(),
             bitfield: Vec::new(),
             am_choking: ChokeStatus::Choke,
@@ -3329,13 +3349,14 @@ mod tests {
             force: true,
         });
 
-        // THEN: Peer removed, count decremented, Disconnect effect emitted
+        // THEN: Peer removed, count decremented, DisconnectPeerSession effect emitted
         assert!(!state.peers.contains_key("peer_X"));
         assert_eq!(state.number_of_successfully_connected_peers, 0);
 
-        assert!(effects
-            .iter()
-            .any(|e| matches!(e, Effect::DisconnectPeer { .. })));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::DisconnectPeerSession { peer_id, .. } if peer_id == "peer_X"
+        )));
         assert!(effects.iter().any(|e| matches!(
             e,
             Effect::EmitManagerEvent(ManagerEvent::PeerDisconnected { .. })
@@ -8151,7 +8172,7 @@ mod tests {
         assert!(state.peers.is_empty());
         assert!(effects
             .iter()
-            .any(|e| matches!(e, Effect::DisconnectPeer { .. })));
+            .any(|e| matches!(e, Effect::DisconnectPeerSession { .. })));
         assert!(effects.iter().any(|e| matches!(
             e,
             Effect::EmitManagerEvent(ManagerEvent::PeerDisconnected { .. })

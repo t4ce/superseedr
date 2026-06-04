@@ -1,0 +1,87 @@
+# SPDX-FileCopyrightText: 2025 The superseedr Contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+[package]
+name = "superseedr-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.superseedr]
+path = ".."
+
+[[bin]]
+name = "utp_packet_decode"
+path = "fuzz_targets/utp_packet_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "utp_packet_roundtrip"
+path = "fuzz_targets/utp_packet_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tcp_message_parse"
+path = "fuzz_targets/tcp_message_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tcp_message_roundtrip"
+path = "fuzz_targets/tcp_message_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "torrent_file_parse"
+path = "fuzz_targets/torrent_file_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "torrent_info_parse"
+path = "fuzz_targets/torrent_info_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "krpc_message_decode"
+path = "fuzz_targets/krpc_message_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "krpc_compact_decode"
+path = "fuzz_targets/krpc_compact_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "krpc_query_roundtrip"
+path = "fuzz_targets/krpc_query_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dht_lifecycle_reduce"
+path = "fuzz_targets/dht_lifecycle_reduce.rs"
+test = false
+doc = false
+bench = false

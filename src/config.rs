@@ -26,6 +26,12 @@ use crate::theme::ThemeName;
 use strum_macros::EnumCount;
 use strum_macros::EnumIter;
 
+pub const UNLIMITED_RATE_LIMIT_BPS: u64 = i64::MAX as u64;
+
+pub fn is_unlimited_rate_limit_bps(limit_bps: u64) -> bool {
+    limit_bps == 0 || limit_bps >= UNLIMITED_RATE_LIMIT_BPS
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default, EnumIter, EnumCount)]
 pub enum TorrentSortColumn {
     Name,
@@ -211,8 +217,8 @@ impl Default for Settings {
             lifetime_downloaded: 0,
             lifetime_uploaded: 0,
             private_client: false,
-            global_download_limit_bps: 0,
-            global_upload_limit_bps: 0,
+            global_download_limit_bps: UNLIMITED_RATE_LIMIT_BPS,
+            global_upload_limit_bps: UNLIMITED_RATE_LIMIT_BPS,
             torrent_sort_column: TorrentSortColumn::default(),
             torrent_sort_direction: TorrentSortColumn::default().default_direction(),
             torrent_sort_pinned: false,
@@ -479,6 +485,7 @@ struct NormalConfigPaths {
     settings_path: PathBuf,
     metadata_path: PathBuf,
     backup_dir: PathBuf,
+    data_dir: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -529,11 +536,22 @@ static LOGGED_SHARED_CONFIG_REVISION: OnceLock<Mutex<Option<LoggedSharedConfigRe
 static APP_PATHS_OVERRIDE: OnceLock<Mutex<Option<(PathBuf, PathBuf)>>> = OnceLock::new();
 
 #[cfg(test)]
+thread_local! {
+    static HUMAN_BACKUP_ROOT_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
 static SHARED_ENV_TEST_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[cfg(test)]
 fn app_paths_override() -> &'static Mutex<Option<(PathBuf, PathBuf)>> {
     APP_PATHS_OVERRIDE.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn human_backup_root_override() -> Option<PathBuf> {
+    HUMAN_BACKUP_ROOT_OVERRIDE.with(|override_path| override_path.borrow().clone())
 }
 
 #[cfg(test)]
@@ -676,6 +694,12 @@ impl TorrentMetadataEntry {
     fn placeholder_from_settings(settings: &TorrentSettings) -> Option<Self> {
         let info_hash =
             crate::torrent_identity::info_hash_from_torrent_source(&settings.torrent_or_magnet)?;
+        if settings.torrent_or_magnet.starts_with("magnet:") {
+            return Some(magnet_metadata_placeholder_from_settings(
+                settings, info_hash,
+            ));
+        }
+
         Some(Self {
             info_hash_hex: hex::encode(info_hash),
             torrent_name: settings.name.clone(),
@@ -692,6 +716,65 @@ impl TorrentMetadataEntry {
         }
         self.file_priorities = settings.file_priorities.clone();
     }
+}
+
+fn magnet_metadata_placeholder_from_settings(
+    settings: &TorrentSettings,
+    info_hash: Vec<u8>,
+) -> TorrentMetadataEntry {
+    let display_name = extract_magnet_query_value(&settings.torrent_or_magnet, "dn")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| settings.name.clone());
+    let length = extract_magnet_query_value(&settings.torrent_or_magnet, "xl")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_default();
+    let files = if !display_name.is_empty() && length > 0 {
+        vec![TorrentMetadataFileEntry {
+            relative_path: normalize_magnet_file_name(&display_name),
+            length,
+        }]
+    } else {
+        Vec::new()
+    };
+
+    TorrentMetadataEntry {
+        info_hash_hex: hex::encode(info_hash),
+        torrent_name: display_name,
+        total_size: length,
+        is_multi_file: false,
+        files,
+        file_priorities: settings.file_priorities.clone(),
+    }
+}
+
+fn extract_magnet_query_value(magnet_link: &str, target_key: &str) -> Option<String> {
+    for raw_part in magnet_link.split('&') {
+        let part = raw_part.strip_prefix("magnet:?").unwrap_or(raw_part);
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        if key.eq_ignore_ascii_case(target_key) {
+            let value_for_decode = value.replace('+', "%20");
+            if let Ok(decoded) = urlencoding::decode(&value_for_decode) {
+                let value = decoded.trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn normalize_magnet_file_name(name: &str) -> String {
+    name.replace('\\', "/")
+        .split('/')
+        .filter(|segment| {
+            let segment = segment.trim();
+            !segment.is_empty() && segment != "." && segment != ".."
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn sync_torrent_metadata_with_settings(
@@ -1120,7 +1203,7 @@ fn resolve_config_backend() -> io::Result<ConfigBackend> {
         return Ok(ConfigBackend::Shared(SharedConfigBackend { paths }));
     }
 
-    let (config_dir, _) = get_app_paths().ok_or_else(|| {
+    let (config_dir, data_dir) = get_app_paths().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "Could not resolve application config directory",
@@ -1131,6 +1214,7 @@ fn resolve_config_backend() -> io::Result<ConfigBackend> {
             settings_path: config_dir.join("settings.toml"),
             metadata_path: config_dir.join("torrent_metadata.toml"),
             backup_dir: config_dir.join("backups_settings_files"),
+            data_dir,
         },
     }))
 }
@@ -1622,6 +1706,173 @@ fn backup_shared_catalog_before_write(
     cleanup_shared_catalog_backups(&backup_dir, policy.retained_backups)
 }
 
+fn human_backup_root_dir() -> io::Result<PathBuf> {
+    #[cfg(test)]
+    {
+        human_backup_root_override().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "Test backup root override is not configured",
+            )
+        })
+    }
+
+    #[cfg(not(test))]
+    {
+        home_dir_from_env()
+            .map(|home| home.join(".superseedr").join("backups"))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "Could not resolve home directory")
+            })
+    }
+}
+
+fn fully_refresh_backup_tree<F>(target: &Path, populate: F) -> io::Result<()>
+where
+    F: FnOnce(&Path) -> io::Result<()>,
+{
+    let parent = target.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Backup target has no parent: {:?}", target),
+        )
+    })?;
+    fs::create_dir_all(parent)?;
+
+    let name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("latest");
+    let suffix = Local::now()
+        .timestamp_nanos_opt()
+        .unwrap_or_else(|| Local::now().timestamp_millis());
+    let tmp_path = parent.join(format!("{name}.tmp.{}.{}", std::process::id(), suffix));
+    let old_path = parent.join(format!("{name}.old.{}.{}", std::process::id(), suffix));
+
+    remove_path_if_exists(&tmp_path)?;
+    remove_path_if_exists(&old_path)?;
+
+    fs::create_dir_all(&tmp_path)?;
+    if let Err(error) = populate(&tmp_path) {
+        let _ = remove_path_if_exists(&tmp_path);
+        return Err(error);
+    }
+
+    match fs::symlink_metadata(target) {
+        Ok(_) => fs::rename(target, &old_path)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    match fs::rename(&tmp_path, target) {
+        Ok(()) => {
+            let _ = remove_path_if_exists(&old_path);
+            Ok(())
+        }
+        Err(error) => {
+            if fs::symlink_metadata(&old_path).is_ok() {
+                let _ = fs::rename(&old_path, target);
+            }
+            let _ = remove_path_if_exists(&tmp_path);
+            Err(error)
+        }
+    }
+}
+
+fn remove_path_if_exists(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn copy_dir_if_exists(source: &Path, destination: &Path) -> io::Result<()> {
+    if !source.exists() {
+        return Ok(());
+    }
+    copy_dir_recursive(source, destination)
+}
+
+fn copy_dir_recursive(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_dir_recursive(&source_path, &destination_path)?;
+        } else if file_type.is_file() {
+            fs::copy(&source_path, &destination_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn refresh_normal_config_recovery_backup(
+    paths: &NormalConfigPaths,
+    settings: &Settings,
+) -> io::Result<()> {
+    let target = human_backup_root_dir()?.join("local-config").join("latest");
+    fully_refresh_backup_tree(&target, |backup_dir| {
+        write_toml_atomically(&backup_dir.join("settings.toml"), settings)?;
+        copy_dir_if_exists(
+            &paths.data_dir.join("torrents"),
+            &backup_dir.join("torrents"),
+        )?;
+        Ok(())
+    })
+}
+
+fn refresh_shared_config_recovery_backup_tree(
+    paths: &SharedConfigPaths,
+    layered: &LayeredConfig,
+) -> io::Result<()> {
+    let target = human_backup_root_dir()?
+        .join("shared-config")
+        .join("latest");
+    fully_refresh_backup_tree(&target, |backup_dir| {
+        write_toml_atomically(&backup_dir.join("settings.toml"), &layered.settings)?;
+        write_toml_atomically(&backup_dir.join("catalog.toml"), &layered.catalog)?;
+        write_toml_atomically(
+            &backup_dir
+                .join("hosts")
+                .join(&paths.host_id)
+                .join("config.toml"),
+            &layered.host,
+        )?;
+        copy_dir_if_exists(
+            &paths.root_dir.join("torrents"),
+            &backup_dir.join("torrents"),
+        )?;
+        copy_dir_if_exists(
+            &paths.root_dir.join("backups").join("catalog"),
+            &backup_dir.join("backups").join("catalog"),
+        )?;
+        Ok(())
+    })
+}
+
+pub(crate) fn refresh_shared_config_recovery_backup_now() -> io::Result<bool> {
+    let Some(paths) = resolve_shared_config_paths()? else {
+        return Ok(false);
+    };
+    let (layered, _metadata) = load_current_shared_layered(&paths, true)?;
+    refresh_shared_config_recovery_backup_tree(&paths, &layered)?;
+    Ok(true)
+}
+
+fn log_recovery_backup_error(kind: &str, error: &io::Error) {
+    tracing_event!(
+        Level::WARN,
+        backup_kind = kind,
+        error = %error,
+        "Failed to refresh recovery backup"
+    );
+}
+
 fn write_shared_cluster_revision_marker(root_dir: &Path) -> io::Result<String> {
     let revision_path = root_dir.join("cluster.revision");
     let revision = format!(
@@ -1776,6 +2027,11 @@ pub(crate) fn set_app_paths_override_for_tests(paths: Option<(PathBuf, PathBuf)>
     *guard = paths;
 }
 
+#[cfg(test)]
+pub(crate) fn set_human_backup_root_override_for_tests(path: Option<PathBuf>) -> Option<PathBuf> {
+    HUMAN_BACKUP_ROOT_OVERRIDE.with(|override_path| override_path.replace(path))
+}
+
 fn first_run_settings() -> Settings {
     let mut settings = Settings::default();
     if let Some(user_dirs) = directories::UserDirs::new() {
@@ -1927,6 +2183,9 @@ impl NormalConfigBackend {
         let existing_metadata = read_torrent_metadata_or_default(&self.paths.metadata_path)?;
         let next_metadata = sync_torrent_metadata_with_settings(existing_metadata, &flat_settings);
         let _ = write_toml_atomically_with_fingerprint(&self.paths.metadata_path, &next_metadata)?;
+        if let Err(error) = refresh_normal_config_recovery_backup(&self.paths, &flat_settings) {
+            log_recovery_backup_error("local-config", &error);
+        }
 
         Ok(())
     }
@@ -2014,7 +2273,8 @@ impl SharedConfigBackend {
                 write_toml_atomically_with_fingerprint(&self.paths.metadata_path, &next_metadata)?;
         }
 
-        if next_layered.host != current_layered.host {
+        let shared_host_changed = next_layered.host != current_layered.host;
+        if shared_host_changed {
             let _ =
                 write_toml_atomically_with_fingerprint(&self.paths.host_path, &next_layered.host)?;
         }
@@ -2022,6 +2282,17 @@ impl SharedConfigBackend {
         if shared_settings_changed || shared_catalog_changed || shared_metadata_changed {
             let revision = write_shared_cluster_revision_marker(&self.paths.root_dir)?;
             mark_shared_config_revision_seen(&self.paths, revision);
+        }
+        if shared_settings_changed
+            || shared_catalog_changed
+            || shared_metadata_changed
+            || shared_host_changed
+        {
+            if let Err(error) =
+                refresh_shared_config_recovery_backup_tree(&self.paths, &next_layered)
+            {
+                log_recovery_backup_error("shared-config", &error);
+            }
         }
         Ok(())
     }
@@ -2078,11 +2349,12 @@ impl ConfigBackend {
         match self {
             ConfigBackend::Normal(backend) => {
                 let mut metadata = read_torrent_metadata_or_default(&backend.paths.metadata_path)?;
-                upsert_torrent_metadata_entry(&mut metadata, entry);
-                let _ = write_toml_atomically_with_fingerprint(
-                    &backend.paths.metadata_path,
-                    &metadata,
-                )?;
+                if upsert_torrent_metadata_entry(&mut metadata, entry) {
+                    let _ = write_toml_atomically_with_fingerprint(
+                        &backend.paths.metadata_path,
+                        &metadata,
+                    )?;
+                }
                 Ok(())
             }
             ConfigBackend::Shared(backend) => {
@@ -2090,11 +2362,12 @@ impl ConfigBackend {
                 // single-writer model. If concurrent shared writers are added
                 // later, restore conflict detection here before writing.
                 let mut metadata = read_torrent_metadata_or_default(&backend.paths.metadata_path)?;
-                upsert_torrent_metadata_entry(&mut metadata, entry);
-                let _ = write_toml_atomically_with_fingerprint(
-                    &backend.paths.metadata_path,
-                    &metadata,
-                )?;
+                if upsert_torrent_metadata_entry(&mut metadata, entry) {
+                    let _ = write_toml_atomically_with_fingerprint(
+                        &backend.paths.metadata_path,
+                        &metadata,
+                    )?;
+                }
                 Ok(())
             }
         }
@@ -2104,15 +2377,20 @@ impl ConfigBackend {
 fn upsert_torrent_metadata_entry(
     metadata: &mut TorrentMetadataConfig,
     entry: TorrentMetadataEntry,
-) {
+) -> bool {
     if let Some(existing) = metadata
         .torrents
         .iter_mut()
         .find(|existing| existing.info_hash_hex == entry.info_hash_hex)
     {
+        if *existing == entry {
+            return false;
+        }
         *existing = entry;
+        true
     } else {
         metadata.torrents.push(entry);
+        true
     }
 }
 
@@ -2262,7 +2540,7 @@ pub fn clear_persisted_host_id() -> io::Result<bool> {
 }
 
 fn local_normal_backend() -> io::Result<NormalConfigBackend> {
-    let (config_dir, _) = get_app_paths().ok_or_else(|| {
+    let (config_dir, data_dir) = get_app_paths().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "Could not resolve application config directory",
@@ -2273,6 +2551,7 @@ fn local_normal_backend() -> io::Result<NormalConfigBackend> {
             settings_path: config_dir.join("settings.toml"),
             metadata_path: config_dir.join("torrent_metadata.toml"),
             backup_dir: config_dir.join("backups_settings_files"),
+            data_dir,
         },
     })
 }
@@ -2801,6 +3080,23 @@ mod tests {
         }
     }
 
+    struct HumanBackupRootRestore {
+        value: Option<PathBuf>,
+    }
+
+    impl HumanBackupRootRestore {
+        fn set(path: PathBuf) -> Self {
+            let value = set_human_backup_root_override_for_tests(Some(path));
+            Self { value }
+        }
+    }
+
+    impl Drop for HumanBackupRootRestore {
+        fn drop(&mut self) {
+            set_human_backup_root_override_for_tests(self.value.take());
+        }
+    }
+
     #[test]
     fn test_full_settings_parsing() {
         let toml_str = r#"
@@ -2933,7 +3229,7 @@ mod tests {
         assert_eq!(settings.client_id, default_settings.client_id);
         assert_eq!(settings.client_port, 6681);
         assert_eq!(settings.lifetime_downloaded, 0);
-        assert_eq!(settings.global_upload_limit_bps, 0);
+        assert_eq!(settings.global_upload_limit_bps, UNLIMITED_RATE_LIMIT_BPS);
         assert_eq!(settings.torrent_sort_column, TorrentSortColumn::Up);
         assert_eq!(settings.peer_sort_direction, SortDirection::Descending);
         assert!(settings.watch_folder.is_none());
@@ -3605,6 +3901,7 @@ mod tests {
                 settings_path: dir.path().join("settings.toml"),
                 metadata_path: dir.path().join("torrent_metadata.toml"),
                 backup_dir: dir.path().join("backups_settings_files"),
+                data_dir: dir.path().join("data"),
             },
         };
         let settings = Settings {
@@ -3625,6 +3922,77 @@ mod tests {
     }
 
     #[test]
+    fn test_normal_backend_fully_refreshes_human_backup_mirror() {
+        let _guard = watch_env_guard().lock().unwrap();
+        let _home = EnvVarRestore::capture("HOME");
+        let _user_profile = EnvVarRestore::capture("USERPROFILE");
+        let _home_drive = EnvVarRestore::capture("HOMEDRIVE");
+        let _home_path = EnvVarRestore::capture("HOMEPATH");
+        let dir = tempdir().expect("create tempdir");
+        let home = dir.path().join("home");
+        let _backup_root = HumanBackupRootRestore::set(home.join(".superseedr").join("backups"));
+        env::set_var("HOME", &home);
+        env::set_var("USERPROFILE", &home);
+        env::remove_var("HOMEDRIVE");
+        env::remove_var("HOMEPATH");
+
+        let backend = NormalConfigBackend {
+            paths: NormalConfigPaths {
+                settings_path: dir.path().join("settings.toml"),
+                metadata_path: dir.path().join("torrent_metadata.toml"),
+                backup_dir: dir.path().join("backups_settings_files"),
+                data_dir: dir.path().join("data"),
+            },
+        };
+        let stale_path = home
+            .join(".superseedr")
+            .join("backups")
+            .join("local-config")
+            .join("latest")
+            .join("stale.txt");
+        fs::create_dir_all(stale_path.parent().expect("stale parent"))
+            .expect("create stale backup dir");
+        fs::write(&stale_path, "stale").expect("write stale backup marker");
+        fs::write(
+            stale_path
+                .parent()
+                .expect("stale parent")
+                .join("torrent_metadata.toml"),
+            "stale metadata",
+        )
+        .expect("write stale metadata backup");
+        let cached_torrent = backend
+            .paths
+            .data_dir
+            .join("torrents")
+            .join("sample.torrent");
+        fs::create_dir_all(cached_torrent.parent().expect("torrent parent"))
+            .expect("create torrent cache");
+        fs::write(&cached_torrent, b"sample torrent bytes").expect("write cached torrent");
+
+        let settings = Settings {
+            client_id: "local-backup-node".to_string(),
+            client_port: 7777,
+            ..Settings::default()
+        };
+
+        backend.save_settings(&settings).expect("save settings");
+
+        let latest = home
+            .join(".superseedr")
+            .join("backups")
+            .join("local-config")
+            .join("latest");
+        let backup_settings: Settings =
+            read_toml_or_default(&latest.join("settings.toml")).expect("read backup settings");
+
+        assert_eq!(backup_settings.client_id, "local-backup-node");
+        assert!(latest.join("torrents").join("sample.torrent").exists());
+        assert!(!latest.join("torrent_metadata.toml").exists());
+        assert!(!latest.join("stale.txt").exists());
+    }
+
+    #[test]
     fn test_normal_backend_load_applies_supported_env_overrides() {
         let _guard = watch_env_guard().lock().unwrap();
         let _client_port = EnvVarRestore::capture(CLIENT_PORT_ENV);
@@ -3637,6 +4005,7 @@ mod tests {
                 settings_path: dir.path().join("settings.toml"),
                 metadata_path: dir.path().join("torrent_metadata.toml"),
                 backup_dir: dir.path().join("backups_settings_files"),
+                data_dir: dir.path().join("data"),
             },
         };
         let settings = Settings {
@@ -3668,6 +4037,7 @@ mod tests {
                 settings_path: dir.path().join("settings.toml"),
                 metadata_path: dir.path().join("torrent_metadata.toml"),
                 backup_dir: dir.path().join("backups_settings_files"),
+                data_dir: dir.path().join("data"),
             },
         };
         env::set_var(CLIENT_PORT_ENV, "61234");
@@ -3766,6 +4136,134 @@ mod tests {
             reloaded.default_download_folder,
             Some(dir.path().join("downloads"))
         );
+    }
+
+    #[test]
+    fn test_shared_backend_fully_refreshes_human_backup_mirror() {
+        let _guard = shared_backend_guard().lock().unwrap();
+        let _home = EnvVarRestore::capture("HOME");
+        let _user_profile = EnvVarRestore::capture("USERPROFILE");
+        let _home_drive = EnvVarRestore::capture("HOMEDRIVE");
+        let _home_path = EnvVarRestore::capture("HOMEPATH");
+        clear_shared_config_state();
+        let dir = tempdir().expect("create tempdir");
+        let home = dir.path().join("home");
+        let _backup_root = HumanBackupRootRestore::set(home.join(".superseedr").join("backups"));
+        env::set_var("HOME", &home);
+        env::set_var("USERPROFILE", &home);
+        env::remove_var("HOMEDRIVE");
+        env::remove_var("HOMEPATH");
+
+        let config_root = dir.path().join(SHARED_CONFIG_SUBDIR);
+        let host_dir = config_root.join("hosts").join("node-a");
+        let backend = SharedConfigBackend {
+            paths: SharedConfigPaths {
+                mount_dir: dir.path().to_path_buf(),
+                root_dir: config_root.clone(),
+                settings_path: config_root.join("settings.toml"),
+                catalog_path: config_root.join("catalog.toml"),
+                metadata_path: config_root.join("torrent_metadata.toml"),
+                host_dir: host_dir.clone(),
+                host_path: host_dir.join("config.toml"),
+                host_id: "node-a".to_string(),
+            },
+        };
+        write_toml_atomically(&backend.paths.host_path, &HostConfig::default())
+            .expect("seed host file");
+        let stale_path = home
+            .join(".superseedr")
+            .join("backups")
+            .join("shared-config")
+            .join("latest")
+            .join("stale.txt");
+        fs::create_dir_all(stale_path.parent().expect("stale parent"))
+            .expect("create stale backup dir");
+        fs::write(&stale_path, "stale").expect("write stale backup marker");
+        fs::write(
+            stale_path
+                .parent()
+                .expect("stale parent")
+                .join("torrent_metadata.toml"),
+            "stale metadata",
+        )
+        .expect("write stale metadata backup");
+        fs::write(
+            stale_path
+                .parent()
+                .expect("stale parent")
+                .join("cluster.revision"),
+            "stale revision",
+        )
+        .expect("write stale revision backup");
+        let shared_torrent = backend
+            .paths
+            .root_dir
+            .join("torrents")
+            .join("0123456789abcdef0123456789abcdef01234567.torrent");
+        fs::create_dir_all(shared_torrent.parent().expect("shared torrent parent"))
+            .expect("create shared torrent cache");
+        fs::write(&shared_torrent, b"sample torrent bytes").expect("write shared torrent");
+        let catalog_snapshot = backend
+            .paths
+            .root_dir
+            .join("backups")
+            .join("catalog")
+            .join("catalog_20260523_10.toml");
+        fs::create_dir_all(catalog_snapshot.parent().expect("catalog snapshot parent"))
+            .expect("create catalog snapshot dir");
+        fs::write(
+            &catalog_snapshot,
+            "[[torrents]]\nname = \"Previous Sample\"\n",
+        )
+        .expect("write catalog snapshot");
+
+        let mut settings = backend.load_settings().expect("load shared settings");
+        settings.client_id = "shared-backup-node".to_string();
+        settings.client_port = 9090;
+        settings.torrents.push(TorrentSettings {
+            torrent_or_magnet: shared_torrent.to_string_lossy().to_string(),
+            name: "Shared Sample".to_string(),
+            ..TorrentSettings::default()
+        });
+
+        backend
+            .save_settings(&settings)
+            .expect("save shared settings");
+
+        let latest = home
+            .join(".superseedr")
+            .join("backups")
+            .join("shared-config")
+            .join("latest");
+        let backup_settings: SharedSettingsConfig =
+            read_toml_or_default(&latest.join("settings.toml")).expect("read backup settings");
+        let backup_catalog: CatalogConfig =
+            read_toml_or_default(&latest.join("catalog.toml")).expect("read backup catalog");
+        let backup_host: HostConfig =
+            read_toml_or_default(&latest.join("hosts").join("node-a").join("config.toml"))
+                .expect("read backup host");
+
+        assert_eq!(backup_settings.client_id, "shared-backup-node");
+        assert_eq!(backup_catalog.torrents.len(), 1);
+        assert_eq!(backup_catalog.torrents[0].name, "Shared Sample");
+        assert_eq!(backup_host.client_port, 9090);
+        assert!(latest
+            .join("torrents")
+            .join("0123456789abcdef0123456789abcdef01234567.torrent")
+            .exists());
+        assert_eq!(
+            fs::read_to_string(
+                latest
+                    .join("backups")
+                    .join("catalog")
+                    .join("catalog_20260523_10.toml")
+            )
+            .expect("read backup catalog snapshot"),
+            "[[torrents]]\nname = \"Previous Sample\"\n"
+        );
+        assert!(!latest.join("torrent_metadata.toml").exists());
+        assert!(!latest.join("cluster.revision").exists());
+        assert!(!latest.join("stale.txt").exists());
     }
 
     #[test]
@@ -4050,6 +4548,7 @@ mod tests {
                 settings_path: temp.path().join("settings.toml"),
                 metadata_path: temp.path().join("torrent_metadata.toml"),
                 backup_dir: temp.path().join("backups_settings_files"),
+                data_dir: temp.path().join("data"),
             },
         };
 
@@ -4085,6 +4584,7 @@ mod tests {
                 settings_path: temp.path().join("standalone-settings.toml"),
                 metadata_path: temp.path().join("standalone-metadata.toml"),
                 backup_dir: temp.path().join("standalone-backups"),
+                data_dir: temp.path().join("data"),
             },
         };
 
@@ -4388,6 +4888,7 @@ mod tests {
                 settings_path: dir.path().join("settings.toml"),
                 metadata_path: dir.path().join("torrent_metadata.toml"),
                 backup_dir: dir.path().join("backups_settings_files"),
+                data_dir: dir.path().join("data"),
             },
         };
         let settings = Settings {
@@ -4424,6 +4925,7 @@ mod tests {
                 settings_path: dir.path().join("settings.toml"),
                 metadata_path: dir.path().join("torrent_metadata.toml"),
                 backup_dir: dir.path().join("backups_settings_files"),
+                data_dir: dir.path().join("data"),
             },
         };
         let settings = Settings {
@@ -4494,6 +4996,7 @@ mod tests {
                 settings_path: dir.path().join("settings.toml"),
                 metadata_path: dir.path().join("torrent_metadata.toml"),
                 backup_dir: dir.path().join("backups_settings_files"),
+                data_dir: dir.path().join("data"),
             },
         };
         let invalid_metadata = "schema_version = 1\n[[torrents]]\ninfo_hash_hex = \"1111111111111111111111111111111111111111\"\n[torrents.file_priorities]\n[torrents.file_priorities]\n";
@@ -4538,6 +5041,48 @@ mod tests {
     }
 
     #[test]
+    fn test_save_settings_seeds_single_file_magnet_metadata() {
+        let dir = tempdir().expect("create tempdir");
+        let backend = NormalConfigBackend {
+            paths: NormalConfigPaths {
+                settings_path: dir.path().join("settings.toml"),
+                metadata_path: dir.path().join("torrent_metadata.toml"),
+                backup_dir: dir.path().join("backups_settings_files"),
+                data_dir: dir.path().join("data"),
+            },
+        };
+        let settings = Settings {
+            torrents: vec![TorrentSettings {
+                torrent_or_magnet: concat!(
+                    "magnet:?xt=urn:btih:2222222222222222222222222222222222222222",
+                    "&dn=Sample%20Node.mkv",
+                    "&xl=12345"
+                )
+                .to_string(),
+                validation_status: true,
+                ..TorrentSettings::default()
+            }],
+            ..Settings::default()
+        };
+
+        backend.save_settings(&settings).expect("save settings");
+
+        let saved_metadata: TorrentMetadataConfig =
+            read_toml_or_default(&backend.paths.metadata_path).expect("load metadata");
+        assert_eq!(saved_metadata.torrents.len(), 1);
+        let entry = &saved_metadata.torrents[0];
+        assert_eq!(
+            entry.info_hash_hex,
+            "2222222222222222222222222222222222222222"
+        );
+        assert_eq!(entry.torrent_name, "Sample Node.mkv");
+        assert_eq!(entry.total_size, 12345);
+        assert_eq!(entry.files.len(), 1);
+        assert_eq!(entry.files[0].relative_path, "Sample Node.mkv");
+        assert_eq!(entry.files[0].length, 12345);
+    }
+
+    #[test]
     fn test_upsert_torrent_metadata_overwrites_invalid_metadata() {
         let dir = tempdir().expect("create tempdir");
         let backend = NormalConfigBackend {
@@ -4545,6 +5090,7 @@ mod tests {
                 settings_path: dir.path().join("settings.toml"),
                 metadata_path: dir.path().join("torrent_metadata.toml"),
                 backup_dir: dir.path().join("backups_settings_files"),
+                data_dir: dir.path().join("data"),
             },
         };
         let invalid_metadata = "schema_version = 1\n[[torrents]]\ninfo_hash_hex = \"1111111111111111111111111111111111111111\"\n[torrents.file_priorities]\n[torrents.file_priorities]\n";
@@ -4561,12 +5107,38 @@ mod tests {
 
         let saved_metadata: TorrentMetadataConfig =
             read_toml_or_default(&backend.paths.metadata_path).expect("load rewritten metadata");
+
         assert_eq!(saved_metadata.torrents.len(), 1);
         assert_eq!(
             saved_metadata.torrents[0].info_hash_hex,
             "2222222222222222222222222222222222222222"
         );
         assert_eq!(saved_metadata.torrents[0].torrent_name, "Queued Sample");
+    }
+
+    #[test]
+    fn test_upsert_torrent_metadata_entry_reports_unchanged_entries() {
+        let entry = TorrentMetadataEntry {
+            info_hash_hex: "2222222222222222222222222222222222222222".to_string(),
+            torrent_name: "Queued Sample".to_string(),
+            ..TorrentMetadataEntry::default()
+        };
+        let mut metadata = TorrentMetadataConfig {
+            torrents: vec![entry.clone()],
+        };
+
+        assert!(!upsert_torrent_metadata_entry(&mut metadata, entry.clone()));
+        assert_eq!(metadata.torrents, vec![entry.clone()]);
+
+        let changed_entry = TorrentMetadataEntry {
+            torrent_name: "Updated Sample".to_string(),
+            ..entry
+        };
+        assert!(upsert_torrent_metadata_entry(
+            &mut metadata,
+            changed_entry.clone()
+        ));
+        assert_eq!(metadata.torrents, vec![changed_entry]);
     }
 
     fn watch_env_guard() -> &'static std::sync::Mutex<()> {
@@ -4602,6 +5174,63 @@ mod tests {
             .expect("resolve effective shared config")
             .expect("shared config enabled");
         assert_eq!(effective, selection);
+
+        set_app_paths_override_for_tests(None);
+        clear_shared_config_state();
+    }
+
+    #[test]
+    fn test_set_persisted_shared_config_does_not_write_shared_settings() {
+        let _guard = shared_backend_guard().lock().unwrap();
+        let temp = set_temp_app_paths();
+        let shared_root = temp.path().join("shared-root");
+        fs::create_dir_all(&shared_root).expect("create mounted shared root");
+
+        let selection =
+            set_persisted_shared_config(&shared_root).expect("persist shared config path");
+
+        let settings_path = selection.config_root.join("settings.toml");
+        assert!(!settings_path.exists());
+
+        let loaded = load_settings().expect("load shared settings");
+        assert_eq!(loaded.default_download_folder, Some(selection.mount_root));
+
+        set_app_paths_override_for_tests(None);
+        clear_shared_config_state();
+    }
+
+    #[test]
+    fn test_set_persisted_shared_config_preserves_existing_default_download_folder() {
+        let _guard = shared_backend_guard().lock().unwrap();
+        let temp = set_temp_app_paths();
+        let shared_root = temp.path().join("shared-root");
+        let explicit_config_root = shared_root.join(SHARED_CONFIG_SUBDIR);
+        fs::create_dir_all(&explicit_config_root).expect("create shared config root");
+        write_toml_atomically(
+            &explicit_config_root.join("settings.toml"),
+            &SharedSettingsConfig {
+                default_download_folder: Some(PathBuf::from("old-downloads")),
+                ..SharedSettingsConfig::default()
+            },
+        )
+        .expect("write stale shared settings");
+
+        let selection = set_persisted_shared_config(&explicit_config_root)
+            .expect("persist explicit shared config path");
+
+        let raw_settings: SharedSettingsConfig =
+            read_toml_or_default(&selection.config_root.join("settings.toml"))
+                .expect("read shared settings");
+        assert_eq!(
+            raw_settings.default_download_folder,
+            Some(PathBuf::from("old-downloads"))
+        );
+
+        let loaded = load_settings().expect("load shared settings");
+        assert_eq!(
+            loaded.default_download_folder,
+            Some(shared_root.join("old-downloads"))
+        );
 
         set_app_paths_override_for_tests(None);
         clear_shared_config_state();

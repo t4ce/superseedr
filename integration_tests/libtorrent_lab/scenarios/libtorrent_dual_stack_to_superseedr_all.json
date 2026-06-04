@@ -1,0 +1,24 @@
+{
+  "name": "libtorrent_dual_stack_to_superseedr_all",
+  "description": "A libtorrent peer seeds one deterministic v1 fixture with TCP and uTP enabled while Superseedr downloads with both listeners enabled.",
+  "seed_client": "libtorrent",
+  "leech_client": "superseedr",
+  "mode": "v1",
+  "torrent": "single_16k.bin.torrent",
+  "payload": "single/single_16k.bin",
+  "download_name": "single_16k.bin",
+  "timeout_secs": 180,
+  "seed_listen_port": 26881,
+  "leech_listen_port": 26882,
+  "superseedr_peer_transport": "all",
+  "libtorrent_settings": {
+    "enable_dht": false,
+    "enable_lsd": false,
+    "enable_natpmp": false,
+    "enable_upnp": false,
+    "enable_incoming_tcp": true,
+    "enable_outgoing_tcp": true,
+    "enable_incoming_utp": true,
+    "enable_outgoing_utp": true
+  }
+}

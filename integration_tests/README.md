@@ -149,6 +149,96 @@ Artifacts are written under:
 
 - `integration_tests/artifacts/cluster_cli/<run_id>/`
 
+## Libtorrent Lab
+
+The libtorrent lab is a separate Docker-first lane for direct libtorrent-backed
+test peers. It is intended for future protocol, behavior, performance, and
+settings probes without pulling in a full client UI stack.
+
+Main entrypoint:
+
+```bash
+./integration_tests/run_libtorrent_lab.sh
+```
+
+or:
+
+```bash
+python3 -m integration_tests.libtorrent_lab.run --scenario basic_ul_dl
+```
+
+Matrix entrypoint:
+
+```bash
+./integration_tests/run_libtorrent_lab.sh --matrix smoke
+./integration_tests/run_libtorrent_lab.sh --matrix config
+./integration_tests/run_libtorrent_lab.sh --matrix behavior
+./integration_tests/run_libtorrent_lab.sh --matrix full --repeat 2
+```
+
+Profile entrypoint:
+
+```bash
+./integration_tests/run_libtorrent_lab.sh --profile quick
+./integration_tests/run_libtorrent_lab.sh --profile premerge
+./integration_tests/run_libtorrent_lab.sh --profile stress
+./integration_tests/run_libtorrent_lab.sh --profile soak
+```
+
+Readiness entrypoint for final uTP merge/release validation:
+
+```bash
+./integration_tests/run_libtorrent_lab.sh --readiness quick --fail-fast
+./integration_tests/run_libtorrent_lab.sh --readiness release --fail-fast
+```
+
+Readiness summaries fail on any failed scenario attempt or any Superseedr
+error-level app log line. Warning-level Superseedr log lines are counted and
+surfaced in `readiness_summary.json`/`.md`.
+
+Network impairment can be applied to any scenario or matrix with the `netem`
+flags:
+
+```bash
+./integration_tests/run_libtorrent_lab.sh --matrix transport \
+  --netem-delay-ms 50 \
+  --netem-jitter-ms 10 \
+  --netem-loss-pct 0.5
+```
+
+Initial scenario names:
+
+- `basic_ul_dl`
+- `superseedr_to_libtorrent`
+- `libtorrent_to_superseedr`
+- `superseedr_utp_to_libtorrent`
+- `libtorrent_utp_to_superseedr`
+- `superseedr_to_libtorrent_v1_multi_file`
+- `libtorrent_to_superseedr_v1_nested`
+- `superseedr_to_libtorrent_v2_multi_file`
+- `libtorrent_to_superseedr_hybrid_nested`
+- `superseedr_to_libtorrent_tcp_fanout`
+- `libtorrent_to_superseedr_tcp_fanout`
+- `basic_ul_dl_tcp_only`
+- `basic_ul_dl_utp_only`
+- `basic_ul_dl_dht_lsd_enabled`
+- `superseedr_all_to_libtorrent_dual_stack`
+- `libtorrent_dual_stack_to_superseedr_all`
+
+Artifacts are written under:
+
+- `integration_tests/artifacts/libtorrent_lab/<run_id>/`
+
+Matrix runs also write `matrix_summary.json` and `matrix_summary.md` in their
+matrix artifact directory.
+
+Profile runs also write `profile_summary.json` and `profile_summary.md` in
+their profile artifact directory.
+
+Per-scenario `summary.json` also includes stronger `assertions`, summarized
+`libtorrent_events`, and `behavior_probes` so completed-but-suspicious runs can
+fail or at least emit trendable warnings.
+
 ## Artifacts and Monitoring
 
 Per run output:

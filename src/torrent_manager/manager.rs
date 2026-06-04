@@ -9,8 +9,9 @@ use crate::torrent_manager::merkle;
 use crate::resource_manager::ResourceManagerClient;
 use crate::resource_manager::ResourceManagerError;
 
+use crate::networking::transport::PeerTransportKind;
 use crate::networking::web_seed_worker::web_seed_worker;
-use crate::networking::ConnectionType;
+use crate::networking::{ConnectionType, PeerConnection, TcpPeerTransport, UtpPeerTransport};
 
 use crate::token_bucket::TokenBucket;
 
@@ -25,6 +26,7 @@ use crate::torrent_manager::piece_manager::PieceStatus;
 use crate::torrent_manager::state::Action;
 use crate::torrent_manager::state::ChokeStatus;
 use crate::torrent_manager::state::Effect;
+use crate::torrent_manager::state::PeerState;
 use crate::torrent_manager::state::TorrentActivity;
 use crate::torrent_manager::state::TorrentState;
 
@@ -74,7 +76,6 @@ use urlencoding::decode;
 
 use sha1::Digest;
 use tokio::fs;
-use tokio::net::TcpStream;
 use tokio::signal;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
@@ -89,16 +90,163 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::telemetry::manager_telemetry::ManagerTelemetry;
-use crate::torrent_manager::TorrentParameters;
+use crate::torrent_manager::{IncomingPeerSession, TorrentParameters};
 
 const HASH_LENGTH: usize = 20;
 
 const MAX_UPLOAD_REQUEST_ATTEMPTS: u32 = 7;
 const MAX_PIECE_WRITE_ATTEMPTS: u32 = 12;
 const ACTIVITY_MESSAGE_MAX_LEN: usize = 28;
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const UTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 const BASE_BACKOFF_MS: u64 = 1000;
 const JITTER_MS: u64 = 100;
+const PEER_TRANSPORT_ENV: &str = "SUPERSEEDR_PEER_TRANSPORT";
+const UTP_CONNECT_LOG_ENV: &str = "SUPERSEEDR_LOG_UTP_CONNECT";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerTransportMode {
+    Tcp,
+    Utp,
+    All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OutboundTransportMode {
+    try_utp: bool,
+    allow_tcp: bool,
+}
+
+fn outbound_transport_mode_from_env() -> OutboundTransportMode {
+    outbound_transport_mode(peer_transport_mode_from_env())
+}
+
+fn utp_connect_log_enabled() -> bool {
+    env_flag(UTP_CONNECT_LOG_ENV)
+}
+
+fn outbound_transport_mode(mode: PeerTransportMode) -> OutboundTransportMode {
+    match mode {
+        PeerTransportMode::Tcp => OutboundTransportMode {
+            try_utp: false,
+            allow_tcp: true,
+        },
+        PeerTransportMode::Utp => OutboundTransportMode {
+            try_utp: true,
+            allow_tcp: false,
+        },
+        PeerTransportMode::All => OutboundTransportMode {
+            try_utp: true,
+            allow_tcp: true,
+        },
+    }
+}
+
+fn peer_transport_key(kind: PeerTransportKind, addr: SocketAddr) -> String {
+    format!("{kind}://{addr}")
+}
+
+fn outbound_peer_key_candidates(
+    peer_addr: SocketAddr,
+    mode: OutboundTransportMode,
+    preferred_key: Option<&str>,
+) -> Vec<String> {
+    let mut keys = Vec::new();
+    if let Some(key) = preferred_key {
+        keys.push(key.to_string());
+    }
+    if mode.try_utp {
+        keys.push(peer_transport_key(PeerTransportKind::Utp, peer_addr));
+    }
+    if mode.allow_tcp {
+        keys.push(peer_transport_key(PeerTransportKind::Tcp, peer_addr));
+    }
+    keys.push(peer_addr.to_string());
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn outbound_peer_session_key(
+    peer_addr: SocketAddr,
+    mode: OutboundTransportMode,
+    preferred_key: Option<String>,
+    selected_transport: PeerTransportKind,
+) -> String {
+    preferred_key.unwrap_or_else(|| {
+        if matches!(
+            selected_transport,
+            PeerTransportKind::Tcp | PeerTransportKind::Utp
+        ) {
+            peer_transport_key(selected_transport, peer_addr)
+        } else if mode.try_utp {
+            peer_transport_key(PeerTransportKind::Utp, peer_addr)
+        } else {
+            peer_transport_key(PeerTransportKind::Tcp, peer_addr)
+        }
+    })
+}
+
+fn peer_transport_mode_from_env() -> PeerTransportMode {
+    match std::env::var(PEER_TRANSPORT_ENV) {
+        Ok(value) => peer_transport_mode(&value),
+        Err(_) => PeerTransportMode::All,
+    }
+}
+
+fn peer_transport_mode(value: &str) -> PeerTransportMode {
+    match value.to_ascii_lowercase().as_str() {
+        "tcp" => PeerTransportMode::Tcp,
+        "utp" => PeerTransportMode::Utp,
+        "all" => PeerTransportMode::All,
+        _ => PeerTransportMode::All,
+    }
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TransportPeerCounts {
+    tcp_peer_count: usize,
+    utp_peer_count: usize,
+    beneficial_tcp_peer_count: usize,
+    beneficial_utp_peer_count: usize,
+}
+
+fn count_peers_by_transport<'a>(peers: impl Iterator<Item = &'a PeerState>) -> TransportPeerCounts {
+    let mut counts = TransportPeerCounts::default();
+
+    for peer in peers {
+        let has_moved_payload = peer.total_bytes_downloaded > 0 || peer.total_bytes_uploaded > 0;
+        match peer.transport_kind {
+            PeerTransportKind::Tcp => {
+                counts.tcp_peer_count += 1;
+                if has_moved_payload {
+                    counts.beneficial_tcp_peer_count += 1;
+                }
+            }
+            PeerTransportKind::Utp => {
+                counts.utp_peer_count += 1;
+                if has_moved_payload {
+                    counts.beneficial_utp_peer_count += 1;
+                }
+            }
+            PeerTransportKind::Quic => {}
+        }
+    }
+
+    counts
+}
 
 #[cfg(feature = "synthetic-load")]
 fn synthetic_peer_connect_failure(error: &std::io::Error) -> SyntheticPeerConnectFailure {
@@ -110,6 +258,147 @@ fn synthetic_peer_connect_failure(error: &std::io::Error) -> SyntheticPeerConnec
         std::io::ErrorKind::AddrNotAvailable => SyntheticPeerConnectFailure::AddrNotAvailable,
         std::io::ErrorKind::TimedOut => SyntheticPeerConnectFailure::TimedOut,
         _ => SyntheticPeerConnectFailure::OtherIo,
+    }
+}
+
+async fn connect_outbound_peer(
+    peer_addr: SocketAddr,
+    local_udp_port: u16,
+    mode: OutboundTransportMode,
+    peer_label: &str,
+) -> Result<PeerConnection, (PeerTransportKind, Option<std::io::Error>)> {
+    match (mode.try_utp, mode.allow_tcp) {
+        (true, true) => race_utp_and_tcp(peer_addr, local_udp_port, peer_label).await,
+        (true, false) => match attempt_utp_connect(peer_addr, local_udp_port).await {
+            Ok(connection) => {
+                log_utp_connect_established(peer_label);
+                Ok(connection)
+            }
+            Err(error) => {
+                log_utp_connect_failure(
+                    peer_label,
+                    error.as_ref(),
+                    "uTP outbound connect failed in uTP-only mode",
+                );
+                Err((PeerTransportKind::Utp, error))
+            }
+        },
+        (false, _) => attempt_tcp_connect(peer_addr)
+            .await
+            .map_err(|error| (PeerTransportKind::Tcp, error)),
+    }
+}
+
+async fn race_utp_and_tcp(
+    peer_addr: SocketAddr,
+    local_udp_port: u16,
+    peer_label: &str,
+) -> Result<PeerConnection, (PeerTransportKind, Option<std::io::Error>)> {
+    let utp_attempt = attempt_utp_connect(peer_addr, local_udp_port);
+    let tcp_attempt = attempt_tcp_connect(peer_addr);
+    tokio::pin!(utp_attempt);
+    tokio::pin!(tcp_attempt);
+
+    let (first_transport, first_result) = tokio::select! {
+        result = &mut tcp_attempt => (PeerTransportKind::Tcp, result),
+        result = &mut utp_attempt => (PeerTransportKind::Utp, result),
+    };
+
+    match (first_transport, first_result) {
+        (_, Ok(connection)) => {
+            if connection.endpoint.kind == PeerTransportKind::Utp {
+                log_utp_connect_established(peer_label);
+            }
+            Ok(connection)
+        }
+        (PeerTransportKind::Utp, Err(utp_error)) => {
+            log_utp_connect_failure(
+                peer_label,
+                utp_error.as_ref(),
+                "uTP outbound connect failed while racing TCP fallback",
+            );
+            match tcp_attempt.await {
+                Ok(connection) => Ok(connection),
+                Err(tcp_error) => Err((PeerTransportKind::Tcp, tcp_error)),
+            }
+        }
+        (PeerTransportKind::Tcp, Err(tcp_error)) => match utp_attempt.await {
+            Ok(connection) => {
+                log_utp_connect_established(peer_label);
+                Ok(connection)
+            }
+            Err(utp_error) => {
+                log_utp_connect_failure(
+                    peer_label,
+                    utp_error.as_ref(),
+                    "uTP outbound connect failed after TCP fallback failed",
+                );
+                Err((PeerTransportKind::Tcp, tcp_error))
+            }
+        },
+        (PeerTransportKind::Quic, Err(error)) => Err((PeerTransportKind::Quic, error)),
+    }
+}
+
+async fn attempt_utp_connect(
+    peer_addr: SocketAddr,
+    local_udp_port: u16,
+) -> Result<PeerConnection, Option<std::io::Error>> {
+    match timeout(
+        UTP_CONNECT_TIMEOUT,
+        UtpPeerTransport::connect_from_port(peer_addr, local_udp_port),
+    )
+    .await
+    {
+        Ok(Ok(connection)) => Ok(connection),
+        Ok(Err(error)) => Err(Some(error)),
+        Err(_) => Err(None),
+    }
+}
+
+async fn attempt_tcp_connect(
+    peer_addr: SocketAddr,
+) -> Result<PeerConnection, Option<std::io::Error>> {
+    match timeout(TCP_CONNECT_TIMEOUT, TcpPeerTransport::connect(peer_addr)).await {
+        Ok(Ok(connection)) => Ok(connection),
+        Ok(Err(error)) => Err(Some(error)),
+        Err(_) => Err(None),
+    }
+}
+
+fn log_utp_connect_established(peer_label: &str) {
+    if utp_connect_log_enabled() {
+        event!(
+            Level::INFO,
+            peer = %peer_label,
+            "uTP outbound connect established"
+        );
+    }
+}
+
+fn log_utp_connect_failure(
+    peer_label: &str,
+    error: Option<&std::io::Error>,
+    message: &'static str,
+) {
+    if !utp_connect_log_enabled() {
+        return;
+    }
+
+    match error {
+        Some(error) => event!(
+            Level::INFO,
+            peer = %peer_label,
+            error = %error,
+            "{}",
+            message
+        ),
+        None => event!(
+            Level::INFO,
+            peer = %peer_label,
+            "{}",
+            message
+        ),
     }
 }
 
@@ -154,7 +443,7 @@ pub struct TorrentManager {
     #[allow(dead_code)]
     dht_rx: Receiver<()>,
 
-    incoming_peer_rx: Receiver<(TcpStream, Vec<u8>)>,
+    incoming_peer_rx: Receiver<IncomingPeerSession>,
     manager_command_rx: Receiver<ManagerCommand>,
 
     in_flight_uploads: HashMap<String, HashMap<BlockInfo, JoinHandle<()>>>,
@@ -1881,48 +2170,79 @@ impl TorrentManager {
     }
 
     pub fn connect_to_peer(&mut self, peer_addr: SocketAddr) {
+        self.connect_to_peer_with_key(peer_addr, None);
+    }
+
+    #[cfg(feature = "synthetic-load")]
+    pub fn connect_to_synthetic_peer(&mut self, peer_addr: SocketAddr, peer_key: String) {
+        self.connect_to_peer_with_key(peer_addr, Some(peer_key));
+    }
+
+    fn connect_to_peer_with_key(&mut self, peer_addr: SocketAddr, preferred_key: Option<String>) {
         let _ = self
             .manager_event_tx
             .try_send(ManagerEvent::PeerDiscovered {
                 info_hash: self.state.info_hash.clone(),
             });
 
-        let peer_ip_port = peer_addr.to_string();
+        let outbound_transport_mode = outbound_transport_mode_from_env();
+        let peer_key_candidates = outbound_peer_key_candidates(
+            peer_addr,
+            outbound_transport_mode,
+            preferred_key.as_deref(),
+        );
+        let peer_label = preferred_key.as_deref().unwrap_or_else(|| {
+            peer_key_candidates
+                .first()
+                .map(String::as_str)
+                .unwrap_or("")
+        });
+
         if self.state.torrent_status == TorrentStatus::Done {
-            if let Some(&expires_at) = self.state.known_seeders.get(&peer_ip_port) {
+            if let Some((known_key, expires_at)) = peer_key_candidates.iter().find_map(|key| {
+                self.state
+                    .known_seeders
+                    .get(key)
+                    .copied()
+                    .map(|expires_at| (key.clone(), expires_at))
+            }) {
                 if Instant::now() < expires_at {
                     tracing::debug!(
                         target: "superseedr::peer_filter",
                         event = "skip_known_seeder",
-                        peer = %peer_ip_port,
+                        peer = %known_key,
                         "skipping outbound connect to known seeder"
                     );
                     return;
                 } else {
-                    self.state.known_seeders.remove(&peer_ip_port);
+                    self.state.known_seeders.remove(&known_key);
                     tracing::debug!(
                         target: "superseedr::peer_filter",
                         event = "expired_known_seeder",
-                        peer = %peer_ip_port,
+                        peer = %known_key,
                         "expired known seeder entry before outbound connect"
                     );
                 }
             }
         }
 
-        if let Some((failure_count, next_attempt_time)) =
-            self.state.timed_out_peers.get(&peer_ip_port)
+        if let Some((peer_key, (failure_count, next_attempt_time))) = peer_key_candidates
+            .iter()
+            .find_map(|key| self.state.timed_out_peers.get_key_value(key))
         {
             if Instant::now() < *next_attempt_time {
-                event!(Level::DEBUG, peer = %peer_ip_port, failures = %failure_count, "Ignoring connection attempt, peer is on exponential backoff.");
+                event!(Level::DEBUG, peer = %peer_key, failures = %failure_count, "Ignoring connection attempt, peer is on exponential backoff.");
                 return;
             }
         }
 
-        if self.state.peers.contains_key(&peer_ip_port) {
+        if let Some(existing_key) = peer_key_candidates
+            .iter()
+            .find(|key| self.state.peers.contains_key(key.as_str()))
+        {
             event!(
                 Level::TRACE,
-                peer_ip_port,
+                peer_ip_port = %existing_key,
                 "PEER SESSION ALREADY ESTABLISHED"
             );
             return;
@@ -1936,21 +2256,33 @@ impl TorrentManager {
         let global_ul_bucket_clone = self.global_ul_bucket.clone();
         let info_hash_clone = self.state.info_hash.clone();
         let torrent_metadata_length_clone = self.state.torrent_metadata_length;
-        let peer_ip_port_clone = peer_ip_port.clone();
+        let preferred_key_clone = preferred_key.clone();
+        let failure_peer_key = peer_key_candidates
+            .iter()
+            .find(|key| key.contains("://"))
+            .cloned()
+            .unwrap_or_else(|| peer_addr.to_string());
+        let peer_label = peer_label.to_string();
+        let local_udp_port = self.settings.client_port;
 
         let mut shutdown_rx_permit = self.shutdown_tx.subscribe();
         let mut shutdown_rx_session = self.shutdown_tx.subscribe();
         let shutdown_tx = self.shutdown_tx.clone();
 
-        let (peer_session_tx, peer_session_rx) = mpsc::channel::<TorrentCommand>(1000);
-        self.apply_action(Action::RegisterPeer {
-            peer_id: peer_ip_port.clone(),
-            tx: peer_session_tx,
-        });
         #[cfg(feature = "synthetic-load")]
-        let _ = self
-            .manager_event_tx
-            .try_send(ManagerEvent::PeerConnectAttempted);
+        let first_transport = if outbound_transport_mode.try_utp {
+            PeerTransportKind::Utp
+        } else {
+            PeerTransportKind::Tcp
+        };
+        #[cfg(feature = "synthetic-load")]
+        if !outbound_transport_mode.try_utp {
+            let _ = self
+                .manager_event_tx
+                .try_send(ManagerEvent::PeerConnectAttempted {
+                    transport: PeerTransportKind::Tcp,
+                });
+        }
 
         let bitfield = match self.state.torrent {
             None => None,
@@ -1966,6 +2298,7 @@ impl TorrentManager {
                         Ok(Err(ResourceManagerError::ManagerShutdown)) => {
                             #[cfg(feature = "synthetic-load")]
                             let _ = manager_event_tx_clone.try_send(ManagerEvent::PeerConnectFailed {
+                                transport: first_transport,
                                 reason: SyntheticPeerConnectFailure::PermitManagerShutdown,
                             });
                             None
@@ -1973,6 +2306,7 @@ impl TorrentManager {
                         Ok(Err(ResourceManagerError::QueueFull)) => {
                             #[cfg(feature = "synthetic-load")]
                             let _ = manager_event_tx_clone.try_send(ManagerEvent::PeerConnectFailed {
+                                transport: first_transport,
                                 reason: SyntheticPeerConnectFailure::PermitQueueFull,
                             });
                             None
@@ -1980,6 +2314,7 @@ impl TorrentManager {
                         Err(_) => {
                             #[cfg(feature = "synthetic-load")]
                             let _ = manager_event_tx_clone.try_send(ManagerEvent::PeerConnectFailed {
+                                transport: first_transport,
                                 reason: SyntheticPeerConnectFailure::PermitTimeout,
                             });
                             None
@@ -1989,6 +2324,7 @@ impl TorrentManager {
                 _ = shutdown_rx_permit.recv() => {
                     #[cfg(feature = "synthetic-load")]
                     let _ = manager_event_tx_clone.try_send(ManagerEvent::PeerConnectFailed {
+                        transport: first_transport,
                         reason: SyntheticPeerConnectFailure::PermitManagerShutdown,
                     });
                     None
@@ -1996,14 +2332,65 @@ impl TorrentManager {
             };
 
             if let Some(session_permit) = session_permit {
-                let connection_result =
-                    timeout(Duration::from_secs(2), TcpStream::connect(peer_addr)).await;
+                #[cfg(feature = "synthetic-load")]
+                {
+                    if outbound_transport_mode.try_utp {
+                        let _ =
+                            manager_event_tx_clone.try_send(ManagerEvent::PeerConnectAttempted {
+                                transport: PeerTransportKind::Utp,
+                            });
+                    }
+                    if outbound_transport_mode.try_utp && outbound_transport_mode.allow_tcp {
+                        let _ =
+                            manager_event_tx_clone.try_send(ManagerEvent::PeerConnectAttempted {
+                                transport: PeerTransportKind::Tcp,
+                            });
+                    }
+                }
+
+                let connection_result = connect_outbound_peer(
+                    peer_addr,
+                    local_udp_port,
+                    outbound_transport_mode,
+                    &peer_label,
+                )
+                .await;
 
                 match connection_result {
-                    Ok(Ok(stream)) => {
+                    Ok(connection) => {
                         #[cfg(feature = "synthetic-load")]
                         let _ =
-                            manager_event_tx_clone.try_send(ManagerEvent::PeerConnectEstablished);
+                            manager_event_tx_clone.try_send(ManagerEvent::PeerConnectEstablished {
+                                transport: connection.endpoint.kind,
+                            });
+                        let selected_transport = connection.endpoint.kind;
+                        let peer_session_key = outbound_peer_session_key(
+                            peer_addr,
+                            outbound_transport_mode,
+                            preferred_key_clone,
+                            selected_transport,
+                        );
+                        let (peer_session_tx, peer_session_rx) =
+                            mpsc::channel::<TorrentCommand>(1000);
+                        let _ = torrent_manager_tx_clone
+                            .send(TorrentCommand::RegisterPeer {
+                                peer_id: peer_session_key.clone(),
+                                tx: peer_session_tx,
+                            })
+                            .await;
+                        let _ = torrent_manager_tx_clone
+                            .send(TorrentCommand::PeerTransportSelected {
+                                peer_id: peer_session_key.clone(),
+                                transport: selected_transport,
+                            })
+                            .await;
+                        event!(
+                            Level::TRACE,
+                            peer = %peer_session_key,
+                            transport = %connection.transport_key(),
+                            direction = ?connection.direction,
+                            "peer transport connection established"
+                        );
                         let _held_session_permit = session_permit;
                         let session = PeerSession::new(PeerSessionParameters {
                             info_hash: info_hash_clone.clone(),
@@ -2011,7 +2398,7 @@ impl TorrentManager {
                             connection_type: ConnectionType::Outgoing,
                             torrent_manager_rx: peer_session_rx,
                             torrent_manager_tx: torrent_manager_tx_clone.clone(),
-                            peer_ip_port: peer_ip_port_clone.clone(),
+                            peer_ip_port: peer_session_key.clone(),
                             client_id: client_id_clone.into(),
                             global_dl_bucket: global_dl_bucket_clone,
                             global_ul_bucket: global_ul_bucket_clone,
@@ -2019,15 +2406,24 @@ impl TorrentManager {
                         });
 
                         tokio::select! {
-                            session_result = session.run(stream, Vec::new(), bitfield) => {
+                            session_result = session.run(connection.stream, Vec::new(), bitfield) => {
                                 if let Err(e) = session_result {
                                     #[cfg(feature = "synthetic-load")]
                                     let _ = manager_event_tx_clone
                                         .try_send(ManagerEvent::PeerSessionFailed);
+                                    if utp_connect_log_enabled() {
+                                        event!(
+                                            Level::INFO,
+                                            peer = %peer_session_key,
+                                            transport = %selected_transport,
+                                            error = %e,
+                                            "peer session ended with error over selected transport"
+                                        );
+                                    }
                                     event!(
                                         Level::DEBUG,
                                         "PEER SESSION {}: ENDED IN ERROR: {}",
-                                        &peer_ip_port_clone,
+                                        &peer_session_key,
                                         e
                                     );
                                 }
@@ -2036,37 +2432,35 @@ impl TorrentManager {
                                 event!(
                                     Level::DEBUG,
                                     "PEER SESSION {}: Shutting down due to manager signal.",
-                                    &peer_ip_port_clone
+                                    &peer_session_key
                                 );
                             }
                         }
                     }
-                    Ok(Err(error)) => {
+                    Err((transport, Some(error))) => {
                         #[cfg(feature = "synthetic-load")]
                         let _ = manager_event_tx_clone.try_send(ManagerEvent::PeerConnectFailed {
+                            transport,
                             reason: synthetic_peer_connect_failure(&error),
                         });
                         let _ = torrent_manager_tx_clone
-                            .send(TorrentCommand::UnresponsivePeer(peer_ip_port))
+                            .send(TorrentCommand::UnresponsivePeer(failure_peer_key.clone()))
                             .await;
-                        event!(Level::DEBUG, peer = %peer_ip_port_clone, error = %error, "PEER connection failed");
+                        event!(Level::DEBUG, peer = %peer_label, %transport, error = %error, "PEER connection failed");
                     }
-                    Err(_) => {
+                    Err((transport, None)) => {
                         #[cfg(feature = "synthetic-load")]
                         let _ = manager_event_tx_clone.try_send(ManagerEvent::PeerConnectFailed {
+                            transport,
                             reason: SyntheticPeerConnectFailure::ConnectTimeout,
                         });
                         let _ = torrent_manager_tx_clone
-                            .send(TorrentCommand::UnresponsivePeer(peer_ip_port))
+                            .send(TorrentCommand::UnresponsivePeer(failure_peer_key.clone()))
                             .await;
-                        event!(Level::DEBUG, peer = %peer_ip_port_clone, "PEER connection timed out");
+                        event!(Level::DEBUG, peer = %peer_label, %transport, "PEER connection timed out");
                     }
                 }
             }
-
-            let _ = torrent_manager_tx_clone
-                .send(TorrentCommand::Disconnect(peer_ip_port_clone))
-                .await;
         });
     }
 
@@ -2303,6 +2697,7 @@ impl TorrentManager {
                 };
 
             let number_of_successfully_connected_peers = self.state.peers.len();
+            let transport_counts = count_peers_by_transport(self.state.peers.values());
 
             let eta = if self.state.piece_manager.pieces_remaining == 0 {
                 Duration::from_secs(0)
@@ -2387,6 +2782,10 @@ impl TorrentManager {
                 data_available: self.state.data_available,
                 is_complete: self.state.torrent_status == TorrentStatus::Done,
                 number_of_successfully_connected_peers,
+                tcp_peer_count: transport_counts.tcp_peer_count,
+                utp_peer_count: transport_counts.utp_peer_count,
+                beneficial_tcp_peer_count: transport_counts.beneficial_tcp_peer_count,
+                beneficial_utp_peer_count: transport_counts.beneficial_utp_peer_count,
                 number_of_pieces_total,
                 number_of_pieces_completed,
                 download_speed_bps: smoothed_total_dl_speed,
@@ -2725,6 +3124,10 @@ impl TorrentManager {
                         ManagerCommand::ConnectToPeer(peer_addr) => {
                             self.connect_to_peer(peer_addr);
                         }
+                        #[cfg(feature = "synthetic-load")]
+                        ManagerCommand::ConnectToSyntheticPeer { addr, peer_key } => {
+                            self.connect_to_synthetic_peer(addr, peer_key);
+                        }
                         ManagerCommand::ProbeFileBatch {
                             epoch,
                             start_file_index,
@@ -2796,14 +3199,13 @@ impl TorrentManager {
                     }
                 }
 
-                Some((stream, handshake_response)) = self.incoming_peer_rx.recv(), if !self.state.is_paused => {
+                Some((connection, handshake_response, session_permit)) = self.incoming_peer_rx.recv(), if !self.state.is_paused => {
                     if !self.should_accept_new_peers() {
                         continue;
                     }
                     let _ = self.manager_event_tx.try_send(ManagerEvent::PeerDiscovered { info_hash: self.state.info_hash.clone() });
-                    if let Ok(peer_addr) = stream.peer_addr() {
-
-                        let peer_ip_port = peer_addr.to_string();
+                    {
+                        let peer_ip_port = connection.peer_id();
                         let incoming_hash = &handshake_response[28..48];
 
                         let matches_primary = self.state.info_hash == incoming_hash;
@@ -2852,6 +3254,10 @@ impl TorrentManager {
                             peer_id: peer_ip_port.clone(),
                             tx: peer_session_tx,
                         });
+                        self.apply_action(Action::PeerTransportSelected {
+                            peer_id: peer_ip_port.clone(),
+                            transport: connection.endpoint.kind,
+                        });
 
                         let bitfield = match self.state.torrent {
                             None => None,
@@ -2868,7 +3274,15 @@ impl TorrentManager {
                         let client_id_clone = self.settings.client_id.clone();
 
                         let _ = self.manager_event_tx.try_send(ManagerEvent::PeerConnected { info_hash: self.state.info_hash.clone() });
+                        event!(
+                            Level::TRACE,
+                            peer = %peer_ip_port,
+                            transport = %connection.transport_key(),
+                            direction = ?connection.direction,
+                            "incoming peer transport routed to torrent manager"
+                        );
                         tokio::spawn(async move {
+                            let _held_session_permit = session_permit;
                             let session = PeerSession::new(PeerSessionParameters {
                                 info_hash: session_info_hash, // <--- Corrected Hash passed here
                                 torrent_metadata_length: torrent_metadata_length_clone,
@@ -2883,7 +3297,7 @@ impl TorrentManager {
                             });
 
                             tokio::select! {
-                                session_result = session.run(stream, handshake_response, bitfield) => {
+                                session_result = session.run(connection.stream, handshake_response, bitfield) => {
                                     if let Err(e) = session_result {
                                         event!(Level::ERROR, peer_ip = %peer_ip_port, error = %e, "Incoming peer session ended with error.");
                                     }
@@ -2897,8 +3311,6 @@ impl TorrentManager {
                                 }
                             }
                         });
-                    } else {
-                        event!(Level::DEBUG, "ERROR GETTING PEER ADDRESS FROM STREAM");
                     }
                 }
 
@@ -2928,8 +3340,32 @@ impl TorrentManager {
 
                     match command {
 
-                        TorrentCommand::SuccessfullyConnected(peer_id) => self.apply_action(Action::PeerSuccessfullyConnected { peer_id }),
+                        TorrentCommand::SuccessfullyConnected(peer_id) => {
+                            if utp_connect_log_enabled() {
+                                if let Some(peer) = self.state.peers.get(&peer_id) {
+                                    event!(
+                                        Level::INFO,
+                                        peer = %peer_id,
+                                        transport = %peer.transport_kind,
+                                        "BitTorrent peer session established over selected transport"
+                                    );
+                                } else {
+                                    event!(
+                                        Level::INFO,
+                                        peer = %peer_id,
+                                        "BitTorrent peer session established before peer state was registered"
+                                    );
+                                }
+                            }
+                            self.apply_action(Action::PeerSuccessfullyConnected { peer_id })
+                        },
                         TorrentCommand::PeerId(addr, id) => self.apply_action(Action::UpdatePeerId { peer_addr: addr, new_id: id }),
+                        TorrentCommand::RegisterPeer { peer_id, tx } => {
+                            self.apply_action(Action::RegisterPeer { peer_id, tx })
+                        },
+                        TorrentCommand::PeerTransportSelected { peer_id, transport } => {
+                            self.apply_action(Action::PeerTransportSelected { peer_id, transport })
+                        },
 
                         TorrentCommand::MerkleHashData { peer_id, root, piece_index, proof, .. } => {
                             if let Some(torrent) = &self.state.torrent {
@@ -3203,6 +3639,123 @@ mod tests {
     use std::time::{Duration, Instant};
     use tokio::sync::{broadcast, mpsc, watch};
 
+    #[test]
+    fn tcp_transport_mode_disables_utp() {
+        assert_eq!(
+            outbound_transport_mode(PeerTransportMode::Tcp),
+            OutboundTransportMode {
+                try_utp: false,
+                allow_tcp: true,
+            }
+        );
+    }
+
+    #[test]
+    fn utp_transport_mode_disables_tcp_fallback() {
+        assert_eq!(
+            outbound_transport_mode(PeerTransportMode::Utp),
+            OutboundTransportMode {
+                try_utp: true,
+                allow_tcp: false,
+            }
+        );
+    }
+
+    #[test]
+    fn all_transport_mode_keeps_tcp_fallback() {
+        assert_eq!(
+            outbound_transport_mode(PeerTransportMode::All),
+            OutboundTransportMode {
+                try_utp: true,
+                allow_tcp: true,
+            }
+        );
+    }
+
+    #[test]
+    fn outbound_peer_key_candidates_include_transport_variants() {
+        let peer_addr: SocketAddr = "127.0.0.1:6881".parse().unwrap();
+        let keys = outbound_peer_key_candidates(
+            peer_addr,
+            outbound_transport_mode(PeerTransportMode::All),
+            None,
+        );
+
+        assert!(keys.contains(&"tcp://127.0.0.1:6881".to_string()));
+        assert!(keys.contains(&"utp://127.0.0.1:6881".to_string()));
+        assert!(keys.contains(&"127.0.0.1:6881".to_string()));
+        assert_eq!(
+            outbound_peer_session_key(
+                peer_addr,
+                outbound_transport_mode(PeerTransportMode::All),
+                None,
+                PeerTransportKind::Tcp,
+            ),
+            "tcp://127.0.0.1:6881"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_transport_mode_races_tcp_fallback() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let accept_task = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let started_at = Instant::now();
+        let connection = connect_outbound_peer(
+            peer_addr,
+            0,
+            OutboundTransportMode {
+                try_utp: true,
+                allow_tcp: true,
+            },
+            "127.0.0.1:0",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(connection.endpoint.kind, PeerTransportKind::Tcp);
+        assert!(
+            started_at.elapsed() < Duration::from_secs(1),
+            "TCP fallback should not wait for the uTP connect timeout"
+        );
+
+        drop(connection);
+        accept_task.await.unwrap();
+    }
+
+    #[test]
+    fn counts_transport_peers_and_payload_movers() {
+        let (tx, _rx) = mpsc::channel(1);
+        let now = Instant::now();
+
+        let mut useful_tcp = PeerState::new("127.0.0.1:6881".to_string(), tx.clone(), now);
+        useful_tcp.total_bytes_downloaded = 16;
+
+        let mut useful_utp = PeerState::new("127.0.0.1:6882".to_string(), tx.clone(), now);
+        useful_utp.transport_kind = PeerTransportKind::Utp;
+        useful_utp.total_bytes_uploaded = 16;
+
+        let mut idle_utp = PeerState::new("127.0.0.1:6883".to_string(), tx, now);
+        idle_utp.transport_kind = PeerTransportKind::Utp;
+
+        let peers = [&useful_tcp, &useful_utp, &idle_utp];
+        let counts = count_peers_by_transport(peers.into_iter());
+
+        assert_eq!(
+            counts,
+            TransportPeerCounts {
+                tcp_peer_count: 1,
+                utp_peer_count: 2,
+                beneficial_tcp_peer_count: 1,
+                beneficial_utp_peer_count: 1,
+            }
+        );
+    }
+
     #[tokio::test]
     async fn test_manager_event_loop_throughput() {
         let (_incoming_peer_tx, incoming_peer_rx) = mpsc::channel(1000);
@@ -3250,7 +3803,7 @@ mod tests {
             manager_command_rx,
             manager_event_tx,
             settings,
-            resource_manager: resource_manager_client,
+            resource_manager: resource_manager_client.clone(),
             global_dl_bucket: dl_bucket,
             global_ul_bucket: ul_bucket,
             file_priorities: HashMap::new(),
@@ -3465,6 +4018,92 @@ mod resource_tests {
             global_ul_bucket: Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY)),
             file_priorities: HashMap::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn incoming_utp_connection_counts_as_utp_peer() {
+        let (incoming_tx, incoming_peer_rx) = mpsc::channel(4);
+        let (manager_command_tx, manager_command_rx) = mpsc::channel(4);
+        let (manager_event_tx, _manager_event_rx) = mpsc::channel(16);
+        let (metrics_tx, mut metrics_rx) = watch::channel(TorrentMetrics::default());
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let settings = Arc::new(Settings::default());
+        let temp_dir =
+            std::env::temp_dir().join(format!("superseedr_incoming_utp_{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let mut limits = HashMap::new();
+        limits.insert(ResourceType::PeerConnection, (1000, 1000));
+        limits.insert(ResourceType::DiskRead, (1000, 1000));
+        limits.insert(ResourceType::DiskWrite, (1000, 1000));
+        limits.insert(ResourceType::Reserve, (0, 0));
+
+        let (resource_manager, resource_manager_client) =
+            ResourceManager::new(limits, shutdown_tx.clone());
+        let resource_handle = tokio::spawn(resource_manager.run());
+        let params = TorrentParameters {
+            dht_handle: build_test_dht_handle(),
+            incoming_peer_rx,
+            metrics_tx,
+            torrent_validation_status: false,
+            torrent_data_path: Some(temp_dir.clone()),
+            container_name: None,
+            manager_command_rx,
+            manager_event_tx,
+            settings,
+            resource_manager: resource_manager_client.clone(),
+            global_dl_bucket: Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY)),
+            global_ul_bucket: Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY)),
+            file_priorities: HashMap::new(),
+        };
+
+        let manager =
+            TorrentManager::from_torrent(params, create_dummy_torrent(1)).expect("manager");
+        let info_hash = manager.state.info_hash.clone();
+        let run_task = tokio::spawn(async move { manager.run(false).await });
+        manager_command_tx
+            .send(ManagerCommand::SetDataRate(10))
+            .await
+            .unwrap();
+
+        let peer_addr: SocketAddr = "127.0.0.1:50123".parse().unwrap();
+        let (stream, _peer_side) = tokio::io::duplex(128);
+        let mut handshake_response = vec![0_u8; 68];
+        handshake_response[28..48].copy_from_slice(&info_hash);
+        let connection = PeerConnection::new(
+            stream,
+            crate::networking::transport::PeerEndpoint::utp(peer_addr),
+            peer_addr,
+            crate::networking::transport::PeerConnectionDirection::Incoming,
+        );
+        let permit = resource_manager_client
+            .acquire_peer_connection()
+            .await
+            .expect("incoming peer permit");
+        incoming_tx
+            .send((connection, handshake_response, permit))
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                metrics_rx.changed().await.unwrap();
+                let metrics = metrics_rx.borrow().clone();
+                if metrics.utp_peer_count == 1 && metrics.tcp_peer_count == 0 {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("inbound uTP peer should be counted as uTP");
+
+        manager_command_tx
+            .send(ManagerCommand::Shutdown)
+            .await
+            .unwrap();
+        run_task.await.unwrap().unwrap();
+        resource_handle.abort();
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[cfg(feature = "dht")]
@@ -3961,13 +4600,16 @@ mod resource_tests {
         manager.state.accepting_new_peers = true;
 
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let peer_id = addr.to_string();
 
         manager.handle_effect(Effect::ConnectToPeer { addr });
 
         assert!(
-            manager.state.peers.contains_key(&peer_id),
-            "peer admission guard should allow new outgoing peers when open"
+            manager.state.accepting_new_peers,
+            "peer admission guard should remain open for outgoing peers"
+        );
+        assert!(
+            manager.state.peers.is_empty(),
+            "outgoing peers are registered only after transport connection succeeds"
         );
     }
 

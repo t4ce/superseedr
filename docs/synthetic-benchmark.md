@@ -15,6 +15,10 @@ The harness is intended for engineering validation:
 It is not part of the default production build. Build with
 `--features synthetic-load` to expose these commands.
 
+Use `--transport tcp`, `--transport utp`, or `--transport all` to force the
+synthetic peer transport mode. The default is `all`, matching the normal runtime
+behavior where TCP and uTP are both enabled.
+
 ## Benchmark Mode
 
 `benchmark` is the high-level adaptive wrapper around the lower-level synthetic
@@ -67,6 +71,40 @@ cargo run --release --features synthetic-load -- --json benchmark \
   --max-torrents 1000 \
   --max-peers 100000
 ```
+
+## uTP Chaos Mode
+
+Synthetic runs can inject deterministic UDP faults into the uTP path. Use this
+after a clean stress baseline so capacity limits are not confused with protocol
+correctness bugs.
+
+Fault rates are expressed in packets per million. The active chaos settings are
+recorded in `utp_chaos` in the JSON summary so a failing run can be repeated
+with the same seed.
+
+Example:
+
+```bash
+cargo run --release --features synthetic-load -- benchmark \
+  --transport utp \
+  --start-torrents 4 \
+  --start-peers 64 \
+  --max-torrents 4 \
+  --max-peers 64 \
+  --max-steps 1 \
+  --duration-secs 60 \
+  --warmup-secs 5 \
+  --utp-chaos-seed 42 \
+  --utp-chaos-loss-ppm 1000 \
+  --utp-chaos-duplicate-ppm 1000 \
+  --utp-chaos-reorder-ppm 5000 \
+  --utp-chaos-max-delay-ms 100 \
+  --out tmp/utp-chaos
+```
+
+Start with delay, duplicate, and reorder. Add loss once the baseline is stable.
+Use corruption separately because malformed payloads are expected to produce
+bounded protocol errors rather than clean throughput.
 
 ## Disk Budget
 
@@ -173,6 +211,7 @@ tmp/synthetic-benchmark/benchmark_YYYYMMDD_HHMMSS/
 
 Useful summary fields:
 
+- `utp_chaos`
 - `report.runtime_secs`
 - `report.steps_run`
 - `report.retry_attempts`

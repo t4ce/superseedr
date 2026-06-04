@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: 2025 The superseedr Contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+keepalive="\x00\x00\x00\x00"
+len_one="\x00\x00\x00\x01"
+len_five="\x00\x00\x00\x05"
+len_thirteen="\x00\x00\x00\x0d"
+choke="\x00"
+unchoke="\x01"
+interested="\x02"
+not_interested="\x03"
+have="\x04"
+bitfield="\x05"
+request="\x06"
+piece="\x07"
+cancel="\x08"
+port="\x09"
+extended="\x14"
+hash_request="\x15"
+hash_piece="\x16"
+hash_reject="\x17"

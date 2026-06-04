@@ -7,7 +7,9 @@ use ratatui::{prelude::*, widgets::*};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::app::{AppMode, AppState};
-use crate::tui::formatters::{centered_rect, format_limit_bps, format_speed};
+use crate::tui::formatters::{
+    auto_download_limit_applied, centered_rect, format_limit_bps, format_speed,
+};
 use crate::tui::screen_context::ScreenContext;
 use crate::tui::view::calculate_player_stats;
 use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
@@ -97,6 +99,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     let ul_speed = *app_state.avg_upload_history.last().unwrap_or(&0);
     let dl_limit = app_state.effective_download_limit_bps;
     let ul_limit = settings.global_upload_limit_bps;
+    let dl_auto_limited = auto_download_limit_applied(settings.global_download_limit_bps, dl_limit);
     let (level, level_progress) = calculate_player_stats(app_state);
     let level_filled_len = (level_progress * LEVEL_GAUGE_WIDTH as f64).round() as usize;
     let level_empty_len = LEVEL_GAUGE_WIDTH.saturating_sub(level_filled_len);
@@ -133,7 +136,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
         ),
         Span::raw(" / "),
     ];
-    if dl_limit > 0 && dl_speed >= dl_limit {
+    if dl_auto_limited || (dl_limit > 0 && dl_speed >= dl_limit) {
         dl_spans.push(Span::styled(
             format_limit_bps(dl_limit),
             ctx.apply(Style::default().fg(ctx.state_error())),

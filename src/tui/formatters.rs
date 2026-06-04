@@ -265,11 +265,19 @@ pub fn format_countdown(duration: Duration) -> String {
 }
 
 pub fn format_limit_bps(bps: u64) -> String {
-    if bps == 0 {
+    if crate::config::is_unlimited_rate_limit_bps(bps) {
         "Unlimited".to_string()
     } else {
         format_speed(bps)
     }
+}
+
+pub fn auto_download_limit_applied(
+    configured_download_limit_bps: u64,
+    effective_download_limit_bps: u64,
+) -> bool {
+    effective_download_limit_bps > 0
+        && effective_download_limit_bps != configured_download_limit_bps
 }
 
 pub fn format_graph_time_label(duration_secs: usize) -> String {
@@ -408,4 +416,21 @@ pub fn sanitize_text(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_control() { '?' } else { c })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_download_limit_applied_detects_effective_auto_cap() {
+        assert!(auto_download_limit_applied(0, 500_000_000));
+        assert!(auto_download_limit_applied(800_000_000, 500_000_000));
+    }
+
+    #[test]
+    fn auto_download_limit_applied_keeps_unlimited_and_configured_caps_normal() {
+        assert!(!auto_download_limit_applied(0, 0));
+        assert!(!auto_download_limit_applied(500_000_000, 500_000_000));
+    }
 }

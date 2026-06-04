@@ -6,16 +6,17 @@ use super::krpc::{
     KrpcQueryEnvelope, KrpcQueryKind, KrpcResponseBody, KrpcResponseEnvelope,
 };
 use super::types::{AddressFamily, InfoHash, NodeId, TransactionId};
+use crate::networking::shared_udp::{
+    SharedUdpDatagram, SharedUdpFamily, SharedUdpHandle, SharedUdpProtocol,
+};
 use serde::Serialize;
-use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::HashMap;
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
-use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
@@ -137,7 +138,7 @@ impl Drop for InflightQueryGuard {
 #[derive(Debug)]
 struct TransportActorInner {
     config: TransportConfig,
-    socket: Arc<UdpSocket>,
+    udp: SharedUdpHandle,
     inflight_queries: Arc<StdMutex<HashMap<TransactionId, InflightQuery>>>,
     next_transaction_id: AtomicU32,
     event_tx: mpsc::UnboundedSender<TransportEvent>,
@@ -161,7 +162,8 @@ impl TransportActor {
         mut config: TransportConfig,
     ) -> io::Result<(Self, mpsc::UnboundedReceiver<TransportEvent>)> {
         config.bind_addr = normalize_bind_addr(config.bind_addr, config.family);
-        let socket = Arc::new(bind_udp_socket(config.bind_addr, config.family)?);
+        let udp = SharedUdpHandle::bind(config.bind_addr, shared_udp_family(config.family)).await?;
+        let datagram_rx = udp.subscribe(SharedUdpProtocol::Dht)?;
         let inflight_queries = Arc::new(StdMutex::new(HashMap::new()));
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -169,7 +171,7 @@ impl TransportActor {
         let actor = Self {
             inner: Arc::new(TransportActorInner {
                 config,
-                socket: socket.clone(),
+                udp,
                 inflight_queries: inflight_queries.clone(),
                 next_transaction_id: AtomicU32::new(rand::random::<u32>()),
                 event_tx,
@@ -179,11 +181,10 @@ impl TransportActor {
         };
 
         let receive_task = Self::spawn_receive_loop(
-            actor.inner.socket.clone(),
+            datagram_rx,
             actor.inner.inflight_queries.clone(),
             actor.inner.event_tx.clone(),
             actor.inner.config.source_validation,
-            actor.inner.config.socket_buffer,
             shutdown_rx,
         );
         *actor
@@ -204,7 +205,7 @@ impl TransportActor {
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.socket.local_addr()
+        self.inner.udp.local_addr()
     }
 
     pub fn inflight_query_count(&self) -> usize {
@@ -221,7 +222,7 @@ impl TransportActor {
     {
         let payload = serde_bencode::to_bytes(message)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        self.inner.socket.send_to(&payload, target).await
+        self.inner.udp.send_to(&payload, target).await
     }
 
     pub async fn send_response(
@@ -359,7 +360,7 @@ impl TransportActor {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, error));
                 }
             };
-        if let Err(error) = self.inner.socket.send_to(&payload, target).await {
+        if let Err(error) = self.inner.udp.send_to(&payload, target).await {
             self.cancel_inflight_query(transaction_id);
             return Err(error);
         }
@@ -429,18 +430,17 @@ impl TransportActor {
         if let Some(receive_task) = receive_task {
             let _ = receive_task.await;
         }
+        self.inner.udp.close_if_unused().await;
     }
 
     fn spawn_receive_loop(
-        socket: Arc<UdpSocket>,
+        mut datagram_rx: mpsc::Receiver<SharedUdpDatagram>,
         inflight_queries: Arc<StdMutex<HashMap<TransactionId, InflightQuery>>>,
         event_tx: mpsc::UnboundedSender<TransportEvent>,
         source_validation: SourceValidationMode,
-        socket_buffer: usize,
         mut shutdown_rx: watch::Receiver<bool>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
-            let mut buffer = vec![0u8; socket_buffer.max(1)];
             loop {
                 tokio::select! {
                     changed = shutdown_rx.changed() => {
@@ -448,27 +448,24 @@ impl TransportActor {
                             break;
                         }
                     }
-                    result = socket.recv_from(&mut buffer) => {
-                        let (len, source_addr) = match result {
-                            Ok(result) => result,
-                            Err(error) if is_transient_udp_recv_error(&error) => continue,
-                            Err(_) => break,
+                    datagram = datagram_rx.recv() => {
+                        let Some(datagram) = datagram else {
+                            break;
                         };
-
-                        let Ok(message) = decode_message(&buffer[..len]) else {
+                        let Ok(message) = decode_message(&datagram.payload) else {
                             continue;
                         };
                         match message {
                             super::krpc::KrpcInboundMessage::Query(query) => {
                                 let _ = event_tx.send(TransportEvent::Query {
-                                    source: source_addr,
+                                    source: datagram.source,
                                     query,
                                 });
                             }
                             super::krpc::KrpcInboundMessage::Response(response) => {
                                 let reply = TransportReply::Response(response);
                                 handle_reply(
-                                    source_addr,
+                                    datagram.source,
                                     reply,
                                     &inflight_queries,
                                     &event_tx,
@@ -478,7 +475,7 @@ impl TransportActor {
                             super::krpc::KrpcInboundMessage::Error(error) => {
                                 let reply = TransportReply::Error(error);
                                 handle_reply(
-                                    source_addr,
+                                    datagram.source,
                                     reply,
                                     &inflight_queries,
                                     &event_tx,
@@ -561,36 +558,20 @@ fn normalize_bind_addr(bind_addr: SocketAddr, family: AddressFamily) -> SocketAd
     }
 }
 
-fn bind_udp_socket(bind_addr: SocketAddr, family: AddressFamily) -> io::Result<UdpSocket> {
-    let domain = match family {
-        AddressFamily::Ipv4 => Domain::IPV4,
-        AddressFamily::Ipv6 => Domain::IPV6,
-    };
-    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-    if matches!(family, AddressFamily::Ipv6) {
-        socket.set_only_v6(true)?;
+fn shared_udp_family(family: AddressFamily) -> SharedUdpFamily {
+    match family {
+        AddressFamily::Ipv4 => SharedUdpFamily::Ipv4,
+        AddressFamily::Ipv6 => SharedUdpFamily::Ipv6,
     }
-    socket.bind(&SockAddr::from(bind_addr))?;
-    socket.set_nonblocking(true)?;
-    let std_socket: StdUdpSocket = socket.into();
-    UdpSocket::from_std(std_socket)
-}
-
-fn is_transient_udp_recv_error(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::ConnectionReset
-            | io::ErrorKind::ConnectionRefused
-            | io::ErrorKind::ConnectionAborted
-            | io::ErrorKind::Interrupted
-            | io::ErrorKind::TimedOut
-    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::networking::UtpPeerTransport;
     use std::net::IpAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UdpSocket;
 
     #[tokio::test]
     async fn ipv6_transport_bind_is_v6_only_for_shared_dht_port() {
@@ -620,6 +601,53 @@ mod tests {
             Err(error) if ipv6_bind_unavailable(&error) => {}
             Err(error) => panic!("IPv6 wildcard bind should coexist with IPv4: {error}"),
         }
+    }
+
+    #[tokio::test]
+    async fn dht_and_utp_share_udp_port() {
+        let (transport, mut events) = TransportActor::bind(TransportConfig {
+            family: AddressFamily::Ipv4,
+            bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            ..TransportConfig::default()
+        })
+        .await
+        .expect("bind DHT transport");
+        let port = transport.local_addr().expect("DHT local addr").port();
+        let listener = UtpPeerTransport::bind_listener(port)
+            .await
+            .expect("bind uTP listener on DHT port");
+        let shared_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+
+        let dht_sender = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .unwrap();
+        let query = KrpcQueryEnvelope::new(
+            TransactionId::from([1, 2, 3, 4]),
+            KrpcQueryKind::Ping,
+            KrpcPingArgs::new(NodeId::from([7; 20])),
+        );
+        let payload = serde_bencode::to_bytes(&query).unwrap();
+        dht_sender.send_to(&payload, shared_addr).await.unwrap();
+
+        let accept_task = tokio::spawn(async move {
+            let mut connection = listener.accept().await.unwrap();
+            let mut payload = [0_u8; 4];
+            connection.stream.read_exact(&mut payload).await.unwrap();
+            assert_eq!(&payload, b"ping");
+            connection.stream.write_all(b"pong").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        let mut client = UtpPeerTransport::connect(shared_addr).await.unwrap();
+        client.stream.write_all(b"ping").await.unwrap();
+        let mut echoed = [0_u8; 4];
+        client.stream.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"pong");
+
+        let event = events.recv().await.expect("DHT event");
+        assert!(matches!(event, TransportEvent::Query { .. }));
+        accept_task.await.unwrap();
+        transport.shutdown().await;
     }
 
     fn ipv6_bind_unavailable(error: &io::Error) -> bool {

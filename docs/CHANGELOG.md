@@ -1,5 +1,21 @@
 # Changelog
 
+## Release v1.0.8
+### New Features
+- **TCP + uTP Peer Transport**: Enabled production peer transport over both TCP and uTP by default, with TCP fallback when uTP is slow or unreachable.
+- **Per-User Windows Installer**: Added a no-admin Windows installer path with user-level PATH setup, Start Menu shortcuts, and magnet and `.torrent` file associations.
+- **Transport Validation Tooling**: Added transport-specific benchmark modes, deterministic uTP chaos controls, fuzz harnesses, and interoperability lab coverage to exercise peer behavior under stress.
+
+### Improvements
+- **uTP Stability and Throughput**: Tuned congestion control, ACK behavior, outbound connection handling, and shared UDP routing for more reliable uTP sessions.
+- **Automatic Limit Visibility**: The TUI now highlights effective automatic download caps so disk backpressure and self-tuning behavior are easier to understand at a glance.
+- **Benchmark and CLI Controls**: Documented runtime peer transport controls and added benchmark transport selection so operators can compare TCP, uTP, and mixed runs directly.
+
+### Bug Fixes
+- **Disk Backpressure Recovery**: Cleared stale disk-pressure throttles and pending write-latency state after failed writes so old signals do not keep limiting downloads.
+- **Transport Fallback Reliability**: Hardened TCP/uTP parity, outbound uTP congestion handling, and mixed-transport connection paths so peers recover more predictably from degraded routes.
+- **Logging Fallback Handling**: Improved file-logging setup fallback and runtime error reporting so diagnostics remain available when log files cannot be opened.
+
 ## Release v1.0.7
 ### New Features
 - **Synthetic Benchmark Harness**: Added feature-gated benchmark tooling for local download, upload, and swarm capacity testing, with adaptive step sizing, JSON summaries, ETA reporting, and generated run artifacts; see [`docs/synthetic-benchmark.md`](synthetic-benchmark.md).

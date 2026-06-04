@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: 2025 The superseedr Contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+zero="\x00"
+one="\x01"
+max_u32="\xff\xff\xff\xff"
+block_16k="\x00\x00\x40\x00"
+extended_handshake="\x00"
+metadata_piece="\x02"

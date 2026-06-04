@@ -15,6 +15,9 @@ use ratatui::prelude::{Frame, Line, Span, Style};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use tokio::sync::mpsc;
 
+const RATE_LIMIT_STEP_BPS: u64 = 10_000 * 8;
+const UNLIMITED_RATE_LIMIT_BPS: u64 = crate::config::UNLIMITED_RATE_LIMIT_BPS;
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConfigAction {
     SaveAndExit,
@@ -57,6 +60,26 @@ pub struct ConfigReduceResult {
 fn shared_path_is_manual(item: ConfigItem) -> bool {
     crate::config::is_shared_config_mode() && item == ConfigItem::DefaultDownloadFolder
 }
+
+fn increase_rate_limit_bps(current: u64) -> u64 {
+    match current {
+        0 => UNLIMITED_RATE_LIMIT_BPS,
+        UNLIMITED_RATE_LIMIT_BPS => RATE_LIMIT_STEP_BPS,
+        _ => current.saturating_add(RATE_LIMIT_STEP_BPS),
+    }
+}
+
+fn decrease_rate_limit_bps(current: u64) -> u64 {
+    match current {
+        0 => 0,
+        UNLIMITED_RATE_LIMIT_BPS => 0,
+        _ => current
+            .checked_sub(RATE_LIMIT_STEP_BPS)
+            .filter(|new_rate| *new_rate > 0)
+            .unwrap_or(UNLIMITED_RATE_LIMIT_BPS),
+    }
+}
+
 fn map_key_to_config_action(
     key_code: KeyCode,
     editing: &Option<(ConfigItem, String)>,
@@ -178,19 +201,14 @@ pub fn reduce_config_action(
         ConfigAction::IncreaseSelected => {
             result.consumed = true;
             let item = items[*selected_index];
-            let increment = 10_000 * 8;
             match item {
                 ConfigItem::GlobalDownloadLimit => {
-                    let new_rate = settings_edit
-                        .global_download_limit_bps
-                        .saturating_add(increment);
+                    let new_rate = increase_rate_limit_bps(settings_edit.global_download_limit_bps);
                     settings_edit.global_download_limit_bps = new_rate;
                     result.effects.push(ConfigEffect::SetDownloadRate(new_rate));
                 }
                 ConfigItem::GlobalUploadLimit => {
-                    let new_rate = settings_edit
-                        .global_upload_limit_bps
-                        .saturating_add(increment);
+                    let new_rate = increase_rate_limit_bps(settings_edit.global_upload_limit_bps);
                     settings_edit.global_upload_limit_bps = new_rate;
                     result.effects.push(ConfigEffect::SetUploadRate(new_rate));
                 }
@@ -200,19 +218,14 @@ pub fn reduce_config_action(
         ConfigAction::DecreaseSelected => {
             result.consumed = true;
             let item = items[*selected_index];
-            let decrement = 10_000 * 8;
             match item {
                 ConfigItem::GlobalDownloadLimit => {
-                    let new_rate = settings_edit
-                        .global_download_limit_bps
-                        .saturating_sub(decrement);
+                    let new_rate = decrease_rate_limit_bps(settings_edit.global_download_limit_bps);
                     settings_edit.global_download_limit_bps = new_rate;
                     result.effects.push(ConfigEffect::SetDownloadRate(new_rate));
                 }
                 ConfigItem::GlobalUploadLimit => {
-                    let new_rate = settings_edit
-                        .global_upload_limit_bps
-                        .saturating_sub(decrement);
+                    let new_rate = decrease_rate_limit_bps(settings_edit.global_upload_limit_bps);
                     settings_edit.global_upload_limit_bps = new_rate;
                     result.effects.push(ConfigEffect::SetUploadRate(new_rate));
                 }
@@ -520,6 +533,76 @@ mod tests {
         assert_eq!(editing, None);
         assert_eq!(out.effects.len(), 1);
         assert!(matches!(out.effects[0], ConfigEffect::SetDownloadRate(123)));
+    }
+
+    #[test]
+    fn reducer_rate_limit_arrows_keep_unlimited_as_sentinel() {
+        let mut settings = Box::new(Settings::default());
+        let mut idx = 3usize;
+        let mut items = config_items();
+        let mut editing = None;
+
+        let out = reduce_config_action(
+            ConfigAction::IncreaseSelected,
+            &mut settings,
+            &mut idx,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+        assert_eq!(settings.global_download_limit_bps, RATE_LIMIT_STEP_BPS);
+        assert!(matches!(
+            out.effects.as_slice(),
+            [ConfigEffect::SetDownloadRate(RATE_LIMIT_STEP_BPS)]
+        ));
+
+        let out = reduce_config_action(
+            ConfigAction::DecreaseSelected,
+            &mut settings,
+            &mut idx,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+        assert_eq!(settings.global_download_limit_bps, UNLIMITED_RATE_LIMIT_BPS);
+        assert!(matches!(
+            out.effects.as_slice(),
+            [ConfigEffect::SetDownloadRate(UNLIMITED_RATE_LIMIT_BPS)]
+        ));
+
+        let out = reduce_config_action(
+            ConfigAction::DecreaseSelected,
+            &mut settings,
+            &mut idx,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+        assert_eq!(settings.global_download_limit_bps, 0);
+        assert!(matches!(
+            out.effects.as_slice(),
+            [ConfigEffect::SetDownloadRate(0)]
+        ));
+    }
+
+    #[test]
+    fn reducer_upload_rate_decrease_from_small_cap_returns_to_unlimited() {
+        let mut settings = Box::new(Settings::default());
+        settings.global_upload_limit_bps = RATE_LIMIT_STEP_BPS / 2;
+        let mut idx = 4usize;
+        let mut items = config_items();
+        let mut editing = None;
+
+        let out = reduce_config_action(
+            ConfigAction::DecreaseSelected,
+            &mut settings,
+            &mut idx,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+
+        assert_eq!(settings.global_upload_limit_bps, UNLIMITED_RATE_LIMIT_BPS);
+        assert!(matches!(
+            out.effects.as_slice(),
+            [ConfigEffect::SetUploadRate(UNLIMITED_RATE_LIMIT_BPS)]
+        ));
     }
 
     #[test]

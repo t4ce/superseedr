@@ -28,6 +28,8 @@ WORKDIR /app
 # 4. Copy source files
 COPY Cargo.toml Cargo.lock ./
 COPY ./src ./src
+COPY ./fuzz/Cargo.toml ./fuzz/Cargo.toml
+COPY ./fuzz/fuzz_targets ./fuzz/fuzz_targets
 
 # 5. Fix for OpenSSL Cross-Compilation
 # [CRITICAL FIX] The openssl-sys crate is paranoid. It detects cross-compilation

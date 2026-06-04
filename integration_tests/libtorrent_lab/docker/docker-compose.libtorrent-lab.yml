@@ -1,0 +1,145 @@
+services:
+  tracker:
+    image: superseedr-libtorrent-lab-peer:bookworm
+    working_dir: /app
+    entrypoint: ["python3", "tracker.py"]
+    volumes:
+      - ${LIBTORRENT_LAB_TRACKER_SCRIPT_PATH}:/app/tracker.py:ro
+    ports:
+      - "127.0.0.1:${LIBTORRENT_LAB_TRACKER_PORT:-26969}:6969"
+
+  libtorrent_seed:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.peer
+    image: superseedr-libtorrent-lab-peer:bookworm
+    init: true
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - LIBTORRENT_LAB_CONFIG=/config/peer.json
+    volumes:
+      - ${LIBTORRENT_LAB_FIXTURES_PATH}:/fixtures:ro
+      - ${LIBTORRENT_LAB_SEED_DATA_PATH}:/data
+      - ${LIBTORRENT_LAB_SEED_CONFIG_PATH}:/config:ro
+      - ${LIBTORRENT_LAB_SEED_ARTIFACTS_PATH}:/artifacts
+    depends_on:
+      - tracker
+
+  libtorrent_seed_2:
+    image: superseedr-libtorrent-lab-peer:bookworm
+    init: true
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - LIBTORRENT_LAB_CONFIG=/config/peer.json
+    volumes:
+      - ${LIBTORRENT_LAB_FIXTURES_PATH}:/fixtures:ro
+      - ${LIBTORRENT_LAB_SEED_DATA_PATH_2}:/data
+      - ${LIBTORRENT_LAB_SEED_CONFIG_PATH_2}:/config:ro
+      - ${LIBTORRENT_LAB_SEED_ARTIFACTS_PATH_2}:/artifacts
+    depends_on:
+      - tracker
+
+  libtorrent_seed_3:
+    image: superseedr-libtorrent-lab-peer:bookworm
+    init: true
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - LIBTORRENT_LAB_CONFIG=/config/peer.json
+    volumes:
+      - ${LIBTORRENT_LAB_FIXTURES_PATH}:/fixtures:ro
+      - ${LIBTORRENT_LAB_SEED_DATA_PATH_3}:/data
+      - ${LIBTORRENT_LAB_SEED_CONFIG_PATH_3}:/config:ro
+      - ${LIBTORRENT_LAB_SEED_ARTIFACTS_PATH_3}:/artifacts
+    depends_on:
+      - tracker
+
+  libtorrent_leech:
+    image: superseedr-libtorrent-lab-peer:bookworm
+    init: true
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - LIBTORRENT_LAB_CONFIG=/config/peer.json
+    volumes:
+      - ${LIBTORRENT_LAB_FIXTURES_PATH}:/fixtures:ro
+      - ${LIBTORRENT_LAB_LEECH_DATA_PATH}:/data
+      - ${LIBTORRENT_LAB_LEECH_CONFIG_PATH}:/config:ro
+      - ${LIBTORRENT_LAB_LEECH_ARTIFACTS_PATH}:/artifacts
+    depends_on:
+      - tracker
+
+  libtorrent_leech_2:
+    image: superseedr-libtorrent-lab-peer:bookworm
+    init: true
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - LIBTORRENT_LAB_CONFIG=/config/peer.json
+    volumes:
+      - ${LIBTORRENT_LAB_FIXTURES_PATH}:/fixtures:ro
+      - ${LIBTORRENT_LAB_LEECH_DATA_PATH_2}:/data
+      - ${LIBTORRENT_LAB_LEECH_CONFIG_PATH_2}:/config:ro
+      - ${LIBTORRENT_LAB_LEECH_ARTIFACTS_PATH_2}:/artifacts
+    depends_on:
+      - tracker
+
+  libtorrent_leech_3:
+    image: superseedr-libtorrent-lab-peer:bookworm
+    init: true
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - LIBTORRENT_LAB_CONFIG=/config/peer.json
+    volumes:
+      - ${LIBTORRENT_LAB_FIXTURES_PATH}:/fixtures:ro
+      - ${LIBTORRENT_LAB_LEECH_DATA_PATH_3}:/data
+      - ${LIBTORRENT_LAB_LEECH_CONFIG_PATH_3}:/config:ro
+      - ${LIBTORRENT_LAB_LEECH_ARTIFACTS_PATH_3}:/artifacts
+    depends_on:
+      - tracker
+
+  superseedr_seed:
+    build:
+      context: ../../..
+      dockerfile: integration_tests/libtorrent_lab/docker/Dockerfile.superseedr
+    image: superseedr:libtorrent-lab
+    tty: true
+    stdin_open: true
+    init: true
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - SUPERSEEDR_CLIENT_PORT=16881
+      - SUPERSEEDR_OUTPUT_STATUS_INTERVAL=${LIBTORRENT_LAB_STATUS_INTERVAL:-1}
+      - SUPERSEEDR_DEFAULT_DOWNLOAD_FOLDER=/superseedr-data/seed
+      - SUPERSEEDR_PEER_TRANSPORT=${LIBTORRENT_LAB_SUPERSEEDR_PEER_TRANSPORT:-tcp}
+    volumes:
+      - ${LIBTORRENT_LAB_SUPERSEEDR_SEED_DATA_PATH}:/superseedr-data/seed
+      - ${LIBTORRENT_LAB_SUPERSEEDR_SEED_CONFIG_PATH}:/root/.config/jagalite.superseedr
+      - ${LIBTORRENT_LAB_SUPERSEEDR_SEED_SHARE_PATH}:/root/.local/share/jagalite.superseedr
+      - ${LIBTORRENT_LAB_FIXTURES_PATH}:/fixtures:ro
+    depends_on:
+      - tracker
+
+  superseedr_leech:
+    image: superseedr:libtorrent-lab
+    tty: true
+    stdin_open: true
+    init: true
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - SUPERSEEDR_CLIENT_PORT=16882
+      - SUPERSEEDR_OUTPUT_STATUS_INTERVAL=${LIBTORRENT_LAB_STATUS_INTERVAL:-1}
+      - SUPERSEEDR_DEFAULT_DOWNLOAD_FOLDER=/superseedr-data/leech
+      - SUPERSEEDR_PEER_TRANSPORT=${LIBTORRENT_LAB_SUPERSEEDR_PEER_TRANSPORT:-tcp}
+    volumes:
+      - ${LIBTORRENT_LAB_SUPERSEEDR_LEECH_DATA_PATH}:/superseedr-data/leech
+      - ${LIBTORRENT_LAB_SUPERSEEDR_LEECH_CONFIG_PATH}:/root/.config/jagalite.superseedr
+      - ${LIBTORRENT_LAB_SUPERSEEDR_LEECH_SHARE_PATH}:/root/.local/share/jagalite.superseedr
+      - ${LIBTORRENT_LAB_FIXTURES_PATH}:/fixtures:ro
+    depends_on:
+      - tracker

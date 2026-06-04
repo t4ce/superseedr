@@ -48,7 +48,8 @@ Longer-term work targets deeper networking and operational control:
 - Headless/scriptable control surface and richer CLI automation.
 - User-configurable/saved TUI layouts.
 - High-churn peer management at large scale.
-- Networking parity/features (uTP, IPv6, UPnP, hole punch, DHT search).
+- Networking reachability/features beyond shipped TCP+uTP transport (IPv6,
+  UPnP, hole punch, DHT search).
 
 # Detailed Roadmap Steps
 
@@ -106,7 +107,7 @@ Longer-term work targets deeper networking and operational control:
 - **phase: 2 - v2.0+** | 10k Scale Test - profiling and behavior validation with massive peer sets | [Issue #____]
 
 ### Networking Feature Parity
-- **phase: 2 - v2.0+** | IPv6 and uTP - transport capability expansion | [Issue #____]
+- **phase: 2 - v2.0+** | IPv6 - transport capability expansion | [Issue #____]
 - **phase: 2 - v2.0+** | UPnP/NAT Traversal - improved reachability and connectivity | [Issue #____]
 - **phase: 2 - v2.0+** | DHT Search and Discovery - richer discovery tooling and UX | [Issue #____]
 - **phase: 2 - v2.0+** | DHT Ownership - evaluate and stage a first-party DHT runtime to replace `mainline` | See [dht-ownership-plan.md](dht-ownership-plan.md)

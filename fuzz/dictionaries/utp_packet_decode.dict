@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: 2025 The superseedr Contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+data_v1="\x01"
+fin_v1="\x11"
+state_v1="\x21"
+reset_v1="\x31"
+syn_v1="\x41"
+ext_none="\x00"
+ext_sack="\x01"
+sack_len="\x04"
+zero_u16="\x00\x00"
+one_u16="\x00\x01"
+max_u16="\xff\xff"
+zero_u32="\x00\x00\x00\x00"
+one_u32="\x00\x00\x00\x01"
+max_u32="\xff\xff\xff\xff"

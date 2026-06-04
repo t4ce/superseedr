@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2025 The superseedr Contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+type_data="\x00"
+type_fin="\x01"
+type_state="\x02"
+type_reset="\x03"
+type_syn="\x04"
+zero_u16="\x00\x00"
+one_u16="\x00\x01"
+zero_u32="\x00\x00\x00\x00"
+one_u32="\x00\x00\x00\x01"
+sack_word="\x01\x00\x00\x00"

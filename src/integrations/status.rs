@@ -93,7 +93,7 @@ impl Serialize for StatusTorrentMetrics<'_> {
     where
         S: serde::Serializer,
     {
-        let mut state = serializer.serialize_struct("TorrentMetrics", 29)?;
+        let mut state = serializer.serialize_struct("TorrentMetrics", 33)?;
         state.serialize_field("info_hash_hex", &hex::encode(&self.metrics.info_hash))?;
         state.serialize_field("torrent_control_state", &self.metrics.torrent_control_state)?;
         state.serialize_field("delete_files", &self.metrics.delete_files)?;
@@ -110,6 +110,16 @@ impl Serialize for StatusTorrentMetrics<'_> {
         state.serialize_field(
             "number_of_successfully_connected_peers",
             &self.metrics.number_of_successfully_connected_peers,
+        )?;
+        state.serialize_field("tcp_peer_count", &self.metrics.tcp_peer_count)?;
+        state.serialize_field("utp_peer_count", &self.metrics.utp_peer_count)?;
+        state.serialize_field(
+            "beneficial_tcp_peer_count",
+            &self.metrics.beneficial_tcp_peer_count,
+        )?;
+        state.serialize_field(
+            "beneficial_utp_peer_count",
+            &self.metrics.beneficial_utp_peer_count,
         )?;
         state.serialize_field(
             "number_of_pieces_total",
@@ -312,6 +322,10 @@ mod tests {
         let metrics = TorrentMetrics {
             info_hash, // This field will still serialize to [170, 187, ...]
             torrent_name: "Test Torrent".to_string(),
+            tcp_peer_count: 4,
+            utp_peer_count: 2,
+            beneficial_tcp_peer_count: 3,
+            beneficial_utp_peer_count: 1,
             ..Default::default()
         };
 
@@ -346,6 +360,10 @@ mod tests {
             json.contains("\"info_hash_hex\":\"aabbcc1234\""),
             "JSON should contain info_hash_hex in the torrent payload"
         );
+        assert!(json.contains("\"tcp_peer_count\":4"));
+        assert!(json.contains("\"utp_peer_count\":2"));
+        assert!(json.contains("\"beneficial_tcp_peer_count\":3"));
+        assert!(json.contains("\"beneficial_utp_peer_count\":1"));
 
         // We removed the negative assertion (!json.contains("[170,187")) because
         // the 'metrics.info_hash' field inside the object is expected to be a byte array.

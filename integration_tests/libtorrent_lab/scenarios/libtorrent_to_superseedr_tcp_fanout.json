@@ -1,0 +1,25 @@
+{
+  "name": "libtorrent_to_superseedr_tcp_fanout",
+  "description": "Three libtorrent seed peers offer one deterministic v1 fixture to one Superseedr leech over TCP.",
+  "seed_client": "libtorrent",
+  "leech_client": "superseedr",
+  "libtorrent_seed_count": 3,
+  "mode": "v1",
+  "torrent": "single_25k.bin.torrent",
+  "payload": "single/single_25k.bin",
+  "download_name": "single_25k.bin",
+  "timeout_secs": 180,
+  "seed_listen_port": 26881,
+  "leech_listen_port": 26882,
+  "superseedr_peer_transport": "tcp",
+  "libtorrent_settings": {
+    "enable_dht": false,
+    "enable_lsd": false,
+    "enable_natpmp": false,
+    "enable_upnp": false,
+    "enable_incoming_tcp": true,
+    "enable_outgoing_tcp": true,
+    "enable_incoming_utp": false,
+    "enable_outgoing_utp": false
+  }
+}

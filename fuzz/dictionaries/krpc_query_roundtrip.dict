@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: 2025 The superseedr Contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+ping="\x00"
+find_node="\x01"
+get_peers="\x02"
+announce_peer="\x03"
+want_none="\x00"
+want_ipv4="\x01"
+want_ipv6="\x02"
+want_both="\x03"
+txid="txid"
+token="token"
+node_a="aaaaaaaaaaaaaaaaaaaa"
+node_b="bbbbbbbbbbbbbbbbbbbb"

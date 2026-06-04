@@ -159,6 +159,7 @@ pub struct PeerSession {
     pending_window_shrink: usize,
     peer_flood_gate: PeerFloodGate,
     last_piece_received: Instant,
+    last_payload_activity: Instant,
 
     #[cfg(test)]
     testing_window_monitor: Option<Arc<AtomicUsize>>,
@@ -209,6 +210,7 @@ impl PeerSession {
             pending_window_shrink: 0,
             peer_flood_gate: PeerFloodGate::new(now),
             last_piece_received: now,
+            last_payload_activity: now,
 
             #[cfg(test)]
             testing_window_monitor: None,
@@ -308,24 +310,21 @@ impl PeerSession {
         let _reader_abort_guard = AbortOnDrop(reader_handle);
 
         let mut keep_alive_timer = tokio::time::interval(Duration::from_secs(60));
-        let inactivity_timeout = tokio::time::sleep(Duration::from_secs(120));
-        tokio::pin!(inactivity_timeout);
-
         let mut speed_adjustment_timer = tokio::time::interval(Duration::from_secs(1));
         speed_adjustment_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let manager_tx = self.torrent_manager_tx.clone();
 
-        let _result: Result<(), Box<dyn StdError + Send + Sync>> = 'session: loop {
+        let result: Result<(), Box<dyn StdError + Send + Sync>> = 'session: loop {
             tokio::select! {
-                // Timeout Check
-                _ = &mut inactivity_timeout => break 'session Err("Timeout".into()),
-
                 // KeepAlive
                 _ = keep_alive_timer.tick() => { let _ = self.writer_tx.try_send(Message::KeepAlive); },
 
                 _ = speed_adjustment_timer.tick() => {
+                    if self.last_payload_activity.elapsed() > Duration::from_secs(120) {
+                        break 'session Err("Timeout".into());
+                    }
                     if !self.adjust_window_size() {
                         break 'session Ok(());
                     }
@@ -333,8 +332,7 @@ impl PeerSession {
 
                 // INCOMING MESSAGES (From Reader Task)
                 Some(msg) = peer_msg_rx.recv() => {
-                    inactivity_timeout.as_mut().reset(Instant::now() + Duration::from_secs(120));
-
+                    self.last_payload_activity = Instant::now();
                     match self.incoming_peer_message_flood_action() {
                         PeerFloodAction::Allow => {}
                         PeerFloodAction::DisconnectAndLog => {
@@ -493,7 +491,7 @@ impl PeerSession {
             }
         };
 
-        Ok(())
+        result
     }
 
     fn process_manager_command(
@@ -504,20 +502,25 @@ impl PeerSession {
             TorrentCommand::Disconnect(_) => return Ok(false),
 
             TorrentCommand::PeerChoke | TorrentCommand::Choke(_) => {
+                self.last_payload_activity = Instant::now();
                 let _ = self.writer_tx.try_send(Message::Choke);
             }
             TorrentCommand::PeerUnchoke | TorrentCommand::Unchoke(_) => {
+                self.last_payload_activity = Instant::now();
                 let _ = self.writer_tx.try_send(Message::Unchoke);
             }
             TorrentCommand::ClientInterested => {
+                self.last_payload_activity = Instant::now();
                 let _ = self.writer_tx.try_send(Message::Interested);
             }
             TorrentCommand::NotInterested => {
+                self.last_payload_activity = Instant::now();
                 let _ = self.writer_tx.try_send(Message::NotInterested);
             }
 
             // --- BULK REQUEST WITH ZOMBIE REAPER ---
             TorrentCommand::BulkRequest(requests) => {
+                self.last_payload_activity = Instant::now();
                 let writer = self.writer_tx.clone();
                 let sem = self.block_request_limit_semaphore.clone();
                 let tracker = self.block_tracker.clone();
@@ -566,6 +569,7 @@ impl PeerSession {
             }
 
             TorrentCommand::BulkCancel(cancels) => {
+                self.last_payload_activity = Instant::now();
                 for (index, begin, len) in &cancels {
                     let _ = self
                         .writer_tx
@@ -595,9 +599,11 @@ impl PeerSession {
             }
 
             TorrentCommand::Upload(index, begin, data) => {
+                self.last_payload_activity = Instant::now();
                 let _ = self.writer_tx.try_send(Message::Piece(index, begin, data));
             }
             TorrentCommand::PeerBitfield(_, bf) => {
+                self.last_payload_activity = Instant::now();
                 let _ = self.writer_tx.try_send(Message::Bitfield(bf));
             }
             #[cfg(feature = "pex")]
@@ -605,6 +611,7 @@ impl PeerSession {
                 self.handle_pex(peers);
             }
             TorrentCommand::Have(_, idx) => {
+                self.last_payload_activity = Instant::now();
                 let _ = self.writer_tx.try_send(Message::Have(idx));
             }
             TorrentCommand::SendHashPiece {
@@ -614,6 +621,7 @@ impl PeerSession {
                 proof,
                 ..
             } => {
+                self.last_payload_activity = Instant::now();
                 let _ = self
                     .writer_tx
                     .try_send(Message::HashPiece(root, base_layer, index, proof));
@@ -626,6 +634,7 @@ impl PeerSession {
                 length,
                 ..
             } => {
+                self.last_payload_activity = Instant::now();
                 let _ = self
                     .writer_tx
                     .try_send(Message::HashReject(root, base_layer, index, length, 0));
@@ -639,6 +648,7 @@ impl PeerSession {
                 proof_layers,
                 ..
             } => {
+                self.last_payload_activity = Instant::now();
                 let _ = self.writer_tx.try_send(Message::HashRequest(
                     file_root.clone(),
                     base_layer,
@@ -691,10 +701,17 @@ impl PeerSession {
     #[cfg(feature = "pex")]
     fn handle_pex(&self, peers_list: Vec<String>) {
         if let Some(pex_id) = self.peer_advertised_extension_id(ClientExtendedId::UtPex) {
+            let self_addr = Self::peer_key_socket_addr(&self.peer_ip_port);
             let peers: Vec<SocketAddr> = peers_list
                 .iter()
-                .filter(|&ip| *ip != self.peer_ip_port)
-                .filter_map(|ip| ip.parse::<std::net::SocketAddr>().ok())
+                .filter_map(|peer_key| {
+                    let addr = Self::peer_key_socket_addr(peer_key)?;
+                    if *peer_key == self.peer_ip_port || Some(addr) == self_addr {
+                        None
+                    } else {
+                        Some(addr)
+                    }
+                })
                 .collect();
 
             let mut added = Vec::new();
@@ -727,6 +744,14 @@ impl PeerSession {
                 }
             }
         }
+    }
+
+    #[cfg(feature = "pex")]
+    fn peer_key_socket_addr(peer_key: &str) -> Option<SocketAddr> {
+        let socket_addr = peer_key
+            .split_once("://")
+            .map_or(peer_key, |(_, socket_addr)| socket_addr);
+        socket_addr.parse::<SocketAddr>().ok()
     }
 
     #[cfg(feature = "pex")]
@@ -1090,6 +1115,89 @@ mod tests {
         };
 
         (PeerSession::new(params), manager_rx)
+    }
+
+    #[cfg(feature = "pex")]
+    fn build_session_for_pex_tests(peer_ip_port: &str) -> PeerSession {
+        let infinite_bucket = Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY));
+        let (manager_tx, _manager_rx) = mpsc::channel(16);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        let params = PeerSessionParameters {
+            info_hash: [0u8; 20].to_vec(),
+            torrent_metadata_length: None,
+            connection_type: ConnectionType::Outgoing,
+            torrent_manager_rx: cmd_rx,
+            torrent_manager_tx: manager_tx,
+            peer_ip_port: peer_ip_port.to_string(),
+            client_id: b"-SS1000-PEXTEST0000".to_vec(),
+            global_dl_bucket: infinite_bucket.clone(),
+            global_ul_bucket: infinite_bucket,
+            shutdown_tx,
+        };
+
+        PeerSession::new(params)
+    }
+
+    #[cfg(feature = "pex")]
+    fn compact_ipv4_peer(octets: [u8; 4], port: u16) -> Vec<u8> {
+        let mut encoded = Vec::from(octets);
+        encoded.extend_from_slice(&port.to_be_bytes());
+        encoded
+    }
+
+    #[test]
+    #[cfg(feature = "pex")]
+    fn peer_key_socket_addr_accepts_plain_and_transport_qualified_keys() {
+        let plain: SocketAddr = "127.0.0.1:6881".parse().unwrap();
+
+        assert_eq!(
+            PeerSession::peer_key_socket_addr("127.0.0.1:6881"),
+            Some(plain)
+        );
+        assert_eq!(
+            PeerSession::peer_key_socket_addr("tcp://127.0.0.1:6881"),
+            Some(plain)
+        );
+        assert_eq!(
+            PeerSession::peer_key_socket_addr("utp://127.0.0.1:6881"),
+            Some(plain)
+        );
+        assert_eq!(PeerSession::peer_key_socket_addr("not-a-peer"), None);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "pex")]
+    async fn handle_pex_advertises_transport_qualified_peer_keys() {
+        let mut session = build_session_for_pex_tests("tcp://127.0.0.1:5000");
+        session
+            .peer_extended_id_mappings
+            .insert(ClientExtendedId::UtPex.as_str().to_string(), 9);
+        let mut writer_rx = session.writer_rx.take().expect("writer rx");
+
+        session.handle_pex(vec![
+            "tcp://127.0.0.1:5000".to_string(),
+            "tcp://127.0.0.2:6000".to_string(),
+            "127.0.0.3:6001".to_string(),
+        ]);
+
+        let Message::Extended(extension_id, payload) = writer_rx.recv().await.expect("pex message")
+        else {
+            panic!("expected extended pex message");
+        };
+        assert_eq!(extension_id, 9);
+
+        let decoded: PexMessage = serde_bencode::from_bytes(&payload).expect("decode pex");
+        assert_eq!(decoded.added.len(), 12);
+        assert!(decoded
+            .added
+            .chunks_exact(6)
+            .any(|chunk| chunk == compact_ipv4_peer([127, 0, 0, 2], 6000)));
+        assert!(decoded
+            .added
+            .chunks_exact(6)
+            .any(|chunk| chunk == compact_ipv4_peer([127, 0, 0, 3], 6001)));
     }
 
     struct WindowDriveHarness<'a> {

@@ -67,6 +67,24 @@ cargo run --release --features synthetic-load -- benchmark --max-torrents 1000 -
 See [`docs/synthetic-benchmark.md`](synthetic-benchmark.md) for deeper
 synthetic load testing, disk-budget behavior, and per-scenario examples.
 
+## Runtime Peer Transport
+
+Production peer transport enables TCP and uTP by default. When both transports
+are enabled, Superseedr races uTP and TCP connection attempts so a slow or
+unreachable uTP path does not block TCP fallback.
+
+Use `SUPERSEEDR_PEER_TRANSPORT` to override the default:
+
+- `all`: enable TCP and uTP; this is the default
+- `tcp`: use TCP only
+- `utp`: use uTP only
+
+Example:
+
+```bash
+SUPERSEEDR_PEER_TRANSPORT=tcp superseedr
+```
+
 ## Targeting Torrents
 
 Many commands accept either:
@@ -97,6 +115,9 @@ Behavior:
 
 ```bash
 superseedr add <INPUT>...
+superseedr add --path <PATH> <INPUT>...
+superseedr add --validated <INPUT>...
+superseedr add 'magnet:?xt=...,magnet:?xt=...'
 ```
 
 Add one or more torrent file paths or magnet links.
@@ -105,6 +126,15 @@ Inputs can be:
 
 - `.torrent` paths
 - magnet links
+- comma-joined magnet links with no whitespace between entries
+  (`magnet:?xt=...,magnet:?xt=...`)
+
+Use `--validated` (alias: `--validate`) when rebuilding a catalog from data
+that has already been verified and should be persisted with
+`validation_status = true`.
+
+Use `--path` to persist an existing download path for the added inputs. The
+path must be non-empty and must already exist as a directory.
 
 In shared mode, cross-host `.path` adds are portable when the `.torrent` file
 is on the shared root.
@@ -184,6 +214,9 @@ superseedr show-configs --all
 
 Show resolved absolute paths and short descriptions for the effective config,
 log, status, journal, lock, and watch paths.
+
+See [`configuration-and-backups.md`](configuration-and-backups.md) for the
+configuration and backup file map, including backup cadence and retention.
 
 Behavior:
 
@@ -370,6 +403,7 @@ Common options:
 - `--size-per-torrent`
 - `--piece-size`
 - `--target-gbps`
+- `--transport tcp|utp|all`
 - `--issue-retries`
 - `--retry-delay-ms`
 - `--out`
@@ -505,4 +539,3 @@ Errors return:
   "error": "..."
 }
 ```
-

@@ -187,6 +187,10 @@ impl UiTelemetry {
             .latest_state
             .number_of_successfully_connected_peers =
             message.number_of_successfully_connected_peers;
+        display_state.latest_state.tcp_peer_count = message.tcp_peer_count;
+        display_state.latest_state.utp_peer_count = message.utp_peer_count;
+        display_state.latest_state.beneficial_tcp_peer_count = message.beneficial_tcp_peer_count;
+        display_state.latest_state.beneficial_utp_peer_count = message.beneficial_utp_peer_count;
         display_state.latest_state.number_of_pieces_total = message.number_of_pieces_total;
         display_state.latest_state.number_of_pieces_completed = message.number_of_pieces_completed;
         display_state.latest_state.download_speed_bps = message.download_speed_bps;
@@ -702,6 +706,11 @@ mod tests {
             number_of_pieces_completed: 3,
             download_speed_bps: 512,
             upload_speed_bps: 128,
+            number_of_successfully_connected_peers: 5,
+            tcp_peer_count: 3,
+            utp_peer_count: 2,
+            beneficial_tcp_peer_count: 2,
+            beneficial_utp_peer_count: 1,
             session_total_downloaded: 64,
             session_total_uploaded: 16,
             activity_message: "Downloading".to_string(),
@@ -721,6 +730,11 @@ mod tests {
         assert_eq!(state.latest_state.file_count, Some(3));
         assert_eq!(state.latest_state.download_speed_bps, 512);
         assert_eq!(state.latest_state.upload_speed_bps, 128);
+        assert_eq!(state.latest_state.number_of_successfully_connected_peers, 5);
+        assert_eq!(state.latest_state.tcp_peer_count, 3);
+        assert_eq!(state.latest_state.utp_peer_count, 2);
+        assert_eq!(state.latest_state.beneficial_tcp_peer_count, 2);
+        assert_eq!(state.latest_state.beneficial_utp_peer_count, 1);
         assert_eq!(state.download_history.len(), 1);
         assert_eq!(state.upload_history.len(), 1);
         assert_eq!(state.swarm_availability_history.len(), 1);
