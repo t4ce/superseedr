@@ -353,8 +353,8 @@ jobs:
           if ("${{ matrix.flags }}" -eq "") {
             # For the "normal" build, just run the default command.
             # This runs 'cargo build --release' AND packages the MSI.
-            echo "Running: cargo wix"
-            cargo wix
+            echo "Running: cargo wix --package superseedr"
+            cargo wix --package superseedr
           } else {
             # For the "private" build, we must build manually first.
             
@@ -363,8 +363,8 @@ jobs:
             cargo build --release ${{ matrix.flags }}
             
             # 2. Run cargo wix with '--no-build' to package the binaries we just made
-            echo "Running: cargo wix --no-build"
-            cargo wix --no-build
+            echo "Running: cargo wix --package superseedr --no-build"
+            cargo wix --package superseedr --no-build
           }
 
           

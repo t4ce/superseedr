@@ -1,0 +1,86 @@
+name: Temp Windows EXE Installer
+
+on:
+  push:
+    branches:
+      - peer-transport-abstraction
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build_windows_exe:
+    timeout-minutes: 120
+    name: Build Windows EXE (${{ matrix.suffix }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suffix: normal
+            flags: ""
+          - suffix: private
+            flags: "--no-default-features"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-temp-windows-exe-${{ matrix.suffix }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build release binary (${{ matrix.suffix }})
+        shell: pwsh
+        run: |
+          echo "Running: cargo build --release ${{ matrix.flags }}"
+          cargo build --release ${{ matrix.flags }}
+
+      - name: Build per-user EXE Installer (${{ matrix.suffix }})
+        id: build_exe
+        shell: pwsh
+        run: |
+          $INSTALLER_VERSION = "1.0.8-ci-${{ github.run_number }}"
+          $flavor = "${{ matrix.suffix }}"
+          Remove-Item -LiteralPath "target/installer/windows" -Recurse -Force -ErrorAction SilentlyContinue
+
+          .\scripts\build_windows_user_installer.ps1 -Flavor $flavor -Version $INSTALLER_VERSION -SkipBuild -Backend inno
+
+          $exe = Get-ChildItem -Path "target/installer/windows" -Filter "*.exe" |
+            Where-Object {
+              if ($flavor -eq "private") {
+                $_.Name -like "superseedr-private-*-x64-setup.exe"
+              } else {
+                $_.Name -like "superseedr-*-x64-setup.exe" -and $_.Name -notlike "superseedr-private-*"
+              }
+            } |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if ($null -eq $exe) {
+            echo "::error:: No .exe installer found in target/installer/windows"
+            exit 1
+          }
+
+          echo "exe_path=$($exe.FullName)" >> $env:GITHUB_OUTPUT
+          Get-ChildItem "target/installer/windows" | Format-Table Name, Length, LastWriteTime
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: superseedr-temp-windows-exe-${{ matrix.suffix }}-${{ github.run_number }}
+          path: ${{ steps.build_exe.outputs.exe_path }}
