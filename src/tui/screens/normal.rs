@@ -6416,6 +6416,7 @@ fn swarm_heatmap_flash_color(
     peers: &[PeerInfo],
     total_pieces: usize,
     piece_index: usize,
+    heatmap_block_color: Color,
 ) -> Color {
     let Some(peer) = swarm_heatmap_flash_peer(peers, total_pieces, piece_index) else {
         return ctx.theme.semantic.white;
@@ -6424,7 +6425,12 @@ fn swarm_heatmap_flash_color(
     if peer_is_inactive_for_table(peer) {
         ctx.theme.semantic.white
     } else {
-        ip_to_color(ctx, &peer.address)
+        let peer_color = ip_to_color(ctx, &peer.address);
+        if peer_color == heatmap_block_color {
+            ctx.theme.semantic.white
+        } else {
+            peer_color
+        }
     }
 }
 
@@ -6581,25 +6587,30 @@ fn draw_swarm_heatmap(
                 )
             } else {
                 let level = swarm_heatmap_level(display_count, display_max_avail);
+                let (piece_char, color) = match level {
+                    SwarmHeatmapLevel::Empty => (shade_light, color_heatmap_empty),
+                    SwarmHeatmapLevel::Low => (shade_light, color_heatmap_low),
+                    SwarmHeatmapLevel::Medium => (shade_medium, color_heatmap_medium),
+                    SwarmHeatmapLevel::High => (shade_dark, color_heatmap_high),
+                };
                 let flash_new = flash.is_some_and(|flash| {
                     flash
                         .state
                         .is_piece_flashing(flash.info_hash, piece_index, flash.now)
                 });
                 if let Some(tone) = swarm_heatmap_flash_tone(level, flash_new) {
-                    let flash_color =
-                        swarm_heatmap_flash_color(ctx, peers, total_pieces_usize, piece_index);
+                    let flash_color = swarm_heatmap_flash_color(
+                        ctx,
+                        peers,
+                        total_pieces_usize,
+                        piece_index,
+                        color,
+                    );
                     let style = match tone {
                         SwarmHeatmapFlashTone::Regular => Style::default().fg(flash_color),
                     };
                     (shade_dark, ctx.apply(style))
                 } else {
-                    let (piece_char, color) = match level {
-                        SwarmHeatmapLevel::Empty => (shade_light, color_heatmap_empty),
-                        SwarmHeatmapLevel::Low => (shade_light, color_heatmap_low),
-                        SwarmHeatmapLevel::Medium => (shade_medium, color_heatmap_medium),
-                        SwarmHeatmapLevel::High => (shade_dark, color_heatmap_high),
-                    };
                     (piece_char, ctx.apply(Style::default().fg(color)))
                 }
             };
@@ -7342,7 +7353,7 @@ mod tests {
             ..Default::default()
         }];
 
-        let color = swarm_heatmap_flash_color(&ctx, &peers, 2, 0);
+        let color = swarm_heatmap_flash_color(&ctx, &peers, 2, 0, ctx.theme.scale.heatmap.low);
 
         assert_eq!(color, ctx.theme.semantic.white);
     }
@@ -7357,9 +7368,26 @@ mod tests {
             ..Default::default()
         }];
 
-        let color = swarm_heatmap_flash_color(&ctx, &peers, 2, 0);
+        let color = swarm_heatmap_flash_color(&ctx, &peers, 2, 0, ctx.theme.scale.heatmap.low);
 
         assert_eq!(color, ip_to_color(&ctx, "127.0.0.1:7001"));
+    }
+
+    #[test]
+    fn swarm_heatmap_flash_color_uses_white_when_peer_matches_heatmap_block() {
+        let ctx = ThemeContext::new(Theme::builtin(ThemeName::CatppuccinMocha), 0.0);
+        let address = "127.0.0.1:7001";
+        let peers = vec![PeerInfo {
+            address: address.to_string(),
+            bitfield: vec![true, false],
+            download_speed_bps: 1,
+            ..Default::default()
+        }];
+        let heatmap_block_color = ip_to_color(&ctx, address);
+
+        let color = swarm_heatmap_flash_color(&ctx, &peers, 2, 0, heatmap_block_color);
+
+        assert_eq!(color, ctx.theme.semantic.white);
     }
 
     #[test]
