@@ -14,14 +14,12 @@ pub(crate) fn compute_effects_activity_speed_multiplier(
     let ul_bps = app_state.avg_upload_history.last().copied().unwrap_or(0) as f64;
 
     let dl_limit = app_state.effective_download_limit_bps;
-    let dl_ref = if dl_limit > 0 && dl_limit != crate::config::UNLIMITED_RATE_LIMIT_BPS {
+    let dl_ref = if !crate::config::is_unlimited_rate_limit_bps(dl_limit) {
         dl_limit as f64
     } else {
         4_000_000.0
     };
-    let ul_ref = if settings.global_upload_limit_bps > 0
-        && settings.global_upload_limit_bps != crate::config::UNLIMITED_RATE_LIMIT_BPS
-    {
+    let ul_ref = if !crate::config::is_unlimited_rate_limit_bps(settings.global_upload_limit_bps) {
         settings.global_upload_limit_bps as f64
     } else {
         1_000_000.0

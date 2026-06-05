@@ -16,10 +16,9 @@ Superseedr is a modern Rust BitTorrent client featuring a high-performance termi
 
 | **Experience** | **Networking** | **Engineering** |
 | :--- | :--- | :--- |
-| 🎨 **60 FPS TUI + Themes**<br>Fluid, animated interface with heatmaps and 40 live-switchable built-in themes. | 🔁 **TCP + uTP Peers**<br>Production peer transport enables TCP and uTP by default, with TCP retained as fallback. | 🧬 **BitTorrent v2**<br>Hybrid swarms & Merkle tree verification. |
+| 🎨 **60 FPS TUI + Themes**<br>Fluid, animated interface with heatmaps and 40 live-switchable built-in themes. | 🐳 **Docker + VPN**<br>Gluetun integration with dynamic port reloading. | 🧬 **BitTorrent v2**<br>Hybrid swarms & Merkle tree verification. |
 | 📰 **RSS Feeds**<br>In-app feed tracking, filtering, and ingest. | 🧩 **Cluster Mode**<br>OS-agnostic shared torrent catalog with automatic failover. | 🧠 **Self-Tuning**<br>Adaptive limits control for max speed and I/O Stability. |
-| 🧲 **Magnet Links**<br>Native OS-level handler support. | 🐳 **Docker + VPN**<br>Gluetun integration with dynamic port reloading. | 📡 **Integrity Prober**<br>Continuous lightweight background integrity checks with fast recovery reprobes. |
-| ⌨️ **CLI Control**<br>Scriptable commands for status, queue control, and offline-capable operations. | 👻 **Private Mode**<br>Optional builds disabling DHT/PEX. | 🧪 **Fuzzing Harnesses**<br>Protocol decoders and transport paths are exercised through fuzz targets. |
+| 🧲 **Magnet Links**<br>Native OS-level handler support. | 👻 **Private Mode**<br>Optional builds disabling DHT/PEX. | 📡 **Integrity Prober**<br>Continuous lightweight background integrity checks with fast recovery reprobes. |
 
 ### Terminal Torrenting With Superseedr
 
@@ -35,7 +34,7 @@ Superseedr is a modern Rust BitTorrent client featuring a high-performance termi
 ## Installation
 
 Download platform-specific installers from the [releases page](https://github.com/Jagalite/superseedr/releases) **(includes browser magnet link support)**:
-- Windows: `.msi` installer
+- Windows: `.exe` per-user installer (no admin) or `.msi` installer
 - macOS: `.pkg` installer  
 - Debian/Ubuntu: `.deb` package
 
@@ -262,10 +261,9 @@ superseedr to-standalone
 superseedr stop-client
 ```
 
-See [`docs/cli.md`](docs/cli.md) for full CLI command behavior,
+See [`docs/cli.md`](docs/cli.md) for full CLI command behavior, and
 [`docs/shared-config.md`](docs/shared-config.md) for shared leader/follower
-routing, and [`docs/configuration-and-backups.md`](docs/configuration-and-backups.md)
-for configuration and backup file locations.
+routing.
 
 ### 3. Status API & Monitoring
 For external dashboards, health checks, and lightweight automation, Superseedr
@@ -308,9 +306,7 @@ Shared mode gives you an OS- and machine-agnostic torrent catalog and settings
 that live alongside your data on the NAS or shared root. Any Superseedr client
 that mounts that shared root can connect and reuse the same catalog in real time.
 Superseedr CLI commands work against that shared config both online and offline. See
-[`docs/shared-config.md`](docs/shared-config.md) for the full shared-mode guide
-and [`docs/configuration-and-backups.md`](docs/configuration-and-backups.md) for
-configuration and backup file locations.
+[`docs/shared-config.md`](docs/shared-config.md) for the full shared-mode guide.
 
 ```text
 Same shared root, different local mount paths
@@ -459,4 +455,7 @@ Superseedr implements the following BitTorrent Enhancement Proposals (BEPs):
 * **BEP 52:** The BitTorrent Protocol v2
 
 </details>
+
+
+
 

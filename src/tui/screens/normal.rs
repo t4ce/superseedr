@@ -76,6 +76,7 @@ const FOOTER_STATUS_GUTTER: u16 = 2;
 const ASCII_TREE_DIR_ICON: &str = "> ";
 const ASCII_TREE_FILE_ICON: &str = "  ";
 const FILE_ACTIVITY_HIGHLIGHT_WINDOW: Duration = Duration::from_millis(1800);
+const FILE_ACTIVITY_MAX_BAND_WIDTH: usize = 9;
 const MIN_SWARM_AVAILABILITY_HEIGHT: u16 = 1;
 const FILES_SWARM_SPACER_HEIGHT: u16 = 1;
 const SATURATED_ACTIVE_PEER_FILE_ROWS: u16 = 5;
@@ -1035,11 +1036,11 @@ fn swarm_heatmap_flashing_peer_addresses(
     };
 
     let mut addresses = HashSet::new();
-    for piece_index in 0..total_pieces {
-        if !flash
-            .state
-            .is_piece_flashing(flash.info_hash, piece_index, flash.now)
-        {
+    for piece_index in flash
+        .state
+        .active_flash_piece_indices(flash.info_hash, flash.now)
+    {
+        if piece_index >= total_pieces {
             continue;
         }
         if let Some(peer) = swarm_heatmap_flash_peer(peers, total_pieces, piece_index) {
@@ -1959,11 +1960,15 @@ pub fn draw_footer(
     };
     let v4_port_style = if v4_highlight_active {
         ctx.apply(Style::default().fg(ctx.state_success()).bold())
+    } else if app_state.externally_accessable_port_v4 {
+        ctx.apply(Style::default().fg(ctx.state_success()))
     } else {
         ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0))
     };
     let v6_port_style = if v6_highlight_active {
         ctx.apply(Style::default().fg(ctx.state_success()).bold())
+    } else if app_state.externally_accessable_port_v6 {
+        ctx.apply(Style::default().fg(ctx.state_success()))
     } else {
         ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0))
     };
@@ -6041,7 +6046,9 @@ struct FileActivityWaveProfile {
 }
 
 fn file_activity_wave_cycle_duration(total_len: usize, wave: FileActivityWaveProfile) -> Duration {
-    Duration::from_secs_f64((total_len + wave.band_width) as f64 / wave.steps_per_second.max(1.0))
+    Duration::from_secs_f64(
+        file_activity_wave_cycle_len(total_len) as f64 / wave.steps_per_second.max(1.0),
+    )
 }
 
 fn file_activity_is_visible(
@@ -6070,6 +6077,10 @@ fn file_activity_wave_profile(speed_bps: u64, text_len: usize) -> FileActivityWa
     }
 }
 
+fn file_activity_wave_cycle_len(total_len: usize) -> usize {
+    total_len + FILE_ACTIVITY_MAX_BAND_WIDTH
+}
+
 fn file_activity_wave_hits(
     relative_path: &str,
     global_char_idx: usize,
@@ -6084,9 +6095,8 @@ fn file_activity_wave_hits(
         } else {
             1 + relative_path.chars().count()
         };
-    let cycle_len = total_len + wave.band_width;
-    let phase_offset = file_activity_wave_phase_offset(relative_path, left_to_right, cycle_len);
-    let head = (step + phase_offset) % cycle_len;
+    let cycle_len = file_activity_wave_cycle_len(total_len);
+    let head = step % cycle_len;
     let logical_idx = if left_to_right {
         global_char_idx
     } else {
@@ -6095,25 +6105,6 @@ fn file_activity_wave_hits(
 
     (head as isize - logical_idx as isize) >= 0
         && (head as isize - logical_idx as isize) < wave.band_width as isize
-}
-
-fn file_activity_wave_phase_offset(
-    relative_path: &str,
-    left_to_right: bool,
-    cycle_len: usize,
-) -> usize {
-    if cycle_len == 0 {
-        return 0;
-    }
-
-    let mut hash = 1469598103934665603_u64;
-    for byte in relative_path.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(1099511628211);
-    }
-    hash ^= u64::from(left_to_right);
-    hash = hash.wrapping_mul(1099511628211);
-    (hash % cycle_len as u64) as usize
 }
 
 fn torrent_root_path_label(metrics: &crate::app::TorrentMetrics, anonymize: bool) -> String {
@@ -7850,9 +7841,7 @@ mod tests {
         let total_len = root_len + 1 + relative_path.chars().count();
         let logical_hit_idx = 10usize;
         let mirrored_idx = total_len - 1 - logical_hit_idx;
-        let cycle_len = total_len + wave.band_width;
-        let phase_offset = file_activity_wave_phase_offset(relative_path, false, cycle_len);
-        let step = (mirrored_idx + 1 + cycle_len - phase_offset) % cycle_len;
+        let step = mirrored_idx + 1;
 
         assert!(file_activity_wave_hits(
             relative_path,
@@ -9167,16 +9156,64 @@ mod tests {
     }
 
     #[test]
-    fn file_activity_wave_phase_offset_is_stable_per_path() {
-        let cycle_len = 23;
-        let alpha = file_activity_wave_phase_offset("folder/alpha.bin", false, cycle_len);
-        let alpha_again = file_activity_wave_phase_offset("folder/alpha.bin", false, cycle_len);
-        let beta = file_activity_wave_phase_offset("folder/beta.bin", false, cycle_len);
+    fn file_activity_wave_uses_shared_phase_for_new_paths() {
+        let wave = FileActivityWaveProfile {
+            band_width: 4,
+            steps_per_second: 12.0,
+        };
+        let root_len = 9usize;
+        let step = 13usize;
 
-        assert_eq!(alpha, alpha_again);
-        assert!(alpha < cycle_len);
-        assert!(beta < cycle_len);
-        assert_ne!(alpha, beta);
+        assert!(file_activity_wave_hits(
+            "demo/one.bin",
+            step,
+            root_len,
+            wave,
+            step,
+            true,
+        ));
+        assert!(file_activity_wave_hits(
+            "demo/two.bin",
+            step,
+            root_len,
+            wave,
+            step,
+            true,
+        ));
+    }
+
+    #[test]
+    fn file_activity_wave_head_stays_stable_across_band_width_changes() {
+        let root_len = 9usize;
+        let relative_path = "demo/file.bin";
+        let total_len = root_len + 1 + relative_path.chars().count();
+        let step = 87usize;
+        let head = step % file_activity_wave_cycle_len(total_len);
+        let slow_wave = FileActivityWaveProfile {
+            band_width: 4,
+            steps_per_second: 8.0,
+        };
+        let fast_wave = FileActivityWaveProfile {
+            band_width: 9,
+            steps_per_second: 23.0,
+        };
+
+        assert!(file_activity_wave_hits(
+            relative_path,
+            head,
+            root_len,
+            slow_wave,
+            step,
+            true,
+        ));
+        assert!(file_activity_wave_hits(
+            relative_path,
+            head,
+            root_len,
+            fast_wave,
+            step,
+            true,
+        ));
     }
 
     #[test]

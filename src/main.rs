@@ -578,11 +578,13 @@ const SHOW_CONFIG_DESCRIPTIONS: &[ShowConfigsDescription] = &[
 
 // CLI types and process_input moved to integrations::cli
 
-fn init_tracing(
-    log_dirs: Vec<PathBuf>,
-    filename_prefix: &str,
-    emit_stderr: bool,
-) -> Vec<logging::LogWorkerGuard> {
+struct TracingInit {
+    guards: Vec<logging::LogWorkerGuard>,
+    setup_warnings: Vec<String>,
+    attempted_file_logging: bool,
+}
+
+fn init_tracing(log_dirs: Vec<PathBuf>, filename_prefix: &str, emit_stderr: bool) -> TracingInit {
     let quiet_filter = Targets::new()
         .with_default(DEFAULT_LOG_FILTER)
         .with_target("mainline::rpc::socket", LevelFilter::ERROR);
@@ -613,7 +615,11 @@ fn init_tracing(
                         .try_init()
                         .is_ok()
                     {
-                        return vec![guard_general];
+                        return TracingInit {
+                            guards: vec![guard_general],
+                            setup_warnings: suppressed_warnings,
+                            attempted_file_logging,
+                        };
                     } else {
                         let message = format!(
                             "Failed to initialize tracing subscriber for file logging at {}",
@@ -668,7 +674,11 @@ fn init_tracing(
         .with(fallback_layer)
         .try_init();
 
-    Vec::new()
+    TracingInit {
+        guards: Vec::new(),
+        setup_warnings: suppressed_warnings,
+        attempted_file_logging,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -692,9 +702,8 @@ fn report_logging_setup_warning(
 ) {
     if emit_stderr {
         eprintln!("[Warn] {}", message);
-    } else {
-        suppressed_warnings.push(message);
     }
+    suppressed_warnings.push(message);
 }
 
 fn final_logging_fallback_message(attempted_file_logging: bool) -> &'static str {
@@ -703,6 +712,19 @@ fn final_logging_fallback_message(attempted_file_logging: bool) -> &'static str 
     } else {
         "No file logging directories were available; using stderr fallback for diagnostics."
     }
+}
+
+fn tui_logging_setup_warning_message(init: &TracingInit) -> Option<String> {
+    if init.setup_warnings.is_empty() {
+        return None;
+    }
+
+    let summary = if init.attempted_file_logging {
+        "File logging is unavailable; runtime diagnostics may be limited."
+    } else {
+        "No file logging directories were available; runtime diagnostics may be limited."
+    };
+    Some(format!("{} {}", summary, init.setup_warnings.join(" ")))
 }
 
 fn already_running_message() -> &'static str {
@@ -754,11 +776,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         dirs
     };
-    let _tracing_guards = init_tracing(
+    let tracing_init = init_tracing(
         log_dirs,
         if has_cli_request { "cli" } else { "app" },
         has_cli_request,
     );
+    let tui_logging_warning = if has_cli_request {
+        None
+    } else {
+        tui_logging_setup_warning_message(&tracing_init)
+    };
+    let _tracing_guards = tracing_init.guards;
 
     tracing::info!("STARTING SUPERSEEDR");
 
@@ -962,6 +990,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Initializing application state...");
     let mut app = App::new_with_lock(client_configs, runtime_mode, lock_file_handle).await?;
+    app.app_state.system_error = tui_logging_warning;
     tracing::info!("Application state initialized. Starting TUI.");
 
     let original_hook = std::panic::take_hook();
@@ -3646,6 +3675,28 @@ mod tests {
             suppressed_warnings,
             vec!["Failed to initialize file logging at /tmp/demo: denied"]
         );
+    }
+
+    #[test]
+    fn tui_logging_setup_warning_message_reports_suppressed_warnings() {
+        let init = TracingInit {
+            guards: Vec::new(),
+            setup_warnings: vec![
+                "Failed to initialize file logging at /tmp/demo: denied".to_string()
+            ],
+            attempted_file_logging: true,
+        };
+
+        let message = tui_logging_setup_warning_message(&init).expect("warning message");
+
+        assert!(message.contains("File logging is unavailable"));
+        assert!(message.contains("Failed to initialize file logging at /tmp/demo: denied"));
+        assert!(tui_logging_setup_warning_message(&TracingInit {
+            guards: Vec::new(),
+            setup_warnings: Vec::new(),
+            attempted_file_logging: true,
+        })
+        .is_none());
     }
 
     #[test]

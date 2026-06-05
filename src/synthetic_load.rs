@@ -16,6 +16,7 @@ use crate::resource_manager::{
 };
 use crate::token_bucket::TokenBucket;
 use crate::torrent_file::{Info, Torrent};
+use crate::torrent_manager::IncomingPeerSession;
 use crate::torrent_manager::{
     ManagerCommand, ManagerEvent, SyntheticPeerConnectFailure, TorrentManager, TorrentParameters,
 };
@@ -57,7 +58,7 @@ const SYNTHETIC_LOCAL_PORT_SPAN: usize = 30_000;
 const BENCHMARK_INTERRUPT_ISSUE: &str = "interrupted by Ctrl+C";
 
 type DynError = Box<dyn Error + Send + Sync>;
-type IncomingPeerTx = mpsc::Sender<(PeerConnection, Vec<u8>)>;
+type IncomingPeerTx = mpsc::Sender<IncomingPeerSession>;
 type IncomingRoutes = Arc<Mutex<HashMap<Vec<u8>, IncomingPeerTx>>>;
 
 #[derive(Default)]
@@ -1193,10 +1194,7 @@ async fn run_once(
         event_handle,
     );
 
-    let rate_limit = args
-        .target_gbps
-        .map(gbps_to_bytes_per_second)
-        .unwrap_or(0.0);
+    let rate_limit = synthetic_target_rate_limit(args.target_gbps);
     let global_dl_bucket = Arc::new(TokenBucket::new(rate_limit, rate_limit));
     let global_ul_bucket = Arc::new(TokenBucket::new(rate_limit, rate_limit));
     let harness = HarnessContext {
@@ -1239,6 +1237,7 @@ async fn run_once(
             let (hub, handle) = match spawn_incoming_hub(
                 counters.clone(),
                 harness_shutdown_tx.clone(),
+                resource_client.clone(),
                 args.transport,
             )
             .await
@@ -1949,7 +1948,7 @@ fn build_manager_with_incoming(
     spec: &SyntheticTorrentSpec,
     torrent_data_path: PathBuf,
     validated: bool,
-    incoming_rx: mpsc::Receiver<(PeerConnection, Vec<u8>)>,
+    incoming_rx: mpsc::Receiver<IncomingPeerSession>,
     harness: &HarnessContext,
 ) -> Result<
     (
@@ -1966,7 +1965,7 @@ fn build_manager_with_rx(
     spec: &SyntheticTorrentSpec,
     torrent_data_path: PathBuf,
     validated: bool,
-    incoming_rx: mpsc::Receiver<(PeerConnection, Vec<u8>)>,
+    incoming_rx: mpsc::Receiver<IncomingPeerSession>,
     harness: &HarnessContext,
 ) -> Result<
     (
@@ -2548,6 +2547,7 @@ where
 async fn spawn_incoming_hub(
     counters: Arc<SyntheticCounters>,
     shutdown_tx: broadcast::Sender<()>,
+    resource_client: ResourceManagerClient,
     transport: SyntheticTransport,
 ) -> Result<(SyntheticIncomingHub, JoinHandle<()>), DynError> {
     let routes: IncomingRoutes = Arc::new(Mutex::new(HashMap::new()));
@@ -2568,6 +2568,7 @@ async fn spawn_incoming_hub(
                             spawn_incoming_hub_connection(
                                 connection,
                                 routes.clone(),
+                                resource_client.clone(),
                                 counters.clone(),
                             );
                         }
@@ -2591,6 +2592,7 @@ async fn spawn_incoming_hub(
                             spawn_incoming_hub_connection(
                                 connection,
                                 routes.clone(),
+                                resource_client.clone(),
                                 counters.clone(),
                             );
                         }
@@ -2605,6 +2607,7 @@ async fn spawn_incoming_hub(
             let tcp_routes = routes.clone();
             let tcp_counters = counters.clone();
             let tcp_shutdown = shutdown_tx.clone();
+            let tcp_resource_client = resource_client.clone();
             let tcp_handle = tokio::spawn(async move {
                 let mut shutdown_rx = tcp_shutdown.subscribe();
                 loop {
@@ -2618,6 +2621,7 @@ async fn spawn_incoming_hub(
                             spawn_incoming_hub_connection(
                                 connection,
                                 tcp_routes.clone(),
+                                tcp_resource_client.clone(),
                                 tcp_counters.clone(),
                             );
                         }
@@ -2625,6 +2629,7 @@ async fn spawn_incoming_hub(
                 }
             });
             let utp_routes = routes.clone();
+            let utp_resource_client = resource_client.clone();
             let utp_handle = tokio::spawn(async move {
                 let mut shutdown_rx = shutdown_tx.subscribe();
                 loop {
@@ -2637,6 +2642,7 @@ async fn spawn_incoming_hub(
                             spawn_incoming_hub_connection(
                                 connection,
                                 utp_routes.clone(),
+                                utp_resource_client.clone(),
                                 counters.clone(),
                             );
                         }
@@ -2657,6 +2663,7 @@ async fn spawn_incoming_hub(
 fn spawn_incoming_hub_connection(
     mut connection: PeerConnection,
     routes: IncomingRoutes,
+    resource_client: ResourceManagerClient,
     counters: Arc<SyntheticCounters>,
 ) {
     counters.connections.fetch_add(1, Ordering::Relaxed);
@@ -2672,7 +2679,14 @@ fn spawn_incoming_hub_connection(
                 });
                 match tx {
                     Some(tx) => {
-                        if tx.send((connection, handshake)).await.is_err() {
+                        let Ok(permit) = resource_client.acquire_peer_connection().await else {
+                            counters
+                                .incoming_hub_route_send_errors
+                                .fetch_add(1, Ordering::Relaxed);
+                            counters.protocol_errors.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        };
+                        if tx.send((connection, handshake, permit)).await.is_err() {
                             counters
                                 .incoming_hub_route_send_errors
                                 .fetch_add(1, Ordering::Relaxed);
@@ -5047,6 +5061,12 @@ fn gbps_to_bytes_per_second(gbps: f64) -> f64 {
     }
 }
 
+fn synthetic_target_rate_limit(target_gbps: Option<f64>) -> f64 {
+    target_gbps
+        .map(gbps_to_bytes_per_second)
+        .unwrap_or(f64::INFINITY)
+}
+
 fn bytes_to_bits_per_second(bytes: u64, secs: f64) -> u64 {
     ((bytes as f64 * 8.0) / secs.max(0.001)) as u64
 }
@@ -5165,6 +5185,13 @@ mod tests {
     #[test]
     fn default_utp_chaos_does_not_set_shared_udp_env() {
         assert!(shared_udp_chaos_env_value(SyntheticUdpChaosArgs::default()).is_none());
+    }
+
+    #[test]
+    fn omitted_synthetic_target_rate_is_unlimited() {
+        assert!(synthetic_target_rate_limit(None).is_infinite());
+        assert_eq!(synthetic_target_rate_limit(Some(0.0)), 0.0);
+        assert_eq!(synthetic_target_rate_limit(Some(8.0)), 1_000_000_000.0);
     }
 
     #[test]

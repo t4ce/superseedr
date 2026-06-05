@@ -60,10 +60,6 @@ impl PeerEndpoint {
     pub fn key(&self) -> String {
         format!("{}://{}", self.kind, self.addr)
     }
-
-    pub fn display_addr(&self) -> String {
-        self.addr.to_string()
-    }
 }
 
 impl fmt::Display for PeerEndpoint {
@@ -117,7 +113,7 @@ impl PeerConnection {
     }
 
     pub fn peer_id(&self) -> String {
-        self.endpoint.display_addr()
+        self.transport_key()
     }
 
     pub fn transport_key(&self) -> String {
@@ -162,10 +158,23 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_display_addr_stays_plain_socket_addr() {
+    fn endpoint_display_includes_transport_kind() {
         let addr: SocketAddr = "127.0.0.1:6881".parse().unwrap();
 
-        assert_eq!(PeerEndpoint::tcp(addr).display_addr(), "127.0.0.1:6881");
         assert_eq!(PeerEndpoint::tcp(addr).to_string(), "tcp://127.0.0.1:6881");
+    }
+
+    #[test]
+    fn peer_connection_id_includes_transport_kind() {
+        let addr: SocketAddr = "127.0.0.1:6881".parse().unwrap();
+        let stream = tokio::io::duplex(64).0;
+        let connection = PeerConnection::new(
+            stream,
+            PeerEndpoint::utp(addr),
+            addr,
+            PeerConnectionDirection::Incoming,
+        );
+
+        assert_eq!(connection.peer_id(), "utp://127.0.0.1:6881");
     }
 }

@@ -16,13 +16,20 @@
 #ifdef PrivateBuild
 #define AppName "superseedr private"
 #define AppId "superseedr-private-user"
+#define AppInstallDir "superseedr-private"
+#define AppShortcutName "superseedr private"
+#define InstalledExeName "superseedr-private.exe"
+#define InstallerSubKey "Software\superseedr-private\Installer"
 #else
 #define AppName "superseedr"
 #define AppId "superseedr-user"
+#define AppInstallDir "superseedr"
+#define AppShortcutName "superseedr"
+#define InstalledExeName "superseedr.exe"
+#define InstallerSubKey "Software\superseedr\Installer"
 #endif
 
 #define Publisher "The superseedr Contributors"
-#define AppExeName "superseedr.exe"
 #define AppIcon "..\..\assets\app_icon.ico"
 #define AppBinary "..\..\target\release\superseedr.exe"
 
@@ -34,8 +41,8 @@ AppPublisher={#Publisher}
 AppPublisherURL=https://github.com/Jagalite/superseedr
 AppSupportURL=https://github.com/Jagalite/superseedr/issues
 AppUpdatesURL=https://github.com/Jagalite/superseedr/releases
-DefaultDirName={localappdata}\Programs\superseedr
-DefaultGroupName=superseedr
+DefaultDirName={localappdata}\Programs\{#AppInstallDir}
+DefaultGroupName={#AppShortcutName}
 DisableProgramGroupPage=yes
 OutputDir={#OutputDir}
 #ifdef PrivateBuild
@@ -54,35 +61,39 @@ ChangesAssociations=yes
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"; Flags: unchecked
-Name: "path"; Description: "Add superseedr to PATH for this user"; GroupDescription: "Windows integration:"; Flags: checkedonce
+Name: "path"; Description: "Add {#AppName} to PATH for this user"; GroupDescription: "Windows integration:"; Flags: checkedonce
+#ifndef PrivateBuild
 Name: "associations"; Description: "Register magnet links and .torrent files for this user"; GroupDescription: "Windows integration:"; Flags: checkedonce
+#endif
 
 [Files]
-Source: "{#AppBinary}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#AppBinary}"; DestDir: "{app}"; DestName: "{#InstalledExeName}"; Flags: ignoreversion
 Source: "{#AppIcon}"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\superseedr"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; IconFilename: "{app}\app_icon.ico"
-Name: "{autodesktop}\superseedr"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; IconFilename: "{app}\app_icon.ico"; Tasks: desktopicon
+Name: "{group}\{#AppShortcutName}"; Filename: "{app}\{#InstalledExeName}"; WorkingDir: "{app}"; IconFilename: "{app}\app_icon.ico"
+Name: "{autodesktop}\{#AppShortcutName}"; Filename: "{app}\{#InstalledExeName}"; WorkingDir: "{app}"; IconFilename: "{app}\app_icon.ico"; Tasks: desktopicon
 
 [Registry]
+#ifndef PrivateBuild
 Root: HKCU; Subkey: "Software\Classes\magnet"; ValueType: string; ValueName: ""; ValueData: "URL:Magnet Protocol"; Flags: uninsdeletekey; Tasks: associations
 Root: HKCU; Subkey: "Software\Classes\magnet"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""; Flags: uninsdeletevalue; Tasks: associations
 Root: HKCU; Subkey: "Software\Classes\magnet\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: """{app}\app_icon.ico"",0"; Flags: uninsdeletekey; Tasks: associations
-Root: HKCU; Subkey: "Software\Classes\magnet\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExeName}"" ""%1"""; Flags: uninsdeletekey; Tasks: associations
+Root: HKCU; Subkey: "Software\Classes\magnet\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#InstalledExeName}"" ""%1"""; Flags: uninsdeletekey; Tasks: associations
 
 Root: HKCU; Subkey: "Software\Classes\.torrent"; ValueType: string; ValueName: ""; ValueData: "superseedr.torrent"; Flags: uninsdeletevalue; Tasks: associations
 Root: HKCU; Subkey: "Software\Classes\.torrent"; ValueType: string; ValueName: "Content Type"; ValueData: "application/x-bittorrent"; Flags: uninsdeletevalue; Tasks: associations
 Root: HKCU; Subkey: "Software\Classes\superseedr.torrent"; ValueType: string; ValueName: ""; ValueData: "Torrent File (superseedr)"; Flags: uninsdeletekey; Tasks: associations
 Root: HKCU; Subkey: "Software\Classes\superseedr.torrent\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: """{app}\app_icon.ico"",0"; Flags: uninsdeletekey; Tasks: associations
-Root: HKCU; Subkey: "Software\Classes\superseedr.torrent\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExeName}"" ""%1"""; Flags: uninsdeletekey; Tasks: associations
+Root: HKCU; Subkey: "Software\Classes\superseedr.torrent\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#InstalledExeName}"" ""%1"""; Flags: uninsdeletekey; Tasks: associations
 
-Root: HKCU; Subkey: "Software\Classes\Applications\{#AppExeName}"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "superseedr"; Flags: uninsdeletekey; Tasks: associations
-Root: HKCU; Subkey: "Software\Classes\Applications\{#AppExeName}\SupportedTypes"; ValueType: string; ValueName: ".torrent"; ValueData: ""; Flags: uninsdeletekey; Tasks: associations
-Root: HKCU; Subkey: "Software\Classes\Applications\{#AppExeName}\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExeName}"" ""%1"""; Flags: uninsdeletekey; Tasks: associations
+Root: HKCU; Subkey: "Software\Classes\Applications\{#InstalledExeName}"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#AppName}"; Flags: uninsdeletekey; Tasks: associations
+Root: HKCU; Subkey: "Software\Classes\Applications\{#InstalledExeName}\SupportedTypes"; ValueType: string; ValueName: ".torrent"; ValueData: ""; Flags: uninsdeletekey; Tasks: associations
+Root: HKCU; Subkey: "Software\Classes\Applications\{#InstalledExeName}\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#InstalledExeName}"" ""%1"""; Flags: uninsdeletekey; Tasks: associations
+#endif
 
 [Run]
-Filename: "{app}\{#AppExeName}"; Description: "Launch superseedr"; Flags: nowait postinstall skipifsilent unchecked
+Filename: "{app}\{#InstalledExeName}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent unchecked
 
 [Code]
 const
@@ -90,7 +101,7 @@ const
   SuperseedrWmSettingChange = $001A;
   SuperseedrSmtoAbortIfHung = $0002;
   EnvSubKey = 'Environment';
-  InstallerSubKey = 'Software\superseedr\Installer';
+  InstallerSubKey = '{#InstallerSubKey}';
   PathMarkerName = 'UserPath';
 
 function SendMessageTimeout(hWnd: Longint; Msg: Longint; wParam: Longint; lParam: String; fuFlags: Longint; uTimeout: Longint; var lpdwResult: Longint): Longint;
@@ -243,7 +254,7 @@ end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
-  if (CurStep = ssPostInstall) and IsTaskSelected('path') then
+  if (CurStep = ssPostInstall) and WizardIsTaskSelected('path') then
   begin
     AddToUserPath();
   end;

@@ -1202,6 +1202,7 @@ pub struct SwarmAvailabilityFlashState {
     pub previous_availability: Vec<u32>,
     pub flash_start: Vec<Option<Instant>>,
     pub flash_until: Vec<Option<Instant>>,
+    active_flash_pieces: Vec<usize>,
     previous_peer_bitfields: HashMap<String, Vec<bool>>,
 }
 
@@ -1260,6 +1261,7 @@ impl SwarmAvailabilityFlashState {
             self.previous_availability = current_availability;
             self.flash_start = vec![None; self.previous_availability.len()];
             self.flash_until = vec![None; self.previous_availability.len()];
+            self.active_flash_pieces.clear();
             self.previous_peer_bitfields = current_peer_bitfields;
             return;
         }
@@ -1302,6 +1304,7 @@ impl SwarmAvailabilityFlashState {
             self.previous_availability = current_availability;
             self.flash_start = vec![None; self.previous_availability.len()];
             self.flash_until = vec![None; self.previous_availability.len()];
+            self.active_flash_pieces.clear();
             self.previous_peer_bitfields.clear();
             return;
         }
@@ -1335,6 +1338,9 @@ impl SwarmAvailabilityFlashState {
                 let start = now + delay;
                 self.flash_start[idx] = Some(start);
                 self.flash_until[idx] = Some(start + flash_duration);
+                if !self.active_flash_pieces.contains(&idx) {
+                    self.active_flash_pieces.push(idx);
+                }
                 rank += 1;
             }
         }
@@ -1360,21 +1366,39 @@ impl SwarmAvailabilityFlashState {
     }
 
     pub fn has_active_flash(&self, now: Instant) -> bool {
-        self.flash_until
+        self.active_flash_pieces.iter().any(|&piece_index| {
+            self.flash_until
+                .get(piece_index)
+                .copied()
+                .flatten()
+                .is_some_and(|deadline| deadline > now)
+        })
+    }
+
+    pub fn active_flash_piece_indices(&self, info_hash: &[u8], now: Instant) -> Vec<usize> {
+        if self.info_hash.as_slice() != info_hash {
+            return Vec::new();
+        }
+
+        self.active_flash_pieces
             .iter()
-            .flatten()
-            .any(|&deadline| deadline > now)
+            .copied()
+            .filter(|&piece_index| self.is_piece_flashing(info_hash, piece_index, now))
+            .collect()
     }
 
     fn clear_expired(&mut self, now: Instant) {
-        for idx in 0..self.flash_until.len() {
+        self.active_flash_pieces.retain(|&idx| {
             if self.flash_until[idx].is_some_and(|deadline| deadline <= now) {
                 self.flash_until[idx] = None;
                 if let Some(start) = self.flash_start.get_mut(idx) {
                     *start = None;
                 }
+                false
+            } else {
+                true
             }
-        }
+        });
     }
 }
 
@@ -2132,7 +2156,7 @@ fn initial_disk_throttle_rate(configured_download_limit_bps: u64) -> f64 {
 }
 
 fn configured_download_ceiling_bytes_per_sec(configured_download_limit_bps: u64) -> f64 {
-    if configured_download_limit_bps == crate::config::UNLIMITED_RATE_LIMIT_BPS {
+    if crate::config::is_unlimited_rate_limit_bps(configured_download_limit_bps) {
         f64::INFINITY
     } else {
         configured_download_limit_bps as f64 / 8.0
@@ -2175,7 +2199,7 @@ fn effective_download_limit_bps(
 ) -> u64 {
     match adaptive_bps.filter(|bps| *bps > 0) {
         Some(adaptive_bps)
-            if configured_download_limit_bps != crate::config::UNLIMITED_RATE_LIMIT_BPS =>
+            if !crate::config::is_unlimited_rate_limit_bps(configured_download_limit_bps) =>
         {
             configured_download_limit_bps.min(adaptive_bps)
         }
@@ -2225,7 +2249,8 @@ pub struct App {
 
     pub listener: Option<ListenerSet>,
 
-    pub torrent_manager_incoming_peer_txs: HashMap<Vec<u8>, Sender<(PeerConnection, Vec<u8>)>>,
+    pub torrent_manager_incoming_peer_txs:
+        HashMap<Vec<u8>, Sender<crate::torrent_manager::IncomingPeerSession>>,
     pub torrent_manager_command_txs: HashMap<Vec<u8>, Sender<ManagerCommand>>,
     incoming_peer_handshake_tx: mpsc::Sender<IncomingPeerHandshake>,
     incoming_peer_handshake_rx: mpsc::Receiver<IncomingPeerHandshake>,
@@ -4618,9 +4643,7 @@ impl App {
         let torrent_manager_tx = torrent_manager_tx.clone();
         let app_command_tx = self.app_command_tx.clone();
         tokio::spawn(async move {
-            let session_permit = permit;
-            let send_result = torrent_manager_tx.send((connection, buffer)).await;
-            drop(session_permit);
+            let send_result = torrent_manager_tx.send((connection, buffer, permit)).await;
             match send_result {
                 Ok(()) => {
                     let _ = app_command_tx.try_send(AppCommand::MarkPortOpen(peer_addr));
@@ -6494,7 +6517,8 @@ impl App {
             self.app_state.mode = AppMode::Normal;
         }
 
-        let (incoming_peer_tx, incoming_peer_rx) = mpsc::channel::<(PeerConnection, Vec<u8>)>(100);
+        let (incoming_peer_tx, incoming_peer_rx) =
+            mpsc::channel::<crate::torrent_manager::IncomingPeerSession>(100);
         self.torrent_manager_incoming_peer_txs
             .insert(info_hash.clone(), incoming_peer_tx);
         let (manager_command_tx, manager_command_rx) = mpsc::channel::<ManagerCommand>(100);
@@ -6661,7 +6685,8 @@ impl App {
             self.app_state.mode = AppMode::Normal;
         }
 
-        let (incoming_peer_tx, incoming_peer_rx) = mpsc::channel::<(PeerConnection, Vec<u8>)>(100);
+        let (incoming_peer_tx, incoming_peer_rx) =
+            mpsc::channel::<crate::torrent_manager::IncomingPeerSession>(100);
         self.torrent_manager_incoming_peer_txs
             .insert(info_hash.clone(), incoming_peer_tx);
         let (manager_command_tx, manager_command_rx) = mpsc::channel::<ManagerCommand>(100);
@@ -8873,15 +8898,15 @@ mod tests {
     fn configured_rate_limit_buckets_use_bytes_per_second() {
         assert_eq!(configured_download_bucket_rate(8_000), 1_000.0);
         assert_eq!(configured_upload_bucket_rate(16_000), 2_000.0);
-        assert_eq!(configured_download_bucket_rate(0), 0.0);
-        assert_eq!(configured_upload_bucket_rate(0), 0.0);
+        assert!(configured_download_bucket_rate(0).is_infinite());
+        assert!(configured_upload_bucket_rate(0).is_infinite());
         assert!(
             configured_download_bucket_rate(crate::config::UNLIMITED_RATE_LIMIT_BPS).is_infinite()
         );
         assert!(
             configured_upload_bucket_rate(crate::config::UNLIMITED_RATE_LIMIT_BPS).is_infinite()
         );
-        assert_eq!(configured_download_ceiling_bytes_per_sec(0), 0.0);
+        assert!(configured_download_ceiling_bytes_per_sec(0).is_infinite());
         assert!(
             configured_download_ceiling_bytes_per_sec(crate::config::UNLIMITED_RATE_LIMIT_BPS)
                 .is_infinite()
@@ -8913,7 +8938,10 @@ mod tests {
     fn effective_download_limit_uses_lower_configured_or_adaptive_limit() {
         assert_eq!(effective_download_limit_bps(0, None), 0);
         assert_eq!(effective_download_limit_bps(800_000_000, None), 800_000_000);
-        assert_eq!(effective_download_limit_bps(0, Some(500_000_000)), 0);
+        assert_eq!(
+            effective_download_limit_bps(0, Some(500_000_000)),
+            500_000_000
+        );
         assert_eq!(
             effective_download_limit_bps(
                 crate::config::UNLIMITED_RATE_LIMIT_BPS,
@@ -9206,6 +9234,10 @@ mod tests {
         assert!(state.is_piece_flashing(b"torrent-a", 0, next));
         assert!(!state.is_piece_flashing(b"torrent-a", 1, next));
         assert!(!state.is_piece_flashing(b"torrent-a", 2, next));
+        assert_eq!(
+            state.active_flash_piece_indices(b"torrent-a", next),
+            vec![0]
+        );
         assert!(state.has_active_flash(next));
         assert!(!state.is_piece_flashing(b"torrent-a", 0, next + duration));
         assert!(state.is_piece_flashing(b"torrent-a", 2, next + duration));
@@ -12802,6 +12834,12 @@ mod tests {
             .await
             .expect("build app");
         let info_hash = info_hash_from_torrent_source(&magnet).expect("info hash");
+        let display_state = app
+            .display_state_from_torrent_settings(&app.client_configs.torrents[0])
+            .expect("display state");
+        app.app_state
+            .torrents
+            .insert(info_hash.clone(), display_state);
         let runtime = app
             .app_state
             .torrents
@@ -12873,6 +12911,12 @@ mod tests {
             .await
             .expect("build app");
         let info_hash = info_hash_from_torrent_source(&magnet).expect("info hash");
+        let display_state = app
+            .display_state_from_torrent_settings(&app.client_configs.torrents[0])
+            .expect("display state");
+        app.app_state
+            .torrents
+            .insert(info_hash.clone(), display_state);
         let runtime = app
             .app_state
             .torrents

@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub fn rate_limit_bps_to_bucket_bytes_per_sec(limit_bps: u64) -> f64 {
-    if limit_bps == u64::MAX {
+    if limit_bps == 0 || limit_bps >= i64::MAX as u64 {
         f64::INFINITY
     } else {
         limit_bps as f64 / 8.0
@@ -225,6 +225,11 @@ mod tests {
         assert!(bucket.get_fill_rate() == 0.0);
         assert!((bucket.get_tokens() - 100.0).abs() < TOLERANCE);
         assert!(!bucket.is_infinite.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn rate_limit_zero_bps_maps_to_unlimited_bucket_rate() {
+        assert!(rate_limit_bps_to_bucket_bytes_per_sec(0).is_infinite());
     }
 
     #[test]

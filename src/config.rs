@@ -26,7 +26,11 @@ use crate::theme::ThemeName;
 use strum_macros::EnumCount;
 use strum_macros::EnumIter;
 
-pub const UNLIMITED_RATE_LIMIT_BPS: u64 = u64::MAX;
+pub const UNLIMITED_RATE_LIMIT_BPS: u64 = i64::MAX as u64;
+
+pub fn is_unlimited_rate_limit_bps(limit_bps: u64) -> bool {
+    limit_bps == 0 || limit_bps >= UNLIMITED_RATE_LIMIT_BPS
+}
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default, EnumIter, EnumCount)]
 pub enum TorrentSortColumn {
@@ -2474,7 +2478,6 @@ pub fn set_persisted_shared_config(path: &Path) -> io::Result<SharedConfigSelect
     }
 
     let (mount_root, config_root) = resolve_shared_mount_and_config_root(path.to_path_buf());
-    initialize_persisted_shared_config_defaults(&mount_root, &config_root)?;
     let sidecar_path = launcher_shared_config_path()?;
     if let Some(parent) = sidecar_path.parent() {
         fs::create_dir_all(parent)?;
@@ -2492,19 +2495,6 @@ pub fn set_persisted_shared_config(path: &Path) -> io::Result<SharedConfigSelect
         mount_root,
         config_root,
     })
-}
-
-fn initialize_persisted_shared_config_defaults(
-    mount_root: &Path,
-    config_root: &Path,
-) -> io::Result<()> {
-    fs::create_dir_all(config_root)?;
-    let settings_path = config_root.join("settings.toml");
-    let mut settings: SharedSettingsConfig = read_toml_or_default(&settings_path)?;
-    settings.default_download_folder = Some(PathBuf::new());
-    let _ = write_toml_atomically_with_fingerprint(&settings_path, &settings)?;
-    fs::create_dir_all(mount_root)?;
-    Ok(())
 }
 
 pub fn clear_persisted_shared_config() -> io::Result<bool> {
@@ -5190,18 +5180,17 @@ mod tests {
     }
 
     #[test]
-    fn test_set_persisted_shared_config_defaults_download_folder_to_mount_root() {
+    fn test_set_persisted_shared_config_does_not_write_shared_settings() {
         let _guard = shared_backend_guard().lock().unwrap();
         let temp = set_temp_app_paths();
         let shared_root = temp.path().join("shared-root");
+        fs::create_dir_all(&shared_root).expect("create mounted shared root");
 
         let selection =
             set_persisted_shared_config(&shared_root).expect("persist shared config path");
 
         let settings_path = selection.config_root.join("settings.toml");
-        let raw_settings: SharedSettingsConfig =
-            read_toml_or_default(&settings_path).expect("read shared settings");
-        assert_eq!(raw_settings.default_download_folder, Some(PathBuf::new()));
+        assert!(!settings_path.exists());
 
         let loaded = load_settings().expect("load shared settings");
         assert_eq!(loaded.default_download_folder, Some(selection.mount_root));
@@ -5211,7 +5200,7 @@ mod tests {
     }
 
     #[test]
-    fn test_set_persisted_shared_config_repairs_existing_default_download_folder() {
+    fn test_set_persisted_shared_config_preserves_existing_default_download_folder() {
         let _guard = shared_backend_guard().lock().unwrap();
         let temp = set_temp_app_paths();
         let shared_root = temp.path().join("shared-root");
@@ -5232,10 +5221,16 @@ mod tests {
         let raw_settings: SharedSettingsConfig =
             read_toml_or_default(&selection.config_root.join("settings.toml"))
                 .expect("read shared settings");
-        assert_eq!(raw_settings.default_download_folder, Some(PathBuf::new()));
+        assert_eq!(
+            raw_settings.default_download_folder,
+            Some(PathBuf::from("old-downloads"))
+        );
 
         let loaded = load_settings().expect("load shared settings");
-        assert_eq!(loaded.default_download_folder, Some(shared_root));
+        assert_eq!(
+            loaded.default_download_folder,
+            Some(shared_root.join("old-downloads"))
+        );
 
         set_app_paths_override_for_tests(None);
         clear_shared_config_state();
