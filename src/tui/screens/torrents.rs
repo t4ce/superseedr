@@ -10,7 +10,7 @@ use crate::integrations::control::ControlRequest;
 use crate::theme::ThemeContext;
 use crate::tui::formatters::{
     anonymize_preserving_shape, centered_rect, format_bytes, format_duration, format_speed,
-    sanitize_text, speed_to_style, truncate_with_ellipsis,
+    sanitize_text, speed_to_style,
 };
 use crate::tui::layout::common::{compute_smart_table_layout, SmartCol};
 use crate::tui::screen_context::ScreenContext;
@@ -20,7 +20,7 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::prelude::{Color, Frame, Line, Span, Style, Stylize};
+use ratatui::prelude::{Color, Frame, Line, Modifier, Span, Style};
 use ratatui::widgets::{
     Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table, TableState, Wrap,
 };
@@ -518,15 +518,19 @@ fn draw_management_table(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &
                         if app_state.ui.torrent_management.sort_direction
                             == SortDirection::Ascending
                         {
-                            " ▲"
-                        } else {
                             " ▼"
+                        } else {
+                            " ▲"
                         },
                         style,
                     ));
                 }
                 if is_selected {
-                    spans[0] = spans[0].clone().underlined().bold();
+                    spans[0] = spans[0].clone().style(
+                        style
+                            .fg(ctx.state_selected())
+                            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                    );
                 }
                 Cell::from(Line::from(spans))
             })
@@ -622,7 +626,7 @@ fn management_table_row<'a>(
         .iter()
         .map(|&idx| match all_columns[idx].id {
             ManagementColumnId::Selection => Cell::from(selection_marker),
-            ManagementColumnId::Name => Cell::from(truncate_with_ellipsis(&name, 80)),
+            ManagementColumnId::Name => Cell::from(name.clone()),
             ManagementColumnId::DateAdded => {
                 Cell::from(format_added_date(row.metrics.added_at_unix_secs))
             }

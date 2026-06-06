@@ -4822,9 +4822,9 @@ impl App {
                 torrent_config.torrent_or_magnet.clone(),
                 torrent_config.download_path.clone(),
                 torrent_config.validation_status,
-                torrent_config.torrent_control_state,
-                torrent_config.file_priorities,
-                torrent_config.container_name,
+                torrent_config.torrent_control_state.clone(),
+                torrent_config.file_priorities.clone(),
+                torrent_config.container_name.clone(),
             )
             .await
         } else {
@@ -4832,17 +4832,21 @@ impl App {
                 PathBuf::from(&torrent_config.torrent_or_magnet),
                 torrent_config.download_path.clone(),
                 torrent_config.validation_status,
-                torrent_config.torrent_control_state,
+                torrent_config.torrent_control_state.clone(),
                 torrent_config.file_priorities.clone(),
-                torrent_config.container_name,
+                torrent_config.container_name.clone(),
             )
             .await
         };
 
-        matches!(
+        let restored = matches!(
             ingest_result,
             CommandIngestResult::Added { .. } | CommandIngestResult::Duplicate { .. }
-        )
+        );
+        if restored {
+            preserve_restored_added_at(&mut self.app_state, &torrent_config);
+        }
+        restored
     }
 
     async fn sync_runtime_torrents_from_settings(
@@ -8334,6 +8338,18 @@ fn current_unix_secs() -> u64 {
         .as_secs()
 }
 
+fn preserve_restored_added_at(app_state: &mut AppState, torrent_config: &TorrentSettings) {
+    let Some(added_at_unix_secs) = torrent_config.added_at_unix_secs else {
+        return;
+    };
+    let Some(info_hash) = info_hash_from_torrent_source(&torrent_config.torrent_or_magnet) else {
+        return;
+    };
+    if let Some(runtime) = app_state.torrents.get_mut(&info_hash) {
+        runtime.added_at_unix_secs = Some(added_at_unix_secs);
+    }
+}
+
 fn build_persist_payload(
     client_configs: &mut Settings,
     app_state: &mut AppState,
@@ -8554,13 +8570,14 @@ mod tests {
         effective_download_limit_bps, extract_magnet_display_name, flush_persistence_writer_parts,
         format_filesystem_path_error, initial_disk_throttle_rate,
         is_valid_incoming_bittorrent_handshake, move_file_with_fallback_impl, parse_hybrid_hashes,
-        persisted_validation_status_from_metrics, prune_rss_feed_errors, queue_persistence_payload,
-        refresh_autosort_after_stats, resolve_magnet_torrent_name, rss_settings_changed,
-        should_load_persisted_torrent, should_persist_network_history_on_interval,
-        sort_and_filter_torrent_list_state, swarm_availability_counts, tcp_peer_listener_enabled,
-        torrent_completion_percent, torrent_is_effectively_incomplete, App, AppClusterRole,
-        AppCommand, AppMode, AppRuntimeMode, AppState, ColumnId, CommandIngestResult, DataRate,
-        DhtWaveTargets, DhtWaveUiState, DiskBackpressureDecision, DiskBackpressureDownloadThrottle,
+        persisted_validation_status_from_metrics, preserve_restored_added_at,
+        prune_rss_feed_errors, queue_persistence_payload, refresh_autosort_after_stats,
+        resolve_magnet_torrent_name, rss_settings_changed, should_load_persisted_torrent,
+        should_persist_network_history_on_interval, sort_and_filter_torrent_list_state,
+        swarm_availability_counts, tcp_peer_listener_enabled, torrent_completion_percent,
+        torrent_is_effectively_incomplete, App, AppClusterRole, AppCommand, AppMode,
+        AppRuntimeMode, AppState, ColumnId, CommandIngestResult, DataRate, DhtWaveTargets,
+        DhtWaveUiState, DiskBackpressureDecision, DiskBackpressureDownloadThrottle,
         DiskBackpressureSample, FilePriority, IngestSource, ListenerSet, PeerInfo,
         PeerListenerTransportMode, PeerSortColumn, PersistPayload, SelectedHeader, SortDirection,
         SwarmAvailabilityFlashState, TorrentControlState, TorrentDisplayState, TorrentMetrics,
@@ -9221,6 +9238,46 @@ mod tests {
             torrent.torrent_or_magnet == loaded_magnet
                 && torrent.added_at_unix_secs == Some(1_700_000_000)
         }));
+    }
+
+    #[test]
+    fn preserve_restored_added_at_keeps_original_added_date() {
+        let original_added_at = 1_700_000_000;
+        let restored_runtime_added_at = 1_800_000_000;
+        let magnet = "magnet:?xt=urn:btih:7777777777777777777777777777777777777777".to_string();
+        let info_hash = vec![0x77; 20];
+        let torrent_config = TorrentSettings {
+            torrent_or_magnet: magnet.clone(),
+            name: "sample-restored".to_string(),
+            added_at_unix_secs: Some(original_added_at),
+            torrent_control_state: TorrentControlState::Running,
+            ..Default::default()
+        };
+        let mut app_state = AppState::default();
+        app_state.torrents.insert(
+            info_hash.clone(),
+            TorrentDisplayState {
+                latest_state: TorrentMetrics {
+                    info_hash: info_hash.clone(),
+                    torrent_or_magnet: magnet,
+                    torrent_name: "sample-restored".to_string(),
+                    torrent_control_state: TorrentControlState::Running,
+                    ..Default::default()
+                },
+                added_at_unix_secs: Some(restored_runtime_added_at),
+                ..Default::default()
+            },
+        );
+
+        preserve_restored_added_at(&mut app_state, &torrent_config);
+
+        assert_eq!(
+            app_state
+                .torrents
+                .get(&info_hash)
+                .and_then(|torrent| torrent.added_at_unix_secs),
+            Some(original_added_at)
+        );
     }
 
     #[test]

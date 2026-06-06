@@ -59,7 +59,6 @@ use ratatui::crossterm::event::{
 use ratatui::layout::Layout;
 use ratatui::prelude::{
     symbols, Alignment, Color, Constraint, Direction, Frame, Line, Modifier, Rect, Span, Style,
-    Stylize,
 };
 use ratatui::widgets::{
     Block, Borders, Cell, Clear, Gauge, LineGauge, List, ListItem, Padding, Paragraph, Row, Table,
@@ -2110,15 +2109,19 @@ pub fn draw_torrent_list(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &
             let mut spans = vec![];
             let mut text_span = Span::styled(def.header, style);
             if is_selected {
-                text_span = text_span.underlined().bold();
+                text_span = text_span.style(
+                    style
+                        .fg(ctx.state_selected())
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                );
             }
             spans.push(text_span);
 
             if is_sorting {
                 let arrow = if sort_dir == SortDirection::Ascending {
-                    " ▲"
-                } else {
                     " ▼"
+                } else {
+                    " ▲"
                 };
                 spans.push(Span::styled(arrow, style));
             }
@@ -4873,15 +4876,19 @@ fn draw_peers_table_impl(
                             let mut text = def.header.to_string();
                             if is_sorting {
                                 text.push_str(if sort_direction == SortDirection::Ascending {
-                                    " ▲"
-                                } else {
                                     " ▼"
+                                } else {
+                                    " ▲"
                                 });
                             }
 
                             let mut span = Span::styled(text, style);
                             if is_selected {
-                                span = span.underlined().bold();
+                                span = span.style(
+                                    style
+                                        .fg(ctx.state_selected())
+                                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                                );
                             }
                             Cell::from(Line::from(vec![span]))
                         })
@@ -5967,9 +5974,14 @@ fn render_file_tree_name_spans(
         file_tree_activity_paths(torrent, relative_path, is_dir, download_wave, upload_wave);
     let row_active = !download_paths.is_empty() || !upload_paths.is_empty();
     let active_base_style = render_ctx.ctx.apply(render_ctx.base_style);
+    let inactive_base_style = render_ctx.ctx.apply(
+        render_ctx
+            .base_style
+            .fg(render_ctx.ctx.theme.semantic.surface1),
+    );
 
     if !row_active {
-        return vec![Span::styled(display_name.to_string(), active_base_style)];
+        return vec![Span::styled(display_name.to_string(), inactive_base_style)];
     }
 
     let download_step = render_ctx.download_phase.floor() as usize;
@@ -9242,7 +9254,7 @@ mod tests {
     }
 
     #[test]
-    fn render_file_tree_name_spans_keeps_inactive_rows_at_base_style() {
+    fn render_file_tree_name_spans_mutes_inactive_rows() {
         let mut torrent = create_mock_display_state(0);
         torrent.latest_state.torrent_name = "sample-tree".to_string();
         let ctx = ThemeContext::new(Theme::builtin(ThemeName::CatppuccinMocha), 0.0);
@@ -9266,7 +9278,10 @@ mod tests {
 
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].content, "file.bin");
-        assert_eq!(spans[0].style, ctx.apply(base_style));
+        assert_eq!(
+            spans[0].style,
+            ctx.apply(base_style.fg(ctx.theme.semantic.surface1))
+        );
     }
 
     fn render_list_item_plain_lines(items: Vec<ListItem<'static>>, width: u16) -> Vec<String> {
