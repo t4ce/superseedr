@@ -782,6 +782,28 @@ fn peer_sort_column_uses_autosort(column: PeerSortColumn) -> bool {
     matches!(column, PeerSortColumn::DL | PeerSortColumn::UL)
 }
 
+fn sort_direction_arrow_for_torrent_column(
+    column: TorrentSortColumn,
+    direction: SortDirection,
+) -> &'static str {
+    match (column, direction) {
+        (TorrentSortColumn::Down | TorrentSortColumn::Up, SortDirection::Descending) => " ▼",
+        (_, SortDirection::Ascending) => " ▼",
+        _ => " ▲",
+    }
+}
+
+fn sort_direction_arrow_for_peer_column(
+    column: PeerSortColumn,
+    direction: SortDirection,
+) -> &'static str {
+    match (column, direction) {
+        (PeerSortColumn::DL | PeerSortColumn::UL, SortDirection::Descending) => " ▼",
+        (_, SortDirection::Ascending) => " ▼",
+        _ => " ▲",
+    }
+}
+
 pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>, plan: &LayoutPlan) {
     let app_state = screen.app.state;
     let settings = screen.settings;
@@ -2118,11 +2140,7 @@ pub fn draw_torrent_list(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &
             spans.push(text_span);
 
             if is_sorting {
-                let arrow = if sort_dir == SortDirection::Ascending {
-                    " ▼"
-                } else {
-                    " ▲"
-                };
+                let arrow = sort_direction_arrow_for_torrent_column(sort_col, sort_dir);
                 spans.push(Span::styled(arrow, style));
             }
             Cell::from(Line::from(spans))
@@ -4875,11 +4893,10 @@ fn draw_peers_table_impl(
 
                             let mut text = def.header.to_string();
                             if is_sorting {
-                                text.push_str(if sort_direction == SortDirection::Ascending {
-                                    " ▼"
-                                } else {
-                                    " ▲"
-                                });
+                                text.push_str(sort_direction_arrow_for_peer_column(
+                                    sort_by,
+                                    sort_direction,
+                                ));
                             }
 
                             let mut span = Span::styled(text, style);
@@ -7081,6 +7098,46 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
     use tempfile::tempdir;
+
+    #[test]
+    fn sort_direction_arrows_show_highest_first_rates_as_down() {
+        assert_eq!(
+            sort_direction_arrow_for_torrent_column(
+                TorrentSortColumn::Down,
+                SortDirection::Descending
+            ),
+            " ▼"
+        );
+        assert_eq!(
+            sort_direction_arrow_for_torrent_column(
+                TorrentSortColumn::Up,
+                SortDirection::Descending
+            ),
+            " ▼"
+        );
+        assert_eq!(
+            sort_direction_arrow_for_peer_column(PeerSortColumn::DL, SortDirection::Descending),
+            " ▼"
+        );
+        assert_eq!(
+            sort_direction_arrow_for_peer_column(PeerSortColumn::UL, SortDirection::Descending),
+            " ▼"
+        );
+        assert_eq!(
+            sort_direction_arrow_for_torrent_column(
+                TorrentSortColumn::Name,
+                SortDirection::Ascending
+            ),
+            " ▼"
+        );
+        assert_eq!(
+            sort_direction_arrow_for_torrent_column(
+                TorrentSortColumn::Name,
+                SortDirection::Descending
+            ),
+            " ▲"
+        );
+    }
 
     fn create_mock_metrics(peer_count: usize) -> TorrentMetrics {
         let mut peers = Vec::new();
