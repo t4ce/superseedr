@@ -99,16 +99,7 @@ const MAX_PIECE_WRITE_ATTEMPTS: u32 = 12;
 const ACTIVITY_MESSAGE_MAX_LEN: usize = 28;
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const UTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-const NORMAL_TRACKER_STOP_ANNOUNCE_TIMEOUT: Duration = Duration::from_millis(500);
 const PRIVATE_TRACKER_STOP_ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(4);
-
-fn tracker_stop_announce_timeout(private_client: bool) -> Duration {
-    if private_client {
-        PRIVATE_TRACKER_STOP_ANNOUNCE_TIMEOUT
-    } else {
-        NORMAL_TRACKER_STOP_ANNOUNCE_TIMEOUT
-    }
-}
 
 fn shutdown_tracker_urls(
     tracker_urls: Vec<String>,
@@ -1529,11 +1520,34 @@ impl TorrentManager {
                     }
                 }
 
-                let tracker_urls = shutdown_tracker_urls(
-                    tracker_urls,
-                    &self.state.trackers,
-                    self.settings.private_client,
-                );
+                let private_client = self.settings.private_client;
+                let tracker_urls =
+                    shutdown_tracker_urls(tracker_urls, &self.state.trackers, private_client);
+
+                let tx = self.manager_event_tx.clone();
+                let info_hash = self.state.info_hash.clone();
+
+                if !private_client {
+                    for url in tracker_urls {
+                        let info_hash = self.state.info_hash.clone();
+                        let port = self.settings.client_port;
+                        let client_id = self.settings.client_id.clone();
+
+                        tokio::spawn(async move {
+                            announce_stopped(
+                                url, &info_hash, client_id, port, uploaded, downloaded, left,
+                            )
+                            .await;
+                        });
+                    }
+
+                    tokio::spawn(async move {
+                        let _ = tx
+                            .send(ManagerEvent::DeletionComplete(info_hash, Ok(())))
+                            .await;
+                    });
+                    return;
+                }
 
                 let mut announce_set = JoinSet::new();
                 for url in tracker_urls {
@@ -1549,13 +1563,8 @@ impl TorrentManager {
                     });
                 }
 
-                let tx = self.manager_event_tx.clone();
-                let info_hash = self.state.info_hash.clone();
-                let stop_announce_timeout =
-                    tracker_stop_announce_timeout(self.settings.private_client);
-
                 tokio::spawn(async move {
-                    if (timeout(stop_announce_timeout, async {
+                    if (timeout(PRIVATE_TRACKER_STOP_ANNOUNCE_TIMEOUT, async {
                         while announce_set.join_next().await.is_some() {}
                     })
                     .await)
@@ -3678,12 +3687,11 @@ mod tests {
     use tokio::sync::{broadcast, mpsc, watch};
 
     #[test]
-    fn tracker_stop_announce_timeout_uses_short_normal_budget_and_private_budget() {
+    fn private_tracker_stop_announce_timeout_is_four_seconds() {
         assert_eq!(
-            tracker_stop_announce_timeout(false),
-            Duration::from_millis(500)
+            PRIVATE_TRACKER_STOP_ANNOUNCE_TIMEOUT,
+            Duration::from_secs(4)
         );
-        assert_eq!(tracker_stop_announce_timeout(true), Duration::from_secs(4));
     }
 
     #[test]
