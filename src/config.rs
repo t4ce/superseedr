@@ -15,8 +15,8 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-use crate::app::FilePriority;
 use crate::app::TorrentControlState;
+use crate::app::{DataRate, FilePriority};
 use crate::fs_atomic::{
     deserialize_versioned_toml, serialize_versioned_toml, write_string_atomically,
     write_toml_atomically,
@@ -189,6 +189,7 @@ pub struct Settings {
     pub peer_sort_direction: SortDirection,
     pub peer_sort_pinned: bool,
     pub ui_theme: ThemeName,
+    pub ui_refresh_rate: DataRate,
     pub watch_folder: Option<PathBuf>,
     pub default_download_folder: Option<PathBuf>,
     pub max_connected_peers: usize,
@@ -226,6 +227,7 @@ impl Default for Settings {
             peer_sort_direction: PeerSortColumn::default().default_direction(),
             peer_sort_pinned: false,
             ui_theme: ThemeName::default(),
+            ui_refresh_rate: DataRate::default(),
             max_connected_peers: 2000,
             bootstrap_nodes: vec![
                 "router.utorrent.com:6881".to_string(),
@@ -402,6 +404,7 @@ struct SharedSettingsConfig {
     pub peer_sort_direction: SortDirection,
     pub peer_sort_pinned: bool,
     pub ui_theme: ThemeName,
+    pub ui_refresh_rate: DataRate,
     pub default_download_folder: Option<PathBuf>,
     pub max_connected_peers: usize,
     pub bootstrap_nodes: Vec<String>,
@@ -433,6 +436,7 @@ impl Default for SharedSettingsConfig {
             peer_sort_direction: settings.peer_sort_direction,
             peer_sort_pinned: settings.peer_sort_pinned,
             ui_theme: settings.ui_theme,
+            ui_refresh_rate: settings.ui_refresh_rate,
             default_download_folder: None,
             max_connected_peers: settings.max_connected_peers,
             bootstrap_nodes: settings.bootstrap_nodes,
@@ -856,6 +860,7 @@ impl SharedSettingsConfig {
             peer_sort_direction: settings.peer_sort_direction,
             peer_sort_pinned: settings.peer_sort_pinned,
             ui_theme: settings.ui_theme,
+            ui_refresh_rate: settings.ui_refresh_rate,
             default_download_folder: settings
                 .default_download_folder
                 .as_deref()
@@ -893,6 +898,7 @@ impl SharedSettingsConfig {
         settings.peer_sort_direction = self.peer_sort_direction;
         settings.peer_sort_pinned = self.peer_sort_pinned;
         settings.ui_theme = self.ui_theme;
+        settings.ui_refresh_rate = self.ui_refresh_rate;
         settings.default_download_folder = self
             .default_download_folder
             .as_ref()
@@ -3113,6 +3119,7 @@ mod tests {
             torrent_sort_direction = "Descending"
             peer_sort_column = "Address"
             peer_sort_direction = "Ascending"
+            ui_refresh_rate = "Rate20s"
 
             watch_folder = "/path/to/watch"
             default_download_folder = "/path/to/download"
@@ -3160,6 +3167,7 @@ mod tests {
         assert_eq!(settings.torrent_sort_column, TorrentSortColumn::Name);
         assert_eq!(settings.torrent_sort_direction, SortDirection::Descending);
         assert_eq!(settings.peer_sort_column, PeerSortColumn::Address);
+        assert_eq!(settings.ui_refresh_rate, DataRate::Rate20s);
         assert_eq!(settings.watch_folder, Some(PathBuf::from("/path/to/watch")));
         assert_eq!(settings.resource_limit_override, Some(1024));
         assert_eq!(
@@ -3236,6 +3244,7 @@ mod tests {
         assert_eq!(settings.global_upload_limit_bps, UNLIMITED_RATE_LIMIT_BPS);
         assert_eq!(settings.torrent_sort_column, TorrentSortColumn::Up);
         assert_eq!(settings.peer_sort_direction, SortDirection::Descending);
+        assert_eq!(settings.ui_refresh_rate, DataRate::Rate1s);
         assert!(settings.watch_folder.is_none());
         assert_eq!(settings.max_connected_peers, 2000);
         assert_eq!(settings.bootstrap_nodes, default_settings.bootstrap_nodes);

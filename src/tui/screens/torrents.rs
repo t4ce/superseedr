@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::app::{
-    torrent_completion_percent, App, AppCommand, AppMode, AppState, TorrentControlState,
-    TorrentDisplayState, TorrentManagementDeleteConfirm,
+    torrent_completion_percent, App, AppCommand, AppMode, AppState, SearchMode,
+    TorrentControlState, TorrentDisplayState, TorrentManagementDeleteConfirm,
 };
 use crate::config::SortDirection;
 use crate::integrations::control::ControlRequest;
@@ -41,6 +41,7 @@ pub enum TorrentManagementAction {
     SearchBackspace,
     SearchCommit,
     SearchCancel,
+    ToggleSearchMode,
     ToggleAnonymizeNames,
     ToggleGrouping,
     ToggleCurrentGroup,
@@ -168,10 +169,15 @@ fn map_key_to_management_action(
         return match key_code {
             KeyCode::Esc => Some(TorrentManagementAction::SearchCancel),
             KeyCode::Enter => Some(TorrentManagementAction::SearchCommit),
+            KeyCode::Tab => Some(TorrentManagementAction::ToggleSearchMode),
             KeyCode::Backspace => Some(TorrentManagementAction::SearchBackspace),
             KeyCode::Char(c) => Some(TorrentManagementAction::SearchInsert(c)),
             _ => None,
         };
+    }
+
+    if management_search_panel_active(app_state) && matches!(key_code, KeyCode::Tab) {
+        return Some(TorrentManagementAction::ToggleSearchMode);
     }
 
     match key_code {
@@ -267,6 +273,14 @@ pub fn reduce_torrent_management_action(
         TorrentManagementAction::SearchCancel => {
             app_state.ui.torrent_management.is_searching = false;
             app_state.ui.torrent_management.search_query.clear();
+            app_state.ui.torrent_management.selected_index = 0;
+        }
+        TorrentManagementAction::ToggleSearchMode => {
+            app_state.ui.torrent_management.search_mode =
+                match app_state.ui.torrent_management.search_mode {
+                    SearchMode::Fuzzy => SearchMode::Regex,
+                    SearchMode::Regex => SearchMode::Fuzzy,
+                };
             app_state.ui.torrent_management.selected_index = 0;
         }
         TorrentManagementAction::ToggleAnonymizeNames => {
@@ -432,7 +446,8 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     let area = centered_rect(94, 88, f.area());
     f.render_widget(Clear, area);
 
-    let chunks = if app_state.ui.torrent_management.is_searching {
+    let search_panel_active = management_search_panel_active(app_state);
+    let chunks = if search_panel_active {
         Layout::vertical([
             Constraint::Length(3),
             Constraint::Min(5),
@@ -443,7 +458,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
         Layout::vertical([Constraint::Min(5), Constraint::Length(1)]).split(area)
     };
 
-    let (table_area, footer_area) = if app_state.ui.torrent_management.is_searching {
+    let (table_area, footer_area) = if search_panel_active {
         draw_management_search_panel(f, app_state, chunks[0], ctx);
         (chunks[1], chunks[2])
     } else {
@@ -458,6 +473,11 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     }
 }
 
+fn management_search_panel_active(app_state: &AppState) -> bool {
+    app_state.ui.torrent_management.is_searching
+        || !app_state.ui.torrent_management.search_query.is_empty()
+}
+
 fn draw_management_search_panel(
     f: &mut Frame,
     app_state: &AppState,
@@ -469,9 +489,28 @@ fn draw_management_search_panel(
         area,
         " Torrent Search ".to_string(),
         sanitize_text(&app_state.ui.torrent_management.search_query),
-        Vec::new(),
+        management_search_mode_spans(app_state, ctx),
         ctx,
     );
+}
+
+fn management_search_mode_spans(app_state: &AppState, ctx: &ThemeContext) -> Vec<Span<'static>> {
+    let (fuzzy_style, regex_style) = match app_state.ui.torrent_management.search_mode {
+        SearchMode::Fuzzy => (
+            ctx.apply(Style::default().fg(ctx.state_selected()).bold()),
+            ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0)),
+        ),
+        SearchMode::Regex => (
+            ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0)),
+            ctx.apply(Style::default().fg(ctx.state_selected()).bold()),
+        ),
+    };
+    vec![
+        Span::raw("  "),
+        Span::styled("Fuzzy", fuzzy_style),
+        Span::raw(" / "),
+        Span::styled("Regex", regex_style),
+    ]
 }
 
 fn draw_management_table(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &ThemeContext) {
@@ -689,6 +728,7 @@ fn draw_management_footer(f: &mut Frame, app_state: &AppState, area: Rect, ctx: 
         push_action("Esc", "cancel", ctx.state_selected());
     } else if app_state.ui.torrent_management.is_searching {
         push_action("Enter", "apply", ctx.state_success());
+        push_action("Tab", "mode", ctx.state_selected());
         push_action("Esc", "clear", ctx.state_error());
     } else {
         push_action("arrows", "nav", ctx.state_info());
@@ -699,6 +739,9 @@ fn draw_management_footer(f: &mut Frame, app_state: &AppState, area: Rect, ctx: 
         push_action("u", "clear", ctx.accent_sapphire());
         push_action("g", "roups", ctx.state_selected());
         push_action("/", "search", ctx.accent_sapphire());
+        if management_search_panel_active(app_state) {
+            push_action("Tab", "mode", ctx.state_selected());
+        }
         push_action("x", "names", ctx.accent_sapphire());
         push_action("p", "ause", ctx.state_warning());
         push_action("d/D", "remove/purge", ctx.state_error());
@@ -1118,6 +1161,7 @@ fn torrent_row(app_state: &AppState, info_hash: Vec<u8>, depth: usize) -> Option
 
 fn visible_torrent_hashes(app_state: &AppState) -> Vec<Vec<u8>> {
     let query = app_state.ui.torrent_management.search_query.trim();
+    let mode = app_state.ui.torrent_management.search_mode;
     let matcher = SkimMatcherV2::default();
     ordered_torrent_hashes(app_state)
         .into_iter()
@@ -1125,7 +1169,7 @@ fn visible_torrent_hashes(app_state: &AppState) -> Vec<Vec<u8>> {
             app_state
                 .torrents
                 .get(info_hash)
-                .is_some_and(|torrent| torrent_matches_query(torrent, query, &matcher))
+                .is_some_and(|torrent| torrent_matches_query(torrent, query, mode, &matcher))
         })
         .collect()
 }
@@ -1160,6 +1204,7 @@ fn ordered_torrent_hashes(app_state: &AppState) -> Vec<Vec<u8>> {
 fn torrent_matches_query(
     torrent: &TorrentDisplayState,
     query: &str,
+    mode: SearchMode,
     matcher: &SkimMatcherV2,
 ) -> bool {
     if query.is_empty() {
@@ -1177,7 +1222,16 @@ fn torrent_matches_query(
     }
     haystack.push(' ');
     haystack.push_str(&torrent_group_label(torrent));
-    matcher.fuzzy_match(&haystack, query).is_some()
+    match mode {
+        SearchMode::Fuzzy => matcher
+            .fuzzy_match(&haystack.to_lowercase(), &query.to_lowercase())
+            .is_some(),
+        SearchMode::Regex => regex::RegexBuilder::new(query)
+            .case_insensitive(true)
+            .build()
+            .ok()
+            .is_some_and(|re| re.is_match(&haystack)),
+    }
 }
 
 fn aggregate_metrics_for_hashes<I>(app_state: &AppState, hashes: I) -> RowMetrics
@@ -1752,6 +1806,94 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].label, "Harbor Lights S01E01");
         assert_eq!(app_state.ui.search_query, "normal");
+    }
+
+    #[test]
+    fn committed_management_search_keeps_search_panel_visible() {
+        let mut app_state = app_state_with_torrents(vec![
+            (hash(1), "Meadow Saga S01E01", 100, 10, 2),
+            (hash(2), "Harbor Lights S01E01", 50, 5, 1),
+        ]);
+        app_state.ui.torrent_management.is_searching = true;
+        app_state.ui.torrent_management.search_query = "harbor".to_string();
+
+        reduce_torrent_management_action(&mut app_state, TorrentManagementAction::SearchCommit);
+
+        assert!(!app_state.ui.torrent_management.is_searching);
+        assert_eq!(app_state.ui.torrent_management.search_query, "harbor");
+        assert!(management_search_panel_active(&app_state));
+    }
+
+    #[test]
+    fn empty_management_search_panel_stays_hidden_outside_search_mode() {
+        let mut app_state =
+            app_state_with_torrents(vec![(hash(1), "Harbor Lights S01E01", 50, 5, 1)]);
+        app_state.ui.torrent_management.is_searching = false;
+        app_state.ui.torrent_management.search_query.clear();
+
+        assert!(!management_search_panel_active(&app_state));
+    }
+
+    #[test]
+    fn tab_toggles_management_search_mode_while_searching() {
+        let mut app_state =
+            app_state_with_torrents(vec![(hash(1), "Harbor Lights S01E01", 50, 5, 1)]);
+        app_state.ui.torrent_management.is_searching = true;
+        assert!(matches!(
+            app_state.ui.torrent_management.search_mode,
+            SearchMode::Fuzzy
+        ));
+        assert_eq!(
+            map_key_to_management_action(KeyCode::Tab, &app_state),
+            Some(TorrentManagementAction::ToggleSearchMode)
+        );
+
+        reduce_torrent_management_action(&mut app_state, TorrentManagementAction::ToggleSearchMode);
+
+        assert!(matches!(
+            app_state.ui.torrent_management.search_mode,
+            SearchMode::Regex
+        ));
+    }
+
+    #[test]
+    fn tab_toggles_management_search_mode_for_committed_search() {
+        let mut app_state =
+            app_state_with_torrents(vec![(hash(1), "Harbor Lights S01E01", 50, 5, 1)]);
+        app_state.ui.torrent_management.is_searching = false;
+        app_state.ui.torrent_management.search_query = "Harbor".to_string();
+
+        assert_eq!(
+            map_key_to_management_action(KeyCode::Tab, &app_state),
+            Some(TorrentManagementAction::ToggleSearchMode)
+        );
+    }
+
+    #[test]
+    fn regex_management_search_filters_torrent_rows() {
+        let mut app_state = app_state_with_torrents(vec![
+            (hash(1), "Meadow Saga S01E01", 100, 10, 2),
+            (hash(2), "Harbor Lights S01E02", 50, 5, 1),
+        ]);
+        app_state.ui.torrent_management.grouping_enabled = false;
+        app_state.ui.torrent_management.search_mode = SearchMode::Regex;
+        app_state.ui.torrent_management.search_query = r"S01E0[12]".to_string();
+
+        let rows = build_management_rows(&app_state);
+
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn invalid_regex_management_search_matches_no_rows() {
+        let mut app_state =
+            app_state_with_torrents(vec![(hash(1), "Harbor Lights S01E01", 50, 5, 1)]);
+        app_state.ui.torrent_management.search_mode = SearchMode::Regex;
+        app_state.ui.torrent_management.search_query = "[".to_string();
+
+        let rows = build_management_rows(&app_state);
+
+        assert!(rows.is_empty());
     }
 
     #[test]

@@ -492,7 +492,7 @@ pub struct FileMetadata {
     pub modified: std::time::SystemTime,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DataRate {
     RateQuarter,
     RateHalf,
@@ -1711,6 +1711,7 @@ pub struct TorrentManagementUiState {
     pub grouping_enabled: bool,
     pub is_searching: bool,
     pub search_query: String,
+    pub search_mode: SearchMode,
     pub selected_column_index: usize,
     pub sort_column_index: Option<usize>,
     pub sort_direction: SortDirection,
@@ -1727,6 +1728,7 @@ impl Default for TorrentManagementUiState {
             grouping_enabled: false,
             is_searching: false,
             search_query: String::new(),
+            search_mode: SearchMode::Fuzzy,
             selected_column_index: 1,
             sort_column_index: Some(1),
             sort_direction: SortDirection::Ascending,
@@ -1734,6 +1736,13 @@ impl Default for TorrentManagementUiState {
             confirm_delete: None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SearchMode {
+    #[default]
+    Fuzzy,
+    Regex,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2742,6 +2751,7 @@ impl App {
             peer_sort: (client_configs.peer_sort_column, peer_sort_direction),
             torrent_sort_pinned: client_configs.torrent_sort_pinned,
             peer_sort_pinned: client_configs.peer_sort_pinned,
+            data_rate: client_configs.ui_refresh_rate,
             rss_runtime: RssRuntimeState {
                 history: persisted_rss_state.history,
                 preview_items: Vec::new(),
@@ -4994,6 +5004,14 @@ impl App {
 
         if new_settings.ui_theme != old_settings.ui_theme {
             self.app_state.theme = Theme::builtin(new_settings.ui_theme);
+        }
+        if new_settings.ui_refresh_rate != old_settings.ui_refresh_rate {
+            self.app_state.data_rate = new_settings.ui_refresh_rate;
+            for manager_tx in self.torrent_manager_command_txs.values() {
+                let _ = manager_tx.try_send(ManagerCommand::SetDataRate(
+                    new_settings.ui_refresh_rate.as_ms(),
+                ));
+            }
         }
 
         let port_changed = new_settings.client_port != old_settings.client_port;
@@ -8366,6 +8384,7 @@ fn build_persist_payload(
     client_configs.peer_sort_column = app_state.peer_sort.0;
     client_configs.peer_sort_direction = app_state.peer_sort.1;
     client_configs.peer_sort_pinned = app_state.peer_sort_pinned;
+    client_configs.ui_refresh_rate = app_state.data_rate;
     let old_validation_statuses: HashMap<String, bool> = client_configs
         .torrents
         .iter()
