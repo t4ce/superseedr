@@ -3,7 +3,7 @@
 
 use crate::app::{
     torrent_completion_percent, App, AppCommand, AppMode, AppState, SearchMode,
-    TorrentControlState, TorrentDisplayState, TorrentManagementDeleteConfirm,
+    TorrentControlState, TorrentDisplayState, TorrentManagementPendingCommand,
 };
 use crate::config::SortDirection;
 use crate::integrations::control::ControlRequest;
@@ -50,8 +50,9 @@ pub enum TorrentManagementAction {
     ClearSelection,
     TogglePauseTargets,
     StartDelete { delete_files: bool },
-    ConfirmDelete,
-    CancelDelete,
+    ShowSubmitConfirmation,
+    CancelSubmitConfirmation,
+    SubmitPendingCommands,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -130,6 +131,14 @@ struct GroupBucket {
     info_hashes: Vec<Vec<u8>>,
 }
 
+#[derive(Default)]
+struct PendingManagementSummary {
+    pause_count: usize,
+    resume_count: usize,
+    remove_count: usize,
+    purge_count: usize,
+}
+
 pub fn handle_event(event: CrosstermEvent, app: &mut App) -> bool {
     if !matches!(app.app_state.mode, AppMode::TorrentManagement) {
         return false;
@@ -157,10 +166,12 @@ fn map_key_to_management_action(
     key_code: KeyCode,
     app_state: &AppState,
 ) -> Option<TorrentManagementAction> {
-    if app_state.ui.torrent_management.confirm_delete.is_some() {
+    if app_state.ui.torrent_management.confirm_submit {
         return match key_code {
-            KeyCode::Char('Y') => Some(TorrentManagementAction::ConfirmDelete),
-            KeyCode::Esc | KeyCode::Char('q') => Some(TorrentManagementAction::CancelDelete),
+            KeyCode::Char('Y') => Some(TorrentManagementAction::SubmitPendingCommands),
+            KeyCode::Esc | KeyCode::Char('q') => {
+                Some(TorrentManagementAction::CancelSubmitConfirmation)
+            }
             _ => None,
         };
     }
@@ -190,6 +201,9 @@ fn map_key_to_management_action(
         KeyCode::Char('/') => Some(TorrentManagementAction::StartSearch),
         KeyCode::Char('x') => Some(TorrentManagementAction::ToggleAnonymizeNames),
         KeyCode::Char('g') => Some(TorrentManagementAction::ToggleGrouping),
+        KeyCode::Char('Y') if !app_state.ui.torrent_management.pending_commands.is_empty() => {
+            Some(TorrentManagementAction::ShowSubmitConfirmation)
+        }
         KeyCode::Enter => Some(TorrentManagementAction::ToggleCurrentGroup),
         KeyCode::Char(' ') => Some(TorrentManagementAction::ToggleCurrentSelection),
         KeyCode::Char('A') => Some(TorrentManagementAction::SelectAllVisible),
@@ -218,7 +232,9 @@ pub fn reduce_torrent_management_action(
     match action {
         TorrentManagementAction::ToNormal => {
             app_state.ui.torrent_management.is_searching = false;
-            app_state.ui.torrent_management.confirm_delete = None;
+            app_state.ui.torrent_management.search_query.clear();
+            app_state.ui.torrent_management.pending_commands.clear();
+            app_state.ui.torrent_management.confirm_submit = false;
             result.effects.push(TorrentManagementEffect::ToNormal);
         }
         TorrentManagementAction::MoveUp => {
@@ -349,17 +365,18 @@ pub fn reduce_torrent_management_action(
                             info_hash_hex: hex::encode(&info_hash),
                         }
                     };
-                    result
-                        .effects
-                        .push(TorrentManagementEffect::SubmitControlRequest(request));
-                    result
-                        .effects
-                        .push(TorrentManagementEffect::MarkControlState {
+                    upsert_pending_management_command(
+                        app_state,
+                        TorrentManagementPendingCommand {
                             info_hash,
+                            request,
                             state,
                             delete_files: false,
-                        });
+                        },
+                    );
                 }
+                app_state.ui.torrent_management.status_message =
+                    Some(pending_management_status(app_state));
             }
         }
         TorrentManagementAction::StartDelete { delete_files } => {
@@ -368,43 +385,68 @@ pub fn reduce_torrent_management_action(
                 app_state.ui.torrent_management.status_message =
                     Some("No torrents selected".to_string());
             } else {
-                app_state.ui.torrent_management.confirm_delete =
-                    Some(TorrentManagementDeleteConfirm {
-                        info_hashes: targets,
-                        delete_files,
-                    });
+                for info_hash in targets {
+                    upsert_pending_management_command(
+                        app_state,
+                        TorrentManagementPendingCommand {
+                            request: ControlRequest::Delete {
+                                info_hash_hex: hex::encode(&info_hash),
+                                delete_files,
+                            },
+                            info_hash: info_hash.clone(),
+                            state: TorrentControlState::Deleting,
+                            delete_files,
+                        },
+                    );
+                }
+                app_state.ui.torrent_management.status_message =
+                    Some(pending_management_status(app_state));
             }
         }
-        TorrentManagementAction::ConfirmDelete => {
-            if let Some(confirm) = app_state.ui.torrent_management.confirm_delete.take() {
-                for info_hash in confirm.info_hashes {
+        TorrentManagementAction::ShowSubmitConfirmation => {
+            if app_state.ui.torrent_management.pending_commands.is_empty() {
+                app_state.ui.torrent_management.status_message =
+                    Some("No draft commands to submit".to_string());
+            } else {
+                app_state.ui.torrent_management.confirm_submit = true;
+            }
+        }
+        TorrentManagementAction::CancelSubmitConfirmation => {
+            app_state.ui.torrent_management.confirm_submit = false;
+        }
+        TorrentManagementAction::SubmitPendingCommands => {
+            app_state.ui.torrent_management.confirm_submit = false;
+            let pending_commands =
+                std::mem::take(&mut app_state.ui.torrent_management.pending_commands);
+            if pending_commands.is_empty() {
+                app_state.ui.torrent_management.status_message =
+                    Some("No draft commands to submit".to_string());
+            } else {
+                for command in pending_commands {
+                    let is_deleting = command.state == TorrentControlState::Deleting;
                     result
                         .effects
                         .push(TorrentManagementEffect::SubmitControlRequest(
-                            ControlRequest::Delete {
-                                info_hash_hex: hex::encode(&info_hash),
-                                delete_files: confirm.delete_files,
-                            },
+                            command.request,
                         ));
                     result
                         .effects
                         .push(TorrentManagementEffect::MarkControlState {
-                            info_hash: info_hash.clone(),
-                            state: TorrentControlState::Deleting,
-                            delete_files: confirm.delete_files,
+                            info_hash: command.info_hash.clone(),
+                            state: command.state,
+                            delete_files: command.delete_files,
                         });
-                    app_state
-                        .ui
-                        .torrent_management
-                        .selected_hashes
-                        .remove(&info_hash);
+                    if is_deleting {
+                        app_state
+                            .ui
+                            .torrent_management
+                            .selected_hashes
+                            .remove(&command.info_hash);
+                    }
                 }
                 app_state.ui.torrent_management.status_message =
-                    Some("Delete request queued".to_string());
+                    Some("Draft commands submitted".to_string());
             }
-        }
-        TorrentManagementAction::CancelDelete => {
-            app_state.ui.torrent_management.confirm_delete = None;
         }
     }
 
@@ -412,7 +454,6 @@ pub fn reduce_torrent_management_action(
     clamp_management_column_state(app_state);
     result
 }
-
 fn execute_management_effects(app: &mut App, effects: Vec<TorrentManagementEffect>) {
     for effect in effects {
         match effect {
@@ -443,7 +484,7 @@ fn execute_management_effects(app: &mut App, effects: Vec<TorrentManagementEffec
 pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     let app_state = screen.app.state;
     let ctx = screen.theme;
-    let area = centered_rect(94, 88, f.area());
+    let area = f.area();
     f.render_widget(Clear, area);
 
     let search_panel_active = management_search_panel_active(app_state);
@@ -468,8 +509,8 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     draw_management_table(f, app_state, table_area, ctx);
     draw_management_footer(f, app_state, footer_area, ctx);
 
-    if app_state.ui.torrent_management.confirm_delete.is_some() {
-        draw_delete_confirmation(f, app_state, ctx);
+    if app_state.ui.torrent_management.confirm_submit {
+        draw_submit_confirmation(f, app_state, ctx);
     }
 }
 
@@ -554,13 +595,10 @@ fn draw_management_table(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &
                 let mut spans = vec![Span::styled(column.header, style)];
                 if is_sorting {
                     spans.push(Span::styled(
-                        if app_state.ui.torrent_management.sort_direction
-                            == SortDirection::Ascending
-                        {
-                            " ▼"
-                        } else {
-                            " ▲"
-                        },
+                        management_sort_arrow(
+                            column.id,
+                            app_state.ui.torrent_management.sort_direction,
+                        ),
                         style,
                     ));
                 }
@@ -625,8 +663,11 @@ fn management_table_row<'a>(
     };
 
     let row_is_cursor = app_state.ui.torrent_management.selected_index == row_index;
+    let pending_label = pending_management_label_for_row(app_state, row);
     let row_style = if row_is_cursor {
         ctx.apply(Style::default().fg(ctx.state_warning()).bold())
+    } else if pending_label.is_some() {
+        ctx.apply(Style::default().fg(ctx.accent_peach()))
     } else if matches!(row.kind, ManagementRowKind::Group { .. }) {
         ctx.apply(Style::default().fg(ctx.state_selected()).bold())
     } else if row.metrics.state_label == "Paused" {
@@ -670,7 +711,11 @@ fn management_table_row<'a>(
                 Cell::from(format_added_date(row.metrics.added_at_unix_secs))
             }
             ManagementColumnId::Completed => Cell::from(format!("{:.0}%", row.metrics.completed)),
-            ManagementColumnId::State => Cell::from(row.metrics.state_label.clone()),
+            ManagementColumnId::State => Cell::from(
+                pending_label
+                    .clone()
+                    .unwrap_or_else(|| row.metrics.state_label.clone()),
+            ),
             ManagementColumnId::Peers => Cell::from(row.metrics.peer_count.to_string()),
             ManagementColumnId::DownSpeed => management_speed_cell(ctx, row.metrics.download_bps),
             ManagementColumnId::UpSpeed => management_speed_cell(ctx, row.metrics.upload_bps),
@@ -723,14 +768,18 @@ fn draw_management_footer(f: &mut Frame, app_state: &AppState, area: Rect, ctx: 
         ));
     };
 
-    if app_state.ui.torrent_management.confirm_delete.is_some() {
-        push_action("Y", "confirm-delete", ctx.state_error());
+    if app_state.ui.torrent_management.confirm_submit {
+        push_action("Y", "submit", ctx.state_success());
         push_action("Esc", "cancel", ctx.state_selected());
     } else if app_state.ui.torrent_management.is_searching {
         push_action("Enter", "apply", ctx.state_success());
         push_action("Tab", "mode", ctx.state_selected());
         push_action("Esc", "clear", ctx.state_error());
     } else {
+        let pending_count = app_state.ui.torrent_management.pending_commands.len();
+        if pending_count > 0 {
+            push_action("Y", &format!("review-{pending_count}"), ctx.state_success());
+        }
         push_action("arrows", "nav", ctx.state_info());
         push_action("h/l", "columns", ctx.state_selected());
         push_action("s", "ort", ctx.state_warning());
@@ -758,16 +807,13 @@ fn draw_management_footer(f: &mut Frame, app_state: &AppState, area: Rect, ctx: 
     f.render_widget(footer, area);
 }
 
-fn draw_delete_confirmation(f: &mut Frame, app_state: &AppState, ctx: &ThemeContext) {
-    let Some(confirm) = app_state.ui.torrent_management.confirm_delete.as_ref() else {
-        return;
-    };
-    let area = centered_rect(58, 24, f.area());
+fn draw_submit_confirmation(f: &mut Frame, app_state: &AppState, ctx: &ThemeContext) {
+    let area = centered_rect(64, 28, f.area());
     f.render_widget(Clear, area);
 
     let block = Block::default()
         .title(Span::styled(
-            " Confirm ",
+            " Submit Draft ",
             ctx.apply(Style::default().fg(ctx.state_error()).bold()),
         ))
         .borders(Borders::ALL)
@@ -776,16 +822,20 @@ fn draw_delete_confirmation(f: &mut Frame, app_state: &AppState, ctx: &ThemeCont
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let action = if confirm.delete_files {
-        "Purge and delete local data"
-    } else {
-        "Remove from list and keep files"
-    };
+    let summary = pending_management_summary(app_state);
     let body = vec![
         Line::from(Span::styled(
-            format!("{action} for {} torrents?", confirm.info_hashes.len()),
+            format!(
+                "Submit {} staged torrent commands?",
+                app_state.ui.torrent_management.pending_commands.len()
+            ),
             ctx.apply(Style::default().fg(ctx.state_warning()).bold()),
         )),
+        Line::from(""),
+        Line::from(format!("Pause: {}", summary.pause_count)),
+        Line::from(format!("Resume: {}", summary.resume_count)),
+        Line::from(format!("Remove: {}", summary.remove_count)),
+        Line::from(format!("Purge: {}", summary.purge_count)),
         Line::from(""),
         Line::from("Y confirms. Esc cancels."),
     ];
@@ -823,6 +873,13 @@ fn management_columns() -> Vec<ManagementColumnDefinition> {
             constraint: Constraint::Fill(3),
         },
         ManagementColumnDefinition {
+            id: ManagementColumnId::Eta,
+            header: "ETA",
+            min_width: 9,
+            priority: 4,
+            constraint: Constraint::Length(9),
+        },
+        ManagementColumnDefinition {
             id: ManagementColumnId::Completed,
             header: "Done",
             min_width: 7,
@@ -856,13 +913,6 @@ fn management_columns() -> Vec<ManagementColumnDefinition> {
             min_width: 10,
             priority: 1,
             constraint: Constraint::Length(10),
-        },
-        ManagementColumnDefinition {
-            id: ManagementColumnId::Eta,
-            header: "ETA",
-            min_width: 9,
-            priority: 4,
-            constraint: Constraint::Length(9),
         },
         ManagementColumnDefinition {
             id: ManagementColumnId::Size,
@@ -975,17 +1025,30 @@ fn reverse_sort_direction(direction: SortDirection) -> SortDirection {
 }
 
 fn management_column_default_direction(column: ManagementColumnId) -> SortDirection {
-    match column {
-        ManagementColumnId::Selection
-        | ManagementColumnId::Completed
-        | ManagementColumnId::Peers
-        | ManagementColumnId::DownSpeed
-        | ManagementColumnId::UpSpeed
-        | ManagementColumnId::Size
-        | ManagementColumnId::DateAdded => SortDirection::Descending,
-        ManagementColumnId::Name | ManagementColumnId::State | ManagementColumnId::Eta => {
-            SortDirection::Ascending
-        }
+    if management_column_is_numeric(column) {
+        SortDirection::Descending
+    } else {
+        SortDirection::Ascending
+    }
+}
+
+fn management_column_is_numeric(column: ManagementColumnId) -> bool {
+    matches!(
+        column,
+        ManagementColumnId::Completed
+            | ManagementColumnId::Peers
+            | ManagementColumnId::DownSpeed
+            | ManagementColumnId::UpSpeed
+            | ManagementColumnId::Eta
+            | ManagementColumnId::Size
+            | ManagementColumnId::DateAdded
+    )
+}
+
+fn management_sort_arrow(column: ManagementColumnId, direction: SortDirection) -> &'static str {
+    match (management_column_is_numeric(column), direction) {
+        (true, SortDirection::Descending) | (false, SortDirection::Ascending) => " ▼",
+        (true, SortDirection::Ascending) | (false, SortDirection::Descending) => " ▲",
     }
 }
 
@@ -1475,6 +1538,85 @@ fn management_targets(app_state: &AppState) -> Vec<Vec<u8>> {
     current_row_targets(app_state)
 }
 
+fn upsert_pending_management_command(
+    app_state: &mut AppState,
+    command: TorrentManagementPendingCommand,
+) {
+    app_state
+        .ui
+        .torrent_management
+        .pending_commands
+        .retain(|pending| pending.info_hash != command.info_hash);
+    app_state
+        .ui
+        .torrent_management
+        .pending_commands
+        .push(command);
+}
+
+fn pending_management_status(app_state: &AppState) -> String {
+    let pending_count = app_state.ui.torrent_management.pending_commands.len();
+    format!("{pending_count} draft commands pending")
+}
+
+fn pending_management_summary(app_state: &AppState) -> PendingManagementSummary {
+    let mut summary = PendingManagementSummary::default();
+    for command in &app_state.ui.torrent_management.pending_commands {
+        match &command.request {
+            ControlRequest::Pause { .. } => summary.pause_count += 1,
+            ControlRequest::Resume { .. } => summary.resume_count += 1,
+            ControlRequest::Delete {
+                delete_files: true, ..
+            } => summary.purge_count += 1,
+            ControlRequest::Delete {
+                delete_files: false,
+                ..
+            } => summary.remove_count += 1,
+            _ => {}
+        }
+    }
+    summary
+}
+
+fn pending_management_command_for_hash<'a>(
+    app_state: &'a AppState,
+    info_hash: &[u8],
+) -> Option<&'a TorrentManagementPendingCommand> {
+    app_state
+        .ui
+        .torrent_management
+        .pending_commands
+        .iter()
+        .find(|command| command.info_hash == info_hash)
+}
+
+fn pending_management_label_for_row(app_state: &AppState, row: &ManagementRow) -> Option<String> {
+    let mut matching_commands = row
+        .info_hashes
+        .iter()
+        .filter_map(|hash| pending_management_command_for_hash(app_state, hash));
+    let first = matching_commands.next()?;
+    let all_match = row
+        .info_hashes
+        .iter()
+        .all(|hash| pending_management_command_for_hash(app_state, hash) == Some(first));
+    if !all_match {
+        return Some("Draft".to_string());
+    }
+
+    Some(match first.state {
+        TorrentControlState::Paused => "Draft pause".to_string(),
+        TorrentControlState::Running => "Draft resume".to_string(),
+        TorrentControlState::Deleting => {
+            if first.delete_files {
+                "Draft purge".to_string()
+            } else {
+                "Draft remove".to_string()
+            }
+        }
+    })
+}
+
 fn prune_selected_hashes(app_state: &mut AppState) {
     let live_hashes: HashSet<Vec<u8>> = app_state.torrents.keys().cloned().collect();
     app_state
@@ -1482,6 +1624,11 @@ fn prune_selected_hashes(app_state: &mut AppState) {
         .torrent_management
         .selected_hashes
         .retain(|hash| live_hashes.contains(hash));
+    app_state
+        .ui
+        .torrent_management
+        .pending_commands
+        .retain(|command| live_hashes.contains(&command.info_hash));
 }
 
 fn clamp_management_selection(app_state: &mut AppState) {
@@ -1597,12 +1744,12 @@ mod tests {
             vec![
                 ManagementColumnId::Selection,
                 ManagementColumnId::Name,
+                ManagementColumnId::Eta,
                 ManagementColumnId::Completed,
                 ManagementColumnId::State,
                 ManagementColumnId::Peers,
                 ManagementColumnId::DownSpeed,
                 ManagementColumnId::UpSpeed,
-                ManagementColumnId::Eta,
                 ManagementColumnId::Size,
                 ManagementColumnId::DateAdded,
             ]
@@ -1694,6 +1841,34 @@ mod tests {
         assert_eq!(
             app_state.ui.torrent_management.sort_direction,
             SortDirection::Ascending
+        );
+    }
+
+    #[test]
+    fn sorting_unsorted_numeric_column_starts_highest_first_with_down_arrow() {
+        let mut app_state = app_state_with_torrents(vec![
+            (hash(1), "Fewer Peers", 100, 10, 2),
+            (hash(2), "More Peers", 100, 10, 7),
+        ]);
+        app_state.ui.torrent_management.grouping_enabled = false;
+        app_state.ui.torrent_management.sort_column_index = None;
+        app_state.ui.torrent_management.selected_column_index =
+            management_column_index(ManagementColumnId::Peers).expect("peers column");
+
+        reduce_torrent_management_action(
+            &mut app_state,
+            TorrentManagementAction::SortBySelectedColumn,
+        );
+
+        let rows = build_management_rows(&app_state);
+        assert_eq!(rows[0].label, "More Peers");
+        assert_eq!(
+            app_state.ui.torrent_management.sort_direction,
+            SortDirection::Descending
+        );
+        assert_eq!(
+            management_sort_arrow(ManagementColumnId::Peers, SortDirection::Descending),
+            " ▼"
         );
     }
 
@@ -1993,7 +2168,7 @@ mod tests {
     }
 
     #[test]
-    fn pause_action_emits_batch_pause_requests_for_selected_torrents() {
+    fn pause_action_stages_batch_pause_requests_for_selected_torrents() {
         let mut app_state = app_state_with_torrents(vec![
             (hash(1), "Meadow Saga S01E01", 100, 10, 2),
             (hash(2), "Meadow Saga S01E02", 300, 20, 3),
@@ -2014,6 +2189,84 @@ mod tests {
             TorrentManagementAction::TogglePauseTargets,
         );
 
+        assert!(result.effects.is_empty());
+        assert_eq!(app_state.ui.torrent_management.pending_commands.len(), 2);
+        assert!(matches!(
+            app_state.ui.torrent_management.pending_commands[0].request,
+            ControlRequest::Pause { .. }
+        ));
+        assert!(matches!(
+            app_state.ui.torrent_management.pending_commands[1].request,
+            ControlRequest::Pause { .. }
+        ));
+        assert_eq!(
+            map_key_to_management_action(KeyCode::Char('Y'), &app_state),
+            Some(TorrentManagementAction::ShowSubmitConfirmation)
+        );
+        assert_eq!(
+            map_key_to_management_action(KeyCode::Enter, &app_state),
+            Some(TorrentManagementAction::ToggleCurrentGroup)
+        );
+    }
+
+    #[test]
+    fn submit_confirmation_shift_y_emits_staged_requests_and_marks_state() {
+        let mut app_state = app_state_with_torrents(vec![
+            (hash(1), "Meadow Saga S01E01", 100, 10, 2),
+            (hash(2), "Meadow Saga S01E02", 300, 20, 3),
+        ]);
+        app_state
+            .ui
+            .torrent_management
+            .pending_commands
+            .push(TorrentManagementPendingCommand {
+                info_hash: hash(1),
+                request: ControlRequest::Pause {
+                    info_hash_hex: hex::encode(hash(1)),
+                },
+                state: TorrentControlState::Paused,
+                delete_files: false,
+            });
+        app_state
+            .ui
+            .torrent_management
+            .pending_commands
+            .push(TorrentManagementPendingCommand {
+                info_hash: hash(2),
+                request: ControlRequest::Delete {
+                    info_hash_hex: hex::encode(hash(2)),
+                    delete_files: true,
+                },
+                state: TorrentControlState::Deleting,
+                delete_files: true,
+            });
+        app_state
+            .ui
+            .torrent_management
+            .selected_hashes
+            .insert(hash(2));
+
+        reduce_torrent_management_action(
+            &mut app_state,
+            TorrentManagementAction::ShowSubmitConfirmation,
+        );
+        assert!(app_state.ui.torrent_management.confirm_submit);
+        assert_eq!(
+            map_key_to_management_action(KeyCode::Char('Y'), &app_state),
+            Some(TorrentManagementAction::SubmitPendingCommands)
+        );
+        assert_eq!(
+            map_key_to_management_action(KeyCode::Enter, &app_state),
+            None
+        );
+
+        let result = reduce_torrent_management_action(
+            &mut app_state,
+            TorrentManagementAction::SubmitPendingCommands,
+        );
+
+        assert!(!app_state.ui.torrent_management.confirm_submit);
+        assert!(app_state.ui.torrent_management.pending_commands.is_empty());
         assert_eq!(result.effects.len(), 4);
         assert!(matches!(
             result.effects[0],
@@ -2021,12 +2274,82 @@ mod tests {
         ));
         assert!(matches!(
             result.effects[2],
-            TorrentManagementEffect::SubmitControlRequest(ControlRequest::Pause { .. })
+            TorrentManagementEffect::SubmitControlRequest(ControlRequest::Delete { .. })
         ));
+        assert!(!app_state
+            .ui
+            .torrent_management
+            .selected_hashes
+            .contains(&hash(2)));
     }
 
     #[test]
-    fn delete_action_opens_confirmation_for_selected_targets() {
+    fn exiting_management_clears_pending_draft_and_filter() {
+        let mut app_state =
+            app_state_with_torrents(vec![(hash(1), "Meadow Saga S01E01", 100, 10, 2)]);
+        app_state
+            .ui
+            .torrent_management
+            .pending_commands
+            .push(TorrentManagementPendingCommand {
+                info_hash: hash(1),
+                request: ControlRequest::Pause {
+                    info_hash_hex: hex::encode(hash(1)),
+                },
+                state: TorrentControlState::Paused,
+                delete_files: false,
+            });
+        app_state.ui.torrent_management.confirm_submit = true;
+        app_state.ui.torrent_management.is_searching = true;
+        app_state.ui.torrent_management.search_query = "meadow".to_string();
+
+        let result =
+            reduce_torrent_management_action(&mut app_state, TorrentManagementAction::ToNormal);
+
+        assert!(matches!(
+            result.effects.as_slice(),
+            [TorrentManagementEffect::ToNormal]
+        ));
+        assert!(app_state.ui.torrent_management.pending_commands.is_empty());
+        assert!(!app_state.ui.torrent_management.confirm_submit);
+        assert!(!app_state.ui.torrent_management.is_searching);
+        assert!(app_state.ui.torrent_management.search_query.is_empty());
+    }
+
+    #[test]
+    fn clear_selection_keeps_pending_draft() {
+        let mut app_state = app_state_with_torrents(vec![
+            (hash(1), "Meadow Saga S01E01", 100, 10, 2),
+            (hash(2), "Meadow Saga S01E02", 300, 20, 3),
+        ]);
+        app_state
+            .ui
+            .torrent_management
+            .selected_hashes
+            .insert(hash(2));
+        app_state
+            .ui
+            .torrent_management
+            .pending_commands
+            .push(TorrentManagementPendingCommand {
+                info_hash: hash(1),
+                request: ControlRequest::Pause {
+                    info_hash_hex: hex::encode(hash(1)),
+                },
+                state: TorrentControlState::Paused,
+                delete_files: false,
+            });
+        app_state.ui.torrent_management.confirm_submit = true;
+
+        reduce_torrent_management_action(&mut app_state, TorrentManagementAction::ClearSelection);
+
+        assert!(app_state.ui.torrent_management.selected_hashes.is_empty());
+        assert_eq!(app_state.ui.torrent_management.pending_commands.len(), 1);
+        assert!(app_state.ui.torrent_management.confirm_submit);
+    }
+
+    #[test]
+    fn delete_action_stages_delete_request_without_confirmation() {
         let mut app_state = app_state_with_torrents(vec![
             (hash(1), "Cinder Trails S01E01", 100, 10, 2),
             (hash(2), "Cinder Trails S01E02", 300, 20, 3),
@@ -2042,12 +2365,67 @@ mod tests {
             TorrentManagementAction::StartDelete { delete_files: true },
         );
 
-        let confirm = app_state
-            .ui
-            .torrent_management
-            .confirm_delete
-            .expect("delete confirmation");
-        assert_eq!(confirm.info_hashes, vec![hash(2)]);
-        assert!(confirm.delete_files);
+        assert!(!app_state.ui.torrent_management.confirm_submit);
+        assert_eq!(app_state.ui.torrent_management.pending_commands.len(), 1);
+        assert!(matches!(
+            app_state.ui.torrent_management.pending_commands[0].request,
+            ControlRequest::Delete {
+                delete_files: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn pending_management_summary_counts_draft_actions() {
+        let mut app_state = app_state_with_torrents(vec![
+            (hash(1), "Cinder Trails S01E01", 100, 10, 2),
+            (hash(2), "Cinder Trails S01E02", 300, 20, 3),
+            (hash(3), "Meadow Saga S01E01", 100, 10, 2),
+            (hash(4), "Meadow Saga S01E02", 300, 20, 3),
+        ]);
+        app_state.ui.torrent_management.pending_commands = vec![
+            TorrentManagementPendingCommand {
+                info_hash: hash(1),
+                request: ControlRequest::Pause {
+                    info_hash_hex: hex::encode(hash(1)),
+                },
+                state: TorrentControlState::Paused,
+                delete_files: false,
+            },
+            TorrentManagementPendingCommand {
+                info_hash: hash(2),
+                request: ControlRequest::Resume {
+                    info_hash_hex: hex::encode(hash(2)),
+                },
+                state: TorrentControlState::Running,
+                delete_files: false,
+            },
+            TorrentManagementPendingCommand {
+                info_hash: hash(3),
+                request: ControlRequest::Delete {
+                    info_hash_hex: hex::encode(hash(3)),
+                    delete_files: false,
+                },
+                state: TorrentControlState::Deleting,
+                delete_files: false,
+            },
+            TorrentManagementPendingCommand {
+                info_hash: hash(4),
+                request: ControlRequest::Delete {
+                    info_hash_hex: hex::encode(hash(4)),
+                    delete_files: true,
+                },
+                state: TorrentControlState::Deleting,
+                delete_files: true,
+            },
+        ];
+
+        let summary = pending_management_summary(&app_state);
+
+        assert_eq!(summary.pause_count, 1);
+        assert_eq!(summary.resume_count, 1);
+        assert_eq!(summary.remove_count, 1);
+        assert_eq!(summary.purge_count, 1);
     }
 }

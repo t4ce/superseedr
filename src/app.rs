@@ -1707,6 +1707,7 @@ pub struct JournalUiState {
 pub struct TorrentManagementUiState {
     pub selected_index: usize,
     pub selected_hashes: HashSet<Vec<u8>>,
+    pub pending_commands: Vec<TorrentManagementPendingCommand>,
     pub expanded_groups: HashSet<String>,
     pub grouping_enabled: bool,
     pub is_searching: bool,
@@ -1716,7 +1717,7 @@ pub struct TorrentManagementUiState {
     pub sort_column_index: Option<usize>,
     pub sort_direction: SortDirection,
     pub status_message: Option<String>,
-    pub confirm_delete: Option<TorrentManagementDeleteConfirm>,
+    pub confirm_submit: bool,
 }
 
 impl Default for TorrentManagementUiState {
@@ -1724,6 +1725,7 @@ impl Default for TorrentManagementUiState {
         Self {
             selected_index: 0,
             selected_hashes: HashSet::new(),
+            pending_commands: Vec::new(),
             expanded_groups: HashSet::new(),
             grouping_enabled: false,
             is_searching: false,
@@ -1733,7 +1735,7 @@ impl Default for TorrentManagementUiState {
             sort_column_index: Some(1),
             sort_direction: SortDirection::Ascending,
             status_message: None,
-            confirm_delete: None,
+            confirm_submit: false,
         }
     }
 }
@@ -1746,8 +1748,10 @@ pub enum SearchMode {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TorrentManagementDeleteConfirm {
-    pub info_hashes: Vec<Vec<u8>>,
+pub struct TorrentManagementPendingCommand {
+    pub info_hash: Vec<u8>,
+    pub request: ControlRequest,
+    pub state: TorrentControlState,
     pub delete_files: bool,
 }
 
