@@ -3,6 +3,7 @@
 
 use crate::app::{AppCommand, AppMode, AppState, RssScreen, RssSectionFocus};
 use crate::config::RssFilterMode;
+use crate::tui::app_command::spawn_app_command_sender;
 use crate::tui::formatters::centered_rect;
 use crate::tui::screen_context::ScreenContext;
 use crate::tui::screens::input_panel::draw_prompt_panel;
@@ -15,7 +16,7 @@ use reqwest::Url;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RssAction {
@@ -338,6 +339,7 @@ fn execute_rss_effects(
     app_state: &mut AppState,
     settings: &crate::config::Settings,
     app_command_tx: &mpsc::Sender<AppCommand>,
+    shutdown_tx: Option<&broadcast::Sender<()>>,
     effects: Vec<RssAction>,
 ) {
     if app_state.rss_derived.explorer_items.is_empty()
@@ -353,10 +355,17 @@ fn execute_rss_effects(
     fn try_update_config(
         app_state: &mut AppState,
         app_command_tx: &mpsc::Sender<AppCommand>,
+        shutdown_tx: Option<&broadcast::Sender<()>>,
         new_settings: crate::config::Settings,
         success_message: Option<&str>,
     ) -> bool {
-        if app_command_tx
+        if let Some(shutdown_tx) = shutdown_tx {
+            spawn_app_command_sender(
+                app_command_tx.clone(),
+                shutdown_tx.subscribe(),
+                AppCommand::UpdateConfig(new_settings),
+            );
+        } else if app_command_tx
             .try_send(AppCommand::UpdateConfig(new_settings))
             .is_err()
         {
@@ -428,7 +437,13 @@ fn execute_rss_effects(
                 if !settings.rss.enabled {
                     let mut new_settings = settings.clone();
                     new_settings.rss.enabled = true;
-                    if !try_update_config(app_state, app_command_tx, new_settings, None) {
+                    if !try_update_config(
+                        app_state,
+                        app_command_tx,
+                        shutdown_tx,
+                        new_settings,
+                        None,
+                    ) {
                         continue;
                     }
                 }
@@ -513,6 +528,7 @@ fn execute_rss_effects(
                         let _ = try_update_config(
                             app_state,
                             app_command_tx,
+                            shutdown_tx,
                             new_settings,
                             success_message,
                         );
@@ -611,6 +627,7 @@ fn execute_rss_effects(
                             let _ = try_update_config(
                                 app_state,
                                 app_command_tx,
+                                shutdown_tx,
                                 new_settings,
                                 Some("Link deleted"),
                             );
@@ -628,6 +645,7 @@ fn execute_rss_effects(
                             let _ = try_update_config(
                                 app_state,
                                 app_command_tx,
+                                shutdown_tx,
                                 new_settings,
                                 Some("Filter deleted"),
                             );
@@ -661,6 +679,7 @@ fn execute_rss_effects(
                             let _ = try_update_config(
                                 app_state,
                                 app_command_tx,
+                                shutdown_tx,
                                 new_settings,
                                 Some(if enabled {
                                     "Link enabled"
@@ -682,6 +701,7 @@ fn execute_rss_effects(
                             let _ = try_update_config(
                                 app_state,
                                 app_command_tx,
+                                shutdown_tx,
                                 new_settings,
                                 Some(if enabled {
                                     "Filter enabled"
@@ -758,6 +778,32 @@ pub fn handle_event(
     settings: &crate::config::Settings,
     app_command_tx: &mpsc::Sender<AppCommand>,
 ) {
+    handle_event_inner(event, app_state, settings, app_command_tx, None);
+}
+
+pub fn handle_event_with_shutdown(
+    event: CrosstermEvent,
+    app_state: &mut AppState,
+    settings: &crate::config::Settings,
+    app_command_tx: &mpsc::Sender<AppCommand>,
+    shutdown_tx: &broadcast::Sender<()>,
+) {
+    handle_event_inner(
+        event,
+        app_state,
+        settings,
+        app_command_tx,
+        Some(shutdown_tx),
+    );
+}
+
+fn handle_event_inner(
+    event: CrosstermEvent,
+    app_state: &mut AppState,
+    settings: &crate::config::Settings,
+    app_command_tx: &mpsc::Sender<AppCommand>,
+    shutdown_tx: Option<&broadcast::Sender<()>>,
+) {
     if !matches!(app_state.mode, AppMode::Rss) {
         return;
     }
@@ -766,7 +812,13 @@ pub fn handle_event(
         CrosstermEvent::Key(key) => {
             if let Some(action) = map_key_to_rss_action(key.code, key.kind, app_state) {
                 let result = reduce_rss_action(action);
-                execute_rss_effects(app_state, settings, app_command_tx, result.effects);
+                execute_rss_effects(
+                    app_state,
+                    settings,
+                    app_command_tx,
+                    shutdown_tx,
+                    result.effects,
+                );
                 app_state.ui.needs_redraw = true;
             }
         }

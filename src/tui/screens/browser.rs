@@ -7,6 +7,7 @@ use crate::app::{
 };
 use crate::theme::ThemeContext;
 use crate::torrent_manager::ManagerCommand;
+use crate::tui::app_command::send_app_command_until_shutdown;
 use crate::tui::formatters::{centered_rect, format_bytes, truncate_with_ellipsis};
 use crate::tui::layout::browser::calculate_file_browser_layout;
 use crate::tui::screen_context::ScreenContext;
@@ -18,7 +19,10 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
-use tokio::sync::mpsc::{self, Sender};
+use tokio::sync::{
+    broadcast,
+    mpsc::{self, Sender},
+};
 
 const ASCII_TREE_DIR_ICON: &str = "> ";
 const ASCII_TREE_FILE_ICON: &str = "  ";
@@ -1466,11 +1470,13 @@ pub async fn execute_browser_dialog_effects(app: &mut App, effects: Vec<BrowserD
                 apply_browser_transition(app, BrowserTransition::ToConfig);
             }
             BrowserDialogEffect::CleanupPendingLink { async_delete } => {
+                let shutdown_tx = app.shutdown_tx.clone();
                 cleanup_pending_link_on_escape(
                     &app.app_state.pending_torrent_link,
                     &mut app.torrent_manager_command_txs,
                     &mut app.app_state.torrents,
                     &mut app.app_state.torrent_list_order,
+                    &shutdown_tx,
                     async_delete,
                 );
             }
@@ -1594,10 +1600,13 @@ pub async fn execute_confirm_decision(
                     payload.file_priorities.clone(),
                 ) {
                     Ok(request) => {
-                        let _ = app
-                            .app_command_tx
-                            .send(AppCommand::SubmitControlRequest(request))
-                            .await;
+                        let mut shutdown_rx = app.shutdown_tx.subscribe();
+                        send_app_command_until_shutdown(
+                            &app.app_command_tx,
+                            &mut shutdown_rx,
+                            AppCommand::SubmitControlRequest(request),
+                        )
+                        .await;
                     }
                     Err(error) => {
                         app.app_state.system_error = Some(error);
@@ -1610,10 +1619,13 @@ pub async fn execute_confirm_decision(
                     payload.container_name_to_use,
                     payload.file_priorities,
                 );
-                let _ = app
-                    .app_command_tx
-                    .send(AppCommand::SubmitControlRequest(request))
-                    .await;
+                let mut shutdown_rx = app.shutdown_tx.subscribe();
+                send_app_command_until_shutdown(
+                    &app.app_command_tx,
+                    &mut shutdown_rx,
+                    AppCommand::SubmitControlRequest(request),
+                )
+                .await;
                 app.app_state.pending_torrent_link.clear();
             } else {
                 tracing::warn!(target: "superseedr", "SHIFT+Y pressed but no pending content was found");
@@ -1626,10 +1638,13 @@ pub async fn execute_confirm_decision(
                 .and_then(|n| n.to_str())
                 .is_some_and(|name| name.ends_with(".torrent"))
             {
-                let _ = app
-                    .app_command_tx
-                    .send(AppCommand::AddTorrentFromFile(path))
-                    .await;
+                let mut shutdown_rx = app.shutdown_tx.subscribe();
+                send_app_command_until_shutdown(
+                    &app.app_command_tx,
+                    &mut shutdown_rx,
+                    AppCommand::AddTorrentFromFile(path),
+                )
+                .await;
             }
             Some(BrowserTransition::ToNormal)
         }
@@ -1681,26 +1696,44 @@ pub fn cleanup_pending_link_on_escape(
     torrent_manager_command_txs: &mut HashMap<Vec<u8>, Sender<ManagerCommand>>,
     torrents: &mut HashMap<Vec<u8>, TorrentDisplayState>,
     torrent_list_order: &mut Vec<Vec<u8>>,
+    shutdown_tx: &broadcast::Sender<()>,
     async_delete: bool,
 ) {
     if let Some(info_hash) = pending_link_info_hash(pending_torrent_link) {
         if async_delete {
             if let Some(manager_tx) = torrent_manager_command_txs.get(&info_hash) {
-                let tx = manager_tx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = tx.send(ManagerCommand::DeleteFile).await {
-                        tracing::error!("Failed to send DeleteFile to cancelled manager: {}", e);
-                    }
-                });
+                spawn_manager_delete_until_shutdown(manager_tx.clone(), shutdown_tx.subscribe());
             }
             torrent_manager_command_txs.remove(&info_hash);
         } else if let Some(manager_tx) = torrent_manager_command_txs.remove(&info_hash) {
-            let _ = manager_tx.try_send(ManagerCommand::DeleteFile);
+            spawn_manager_delete_until_shutdown(manager_tx, shutdown_tx.subscribe());
         }
 
         torrents.remove(&info_hash);
         torrent_list_order.retain(|h| h != &info_hash);
     }
+}
+
+fn spawn_manager_delete_until_shutdown(
+    manager_tx: Sender<ManagerCommand>,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) {
+    tokio::spawn(async move {
+        tokio::select! {
+            result = manager_tx.send(ManagerCommand::DeleteFile) => {
+                if let Err(error) = result {
+                    tracing::error!("Failed to send DeleteFile to cancelled manager: {}", error);
+                }
+            }
+            shutdown = shutdown_rx.recv() => {
+                match shutdown {
+                    Ok(())
+                    | Err(broadcast::error::RecvError::Closed)
+                    | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                }
+            }
+        }
+    });
 }
 
 pub fn apply_priority_cycle(
@@ -2286,7 +2319,15 @@ mod tests {
         let mut txs: HashMap<Vec<u8>, Sender<ManagerCommand>> = HashMap::new();
         let mut torrents: HashMap<Vec<u8>, TorrentDisplayState> = HashMap::new();
         let mut order = vec![];
-        cleanup_pending_link_on_escape("", &mut txs, &mut torrents, &mut order, false);
+        let (shutdown_tx, _) = broadcast::channel(1);
+        cleanup_pending_link_on_escape(
+            "",
+            &mut txs,
+            &mut torrents,
+            &mut order,
+            &shutdown_tx,
+            false,
+        );
         assert!(txs.is_empty());
         assert!(torrents.is_empty());
         assert!(order.is_empty());

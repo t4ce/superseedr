@@ -6,6 +6,7 @@ use crate::persistence::event_journal::{
     EventCategory, EventDetails, EventJournalEntry, EventType,
 };
 use crate::theme::ThemeContext;
+use crate::tui::app_command::spawn_app_command_sender;
 use crate::tui::formatters::sanitize_text;
 use crate::tui::screen_context::ScreenContext;
 use chrono::{DateTime, Local};
@@ -13,7 +14,7 @@ use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
 use ratatui::prelude::{Alignment, Constraint, Frame, Line, Modifier, Span, Style};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 use std::path::{Component, Path};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 const JOURNAL_CLOSE_KEYS_LABEL: &str = "Esc / q";
 const JOURNAL_FILTER_KEYS_LABEL: &str = "Tab / Shift+Tab";
@@ -56,6 +57,24 @@ pub fn handle_event(
     app_state: &mut AppState,
     app_command_tx: &mpsc::Sender<AppCommand>,
 ) {
+    handle_event_inner(event, app_state, app_command_tx, None);
+}
+
+pub fn handle_event_with_shutdown(
+    event: CrosstermEvent,
+    app_state: &mut AppState,
+    app_command_tx: &mpsc::Sender<AppCommand>,
+    shutdown_tx: &broadcast::Sender<()>,
+) {
+    handle_event_inner(event, app_state, app_command_tx, Some(shutdown_tx));
+}
+
+fn handle_event_inner(
+    event: CrosstermEvent,
+    app_state: &mut AppState,
+    app_command_tx: &mpsc::Sender<AppCommand>,
+    shutdown_tx: Option<&broadcast::Sender<()>>,
+) {
     if !matches!(app_state.mode, AppMode::Journal) {
         return;
     }
@@ -91,7 +110,9 @@ pub fn handle_event(
                     (app_state.ui.journal.selected_index + 1).min(len - 1);
             }
         }
-        JournalAction::ReplaySelected => replay_selected_entry(app_state, app_command_tx),
+        JournalAction::ReplaySelected => {
+            replay_selected_entry(app_state, app_command_tx, shutdown_tx)
+        }
     }
 }
 
@@ -337,7 +358,11 @@ fn replay_command_for_path(path: &Path) -> Option<AppCommand> {
     }
 }
 
-fn replay_selected_entry(app_state: &mut AppState, app_command_tx: &mpsc::Sender<AppCommand>) {
+fn replay_selected_entry(
+    app_state: &mut AppState,
+    app_command_tx: &mpsc::Sender<AppCommand>,
+    shutdown_tx: Option<&broadcast::Sender<()>>,
+) {
     let entries = filtered_entries(app_state);
     let Some(entry) = entries.get(app_state.ui.journal.selected_index).copied() else {
         app_state.ui.journal.status_message = Some("No journal entry selected".to_string());
@@ -362,13 +387,20 @@ fn replay_selected_entry(app_state: &mut AppState, app_command_tx: &mpsc::Sender
         return;
     }
 
-    match app_command_tx.try_send(command) {
-        Ok(()) => {
-            app_state.ui.journal.status_message =
-                Some(format!("Replayed {}", compact_path_label(source_path, 2)));
-        }
-        Err(_) => {
-            app_state.ui.journal.status_message = Some("Replay request queue is busy".to_string());
+    if let Some(shutdown_tx) = shutdown_tx {
+        spawn_app_command_sender(app_command_tx.clone(), shutdown_tx.subscribe(), command);
+        app_state.ui.journal.status_message =
+            Some(format!("Replayed {}", compact_path_label(source_path, 2)));
+    } else {
+        match app_command_tx.try_send(command) {
+            Ok(()) => {
+                app_state.ui.journal.status_message =
+                    Some(format!("Replayed {}", compact_path_label(source_path, 2)));
+            }
+            Err(_) => {
+                app_state.ui.journal.status_message =
+                    Some("Replay request queue is busy".to_string());
+            }
         }
     }
 }

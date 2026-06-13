@@ -6,6 +6,7 @@ use std::sync::Arc;
 use crate::app::{AppCommand, AppMode, ConfigItem, FileBrowserMode};
 use crate::config::Settings;
 use crate::token_bucket::{rate_limit_bps_to_bucket_bytes_per_sec, TokenBucket};
+use crate::tui::app_command::spawn_app_command_sender;
 use crate::tui::formatters::{format_limit_bps, path_to_string};
 use crate::tui::screen_context::ScreenContext;
 use directories::UserDirs;
@@ -13,7 +14,7 @@ use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::prelude::{Frame, Line, Span, Style};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 const RATE_LIMIT_STEP_BPS: u64 = 10_000 * 8;
 const UNLIMITED_RATE_LIMIT_BPS: u64 = crate::config::UNLIMITED_RATE_LIMIT_BPS;
@@ -47,6 +48,7 @@ pub struct ConfigHandleContext<'a> {
     pub items: &'a mut [ConfigItem],
     pub editing: &'a mut Option<(ConfigItem, String)>,
     pub app_command_tx: &'a mpsc::Sender<AppCommand>,
+    pub shutdown_tx: &'a broadcast::Sender<()>,
     pub global_dl_bucket: &'a Arc<TokenBucket>,
     pub global_ul_bucket: &'a Arc<TokenBucket>,
 }
@@ -454,7 +456,11 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> bool
             for effect in reduced.effects {
                 match effect {
                     ConfigEffect::AppCommand(command) => {
-                        let _ = ctx.app_command_tx.try_send(*command);
+                        spawn_app_command_sender(
+                            ctx.app_command_tx.clone(),
+                            ctx.shutdown_tx.subscribe(),
+                            *command,
+                        );
                     }
                     ConfigEffect::SetDownloadRate(new_rate) => {
                         let bucket = ctx.global_dl_bucket.clone();

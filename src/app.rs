@@ -4911,7 +4911,8 @@ impl App {
 
             if self.should_suppress_follower_runtime_for_torrent(torrent) {
                 if let Some(manager_tx) = self.torrent_manager_command_txs.get(info_hash) {
-                    let _ = manager_tx.try_send(ManagerCommand::Shutdown);
+                    self.send_manager_command_until_shutdown(manager_tx, ManagerCommand::Shutdown)
+                        .await;
                 }
                 self.ensure_display_only_torrent_from_settings(torrent);
                 continue;
@@ -4935,7 +4936,8 @@ impl App {
                         }
                     };
                     if let Some(command) = command {
-                        let _ = manager_tx.try_send(command);
+                        self.send_manager_command_until_shutdown(manager_tx, command)
+                            .await;
                     }
                 }
             }
@@ -4951,11 +4953,15 @@ impl App {
                     .or_else(|| new_settings.default_download_folder.clone())
                 {
                     if let Some(manager_tx) = self.torrent_manager_command_txs.get(info_hash) {
-                        let _ = manager_tx.try_send(ManagerCommand::SetUserTorrentConfig {
-                            torrent_data_path,
-                            file_priorities: torrent.file_priorities.clone(),
-                            container_name: torrent.container_name.clone(),
-                        });
+                        self.send_manager_command_until_shutdown(
+                            manager_tx,
+                            ManagerCommand::SetUserTorrentConfig {
+                                torrent_data_path,
+                                file_priorities: torrent.file_priorities.clone(),
+                                container_name: torrent.container_name.clone(),
+                            },
+                        )
+                        .await;
                     }
                 }
             }
@@ -4967,7 +4973,8 @@ impl App {
             }
 
             if let Some(manager_tx) = self.torrent_manager_command_txs.get(info_hash) {
-                let _ = manager_tx.try_send(ManagerCommand::Shutdown);
+                self.send_manager_command_until_shutdown(manager_tx, ManagerCommand::Shutdown)
+                    .await;
                 if let Some(runtime) = self.app_state.torrents.get_mut(info_hash) {
                     runtime.latest_state.torrent_control_state = TorrentControlState::Deleting;
                     runtime.latest_state.delete_files = false;
@@ -4983,6 +4990,28 @@ impl App {
 
         if self.is_current_shared_follower() {
             self.refresh_follower_read_model();
+        }
+    }
+
+    async fn send_manager_command_until_shutdown(
+        &self,
+        manager_tx: &mpsc::Sender<ManagerCommand>,
+        command: ManagerCommand,
+    ) {
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        tokio::select! {
+            result = manager_tx.send(command) => {
+                if result.is_err() {
+                    tracing_event!(Level::WARN, "Torrent manager command channel closed");
+                }
+            }
+            shutdown = shutdown_rx.recv() => {
+                match shutdown {
+                    Ok(())
+                    | Err(tokio::sync::broadcast::error::RecvError::Closed)
+                    | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                }
+            }
         }
     }
 
@@ -6671,11 +6700,15 @@ impl App {
             } else {
                 if let Some(path) = download_path {
                     if let Some(manager_tx) = self.torrent_manager_command_txs.get(&info_hash) {
-                        let _ = manager_tx.try_send(ManagerCommand::SetUserTorrentConfig {
-                            torrent_data_path: path,
-                            file_priorities: file_priorities.clone(),
-                            container_name,
-                        });
+                        self.send_manager_command_until_shutdown(
+                            manager_tx,
+                            ManagerCommand::SetUserTorrentConfig {
+                                torrent_data_path: path,
+                                file_priorities: file_priorities.clone(),
+                                container_name,
+                            },
+                        )
+                        .await;
                     }
                 }
                 tracing_event!(Level::INFO, "Updated path for existing torrent from magnet");

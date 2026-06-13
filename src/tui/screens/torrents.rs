@@ -8,6 +8,7 @@ use crate::app::{
 use crate::config::SortDirection;
 use crate::integrations::control::ControlRequest;
 use crate::theme::ThemeContext;
+use crate::tui::app_command::spawn_app_command_batch_sender;
 use crate::tui::formatters::{
     anonymize_preserving_shape, centered_rect, format_bytes, format_duration, format_speed,
     sanitize_text, speed_to_style,
@@ -434,15 +435,14 @@ pub fn reduce_torrent_management_action(
     result
 }
 fn execute_management_effects(app: &mut App, effects: Vec<TorrentManagementEffect>) {
+    let mut control_requests = Vec::new();
     for effect in effects {
         match effect {
             TorrentManagementEffect::ToNormal => {
                 app.app_state.mode = AppMode::Normal;
             }
             TorrentManagementEffect::SubmitControlRequest(request) => {
-                let _ = app
-                    .app_command_tx
-                    .try_send(AppCommand::SubmitControlRequest(request));
+                control_requests.push(request);
             }
             TorrentManagementEffect::MarkControlState {
                 info_hash,
@@ -457,6 +457,16 @@ fn execute_management_effects(app: &mut App, effects: Vec<TorrentManagementEffec
                 }
             }
         }
+    }
+    if !control_requests.is_empty() {
+        spawn_app_command_batch_sender(
+            app.app_command_tx.clone(),
+            app.shutdown_tx.subscribe(),
+            control_requests
+                .into_iter()
+                .map(AppCommand::SubmitControlRequest)
+                .collect(),
+        );
     }
 }
 

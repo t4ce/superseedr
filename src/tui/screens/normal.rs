@@ -26,6 +26,7 @@ use crate::persistence::activity_history::{ActivityHistoryPoint, ActivityHistory
 use crate::persistence::network_history::NetworkHistoryPoint;
 use crate::theme::{ThemeContext, ThemeName};
 use crate::torrent_manager::{ManagerCommand, TorrentFileProbeStatus};
+use crate::tui::app_command::send_app_command_until_shutdown;
 use crate::tui::formatters::{
     anonymize_preserving_shape, auto_download_limit_applied, calculate_nice_upper_bound,
     format_bytes, format_countdown, format_duration, format_iops, format_latency, format_limit_bps,
@@ -6866,10 +6867,13 @@ async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
                     None,
                     HashMap::new(),
                 );
-                let _ = app
-                    .app_command_tx
-                    .send(AppCommand::SubmitControlRequest(request))
-                    .await;
+                let mut shutdown_rx = app.shutdown_tx.subscribe();
+                send_app_command_until_shutdown(
+                    &app.app_command_tx,
+                    &mut shutdown_rx,
+                    AppCommand::SubmitControlRequest(request),
+                )
+                .await;
             } else {
                 app.app_state.pending_torrent_link = magnet_link.to_string();
                 let initial_path = app.get_initial_destination_path();
@@ -6899,19 +6903,26 @@ async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
                     HashMap::new(),
                 ) {
                     Ok(request) => {
-                        let _ = app
-                            .app_command_tx
-                            .send(AppCommand::SubmitControlRequest(request))
-                            .await;
+                        let mut shutdown_rx = app.shutdown_tx.subscribe();
+                        send_app_command_until_shutdown(
+                            &app.app_command_tx,
+                            &mut shutdown_rx,
+                            AppCommand::SubmitControlRequest(request),
+                        )
+                        .await;
                     }
                     Err(error) => {
                         app.app_state.system_error = Some(error);
                     }
                 }
             } else {
-                let _ = app
-                    .app_command_tx
-                    .try_send(AppCommand::AddTorrentFromFile(path.to_path_buf()));
+                let mut shutdown_rx = app.shutdown_tx.subscribe();
+                send_app_command_until_shutdown(
+                    &app.app_command_tx,
+                    &mut shutdown_rx,
+                    AppCommand::AddTorrentFromFile(path.to_path_buf()),
+                )
+                .await;
             }
         }
         PastedContent::Unsupported => {
@@ -7024,9 +7035,13 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
             };
             app.client_configs.ui_theme = themes[new_idx];
             app.app_state.theme = crate::theme::Theme::builtin(themes[new_idx]);
-            let _ = app
-                .app_command_tx
-                .try_send(AppCommand::UpdateConfig(app.client_configs.clone()));
+            let mut shutdown_rx = app.shutdown_tx.subscribe();
+            send_app_command_until_shutdown(
+                &app.app_command_tx,
+                &mut shutdown_rx,
+                AppCommand::UpdateConfig(app.client_configs.clone()),
+            )
+            .await;
         }
         UiEffect::ApplyThemeNext => {
             if app.is_current_shared_follower() {
@@ -7044,23 +7059,35 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
             let new_idx = (current_idx + 1) % themes.len();
             app.client_configs.ui_theme = themes[new_idx];
             app.app_state.theme = crate::theme::Theme::builtin(themes[new_idx]);
-            let _ = app
-                .app_command_tx
-                .try_send(AppCommand::UpdateConfig(app.client_configs.clone()));
+            let mut shutdown_rx = app.shutdown_tx.subscribe();
+            send_app_command_until_shutdown(
+                &app.app_command_tx,
+                &mut shutdown_rx,
+                AppCommand::UpdateConfig(app.client_configs.clone()),
+            )
+            .await;
         }
         UiEffect::SendPause(info_hash) => {
-            let _ = app
-                .app_command_tx
-                .try_send(AppCommand::SubmitControlRequest(ControlRequest::Pause {
+            let mut shutdown_rx = app.shutdown_tx.subscribe();
+            send_app_command_until_shutdown(
+                &app.app_command_tx,
+                &mut shutdown_rx,
+                AppCommand::SubmitControlRequest(ControlRequest::Pause {
                     info_hash_hex: hex::encode(info_hash),
-                }));
+                }),
+            )
+            .await;
         }
         UiEffect::SendResume(info_hash) => {
-            let _ = app
-                .app_command_tx
-                .try_send(AppCommand::SubmitControlRequest(ControlRequest::Resume {
+            let mut shutdown_rx = app.shutdown_tx.subscribe();
+            send_app_command_until_shutdown(
+                &app.app_command_tx,
+                &mut shutdown_rx,
+                AppCommand::SubmitControlRequest(ControlRequest::Resume {
                     info_hash_hex: hex::encode(info_hash),
-                }));
+                }),
+            )
+            .await;
         }
         UiEffect::OpenHelpScreen => {
             app.app_state.mode = AppMode::Help;
