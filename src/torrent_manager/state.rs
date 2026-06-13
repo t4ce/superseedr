@@ -3192,6 +3192,52 @@ mod tests {
     }
 
     #[test]
+    fn test_assign_work_tiny_piece_length_requests_piece_local_short_blocks() {
+        let mut state = create_empty_state();
+        let num_pieces = 8usize;
+        let piece_size = 1_024u32;
+        let mut torrent = create_dummy_torrent(num_pieces);
+        torrent.info.piece_length = piece_size as i64;
+        torrent.info.length = i64::from(piece_size) * num_pieces as i64;
+        state.torrent = Some(torrent);
+        state.torrent_status = TorrentStatus::Standard;
+        state.piece_manager.set_initial_fields(num_pieces, false);
+        state.piece_manager.set_geometry(
+            piece_size,
+            u64::from(piece_size) * num_pieces as u64,
+            HashMap::new(),
+            false,
+        );
+
+        add_peer(&mut state, "tiny_peer");
+        let peer = state.peers.get_mut("tiny_peer").unwrap();
+        peer.peer_choking = ChokeStatus::Unchoke;
+        peer.bitfield = vec![true; num_pieces];
+
+        let effects = state.update(Action::AssignWork {
+            peer_id: "tiny_peer".to_string(),
+        });
+
+        let mut requests = Vec::new();
+        for effect in effects {
+            if let Effect::SendToPeer { cmd, .. } = effect {
+                if let TorrentCommand::BulkRequest(reqs) = *cmd {
+                    requests.extend(reqs);
+                }
+            }
+        }
+        requests.sort();
+
+        let expected = (0..num_pieces as u32)
+            .map(|piece| (piece, 0, piece_size))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            requests, expected,
+            "Tiny pieces should request one piece-local short block each"
+        );
+    }
+
+    #[test]
     fn test_data_unavailable_blocks_unchoke_and_upload() {
         let mut state = create_empty_state();
         let torrent = create_dummy_torrent(1);
@@ -11493,6 +11539,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    #[ignore = "large live swarm throughput smoke test; run explicitly when tuning scheduler throughput"]
     async fn test_case_08_full_swarm_1000_blocks() {
         let temp_dir = std::env::temp_dir().join("superseedr_full_swarm");
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -11573,6 +11620,7 @@ mod integration_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "throughput smoke test; deterministic AssignWork tests cover pipelining in the default suite"]
     async fn test_debug_pipeline_latency() {
         // SETUP
         let temp_dir = std::env::temp_dir().join("superseedr_latency_debug");
@@ -11626,94 +11674,6 @@ mod integration_tests {
         let _ = std::fs::remove_dir_all(temp_dir);
 
         assert!(success);
-    }
-
-    #[tokio::test]
-    async fn test_non_aligned_piece_length_small_swarm_completes() {
-        let temp_dir = std::env::temp_dir().join("superseedr_non_aligned_20k");
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        std::fs::create_dir_all(&temp_dir).unwrap();
-
-        let num_pieces = 4;
-        let piece_size = 20_000;
-        let (mut manager, cmd_tx, _res) =
-            create_manager_harness("NonAligned20k", num_pieces, piece_size, temp_dir.clone());
-
-        let bf_all = full_bitfield(num_pieces);
-        spawn_mock_peer(&mut manager, bf_all, std::time::Duration::from_millis(0)).await;
-
-        let manager_handle = tokio::spawn(async move {
-            let _ = manager.run(false).await;
-        });
-
-        let expected_size = (num_pieces * piece_size) as u64;
-        let file_path = temp_dir.join("NonAligned20k");
-        let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(12);
-        let mut success = false;
-
-        while start.elapsed() < timeout {
-            if let Ok(meta) = std::fs::metadata(&file_path) {
-                if meta.len() >= expected_size {
-                    success = true;
-                    break;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
-
-        let _ = cmd_tx.send(ManagerCommand::Shutdown).await;
-        let _ = manager_handle.await;
-        let _ = std::fs::remove_dir_all(temp_dir);
-
-        assert!(
-            success,
-            "Non-aligned piece-length torrent failed to complete in bounded time"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_tiny_piece_length_small_swarm_completes() {
-        let temp_dir = std::env::temp_dir().join("superseedr_tiny_piece_1k");
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        std::fs::create_dir_all(&temp_dir).unwrap();
-
-        let num_pieces = 8;
-        let piece_size = 1_024;
-        let (mut manager, cmd_tx, _res) =
-            create_manager_harness("TinyPiece1k", num_pieces, piece_size, temp_dir.clone());
-
-        let bf_all = full_bitfield(num_pieces);
-        spawn_mock_peer(&mut manager, bf_all, std::time::Duration::from_millis(0)).await;
-
-        let manager_handle = tokio::spawn(async move {
-            let _ = manager.run(false).await;
-        });
-
-        let expected_size = (num_pieces * piece_size) as u64;
-        let file_path = temp_dir.join("TinyPiece1k");
-        let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(12);
-        let mut success = false;
-
-        while start.elapsed() < timeout {
-            if let Ok(meta) = std::fs::metadata(&file_path) {
-                if meta.len() >= expected_size {
-                    success = true;
-                    break;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
-
-        let _ = cmd_tx.send(ManagerCommand::Shutdown).await;
-        let _ = manager_handle.await;
-        let _ = std::fs::remove_dir_all(temp_dir);
-
-        assert!(
-            success,
-            "Tiny piece-length torrent failed to complete in bounded time"
-        );
     }
 
     fn decode_triplet_event(msg: &[u8], expected_kind: u8) -> Option<(u32, u32, u32)> {

@@ -5954,6 +5954,7 @@ mod resource_tests {
     }
 
     #[tokio::test]
+    #[ignore = "large manager write-throughput smoke test; run explicitly when tuning v2 write scaling"]
     async fn test_manager_scale_1000_hybrid() {
         let temp_dir =
             std::env::temp_dir().join(format!("superseedr_scale_hybrid_{}", rand::random::<u32>()));
@@ -6077,6 +6078,7 @@ mod resource_tests {
     }
 
     #[tokio::test]
+    #[ignore = "large manager write-throughput smoke test; run explicitly when tuning pure-v2 write scaling"]
     async fn test_manager_scale_1000_pure_v2() {
         let temp_dir =
             std::env::temp_dir().join(format!("superseedr_scale_v2_{}", rand::random::<u32>()));
