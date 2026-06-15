@@ -1,18 +1,110 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::app::{AppMode, AppState};
+use crate::app::{AppMode, AppState, HelpSection, SearchMode};
 use crate::config::{
     is_shared_config_mode, local_settings_path, resolve_host_watch_path, runtime_log_dir,
     shared_inbox_path, shared_settings_path, Settings,
 };
 use crate::theme::ThemeContext;
-use crate::tui::formatters::{centered_rect, truncate_with_ellipsis};
+use crate::tui::formatters::{centered_rect, sanitize_text};
 use crate::tui::screen_context::ScreenContext;
-use crate::tui::screens::journal::journal_help_rows;
+use crate::tui::screens::input_panel::draw_prompt_panel;
 use crate::tui::view::calculate_player_stats;
-use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
+use fuzzy_matcher::skim::SkimMatcherV2;
+use fuzzy_matcher::FuzzyMatcher;
+use ratatui::crossterm::event::{
+    Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+};
 use ratatui::{prelude::*, widgets::*};
+
+const HELP_SECTIONS: [HelpSection; 7] = [
+    HelpSection::General,
+    HelpSection::Torrents,
+    HelpSection::Graphs,
+    HelpSection::Legends,
+    HelpSection::Screens,
+    HelpSection::Paths,
+    HelpSection::Build,
+];
+
+impl HelpSection {
+    fn label(self) -> &'static str {
+        match self {
+            Self::General => "General",
+            Self::Torrents => "Torrents",
+            Self::Graphs => "Graphs",
+            Self::Legends => "Legends",
+            Self::Screens => "Screens",
+            Self::Paths => "Paths",
+            Self::Build => "Build",
+        }
+    }
+
+    fn next(self) -> Self {
+        let idx = HELP_SECTIONS
+            .iter()
+            .position(|section| *section == self)
+            .unwrap_or(0);
+        HELP_SECTIONS[(idx + 1) % HELP_SECTIONS.len()]
+    }
+
+    fn prev(self) -> Self {
+        let idx = HELP_SECTIONS
+            .iter()
+            .position(|section| *section == self)
+            .unwrap_or(0);
+        HELP_SECTIONS[(idx + HELP_SECTIONS.len() - 1) % HELP_SECTIONS.len()]
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HelpItem {
+    section: HelpSection,
+    subsection: String,
+    key: String,
+    action: String,
+}
+
+impl HelpItem {
+    fn new(
+        section: HelpSection,
+        subsection: impl Into<String>,
+        key: impl Into<String>,
+        action: impl Into<String>,
+    ) -> Self {
+        Self {
+            section,
+            subsection: subsection.into(),
+            key: key.into(),
+            action: action.into(),
+        }
+    }
+
+    fn matches_query(&self, query: &str, mode: SearchMode, matcher: &SkimMatcherV2) -> bool {
+        if query.is_empty() {
+            return true;
+        }
+
+        let haystack = format!(
+            "{} {} {} {}",
+            self.section.label(),
+            self.subsection,
+            self.key,
+            self.action
+        );
+        match mode {
+            SearchMode::Fuzzy => matcher
+                .fuzzy_match(&haystack.to_lowercase(), &query.to_lowercase())
+                .is_some(),
+            SearchMode::Regex => regex::RegexBuilder::new(query)
+                .case_insensitive(true)
+                .build()
+                .ok()
+                .is_some_and(|re| re.is_match(&haystack)),
+        }
+    }
+}
 
 fn display_path_or_disabled(path: Option<std::path::PathBuf>) -> String {
     path.map(|path| path.to_string_lossy().to_string())
@@ -72,41 +164,485 @@ fn build_help_footer_entries(
     entries
 }
 
-fn draw_help_footer(
-    f: &mut Frame,
-    area: Rect,
-    entries: &[(&'static str, String)],
-    ctx: &ThemeContext,
-) {
-    let footer_block =
-        Block::default().border_style(ctx.apply(Style::default().fg(ctx.theme.semantic.border)));
-    let footer_inner_area = footer_block.inner(area);
-    f.render_widget(footer_block, area);
-    let footer_lines = entries
-        .iter()
-        .map(|(label, value)| {
-            let reserved = label.len().saturating_add(2);
-            let available_width = (footer_inner_area.width as usize).saturating_sub(reserved);
-            Line::from(vec![
-                Span::styled(
-                    format!("{}: ", label),
-                    ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
-                ),
-                Span::styled(
-                    truncate_with_ellipsis(value, available_width),
-                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
-                ),
-            ])
-        })
-        .collect::<Vec<_>>();
-    let footer_paragraph =
-        Paragraph::new(footer_lines).style(ctx.apply(Style::default().fg(ctx.theme.semantic.text)));
-    f.render_widget(footer_paragraph, footer_inner_area);
+fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> {
+    let mut items = Vec::new();
+    macro_rules! item {
+        ($section:expr, $subsection:expr, $key:expr, $action:expr $(,)?) => {
+            items.push(HelpItem::new($section, $subsection, $key, $action));
+        };
+    }
+
+    item!(
+        HelpSection::General,
+        "Help Navigation",
+        "Esc / m / q",
+        "Close help"
+    );
+    item!(
+        HelpSection::General,
+        "Help Navigation",
+        "Tab / Shift+Tab",
+        "Move between help sections"
+    );
+    item!(
+        HelpSection::General,
+        "Help Navigation",
+        "Up / Down / k / j",
+        "Scroll the visible help rows"
+    );
+    item!(
+        HelpSection::General,
+        "Help Navigation",
+        "Home / End",
+        "Jump to the top or bottom of the current section"
+    );
+    item!(
+        HelpSection::General,
+        "Search",
+        "/",
+        "Search every help section, path entry, and build detail"
+    );
+    item!(
+        HelpSection::General,
+        "Search",
+        "Tab",
+        "Toggle fuzzy or regex matching while the search prompt is open"
+    );
+    item!(
+        HelpSection::General,
+        "Global Routes",
+        "Q",
+        "Quit the application"
+    );
+    item!(HelpSection::General, "Global Routes", "c", "Open Config");
+    item!(HelpSection::General, "Global Routes", "r", "Open RSS");
+    item!(
+        HelpSection::General,
+        "Global Routes",
+        "J",
+        "Open the event journal"
+    );
+    item!(
+        HelpSection::General,
+        "Global Routes",
+        "M",
+        "Open torrent management"
+    );
+    item!(
+        HelpSection::General,
+        "Global Routes",
+        "z",
+        "Toggle Zen / Power Saving mode"
+    );
+
+    item!(
+        HelpSection::Torrents,
+        "Dashboard Search",
+        "/",
+        "Search torrent names and download paths"
+    );
+    item!(
+        HelpSection::Torrents,
+        "Adding Torrents",
+        "a",
+        "Choose a .torrent file"
+    );
+    item!(
+        HelpSection::Torrents,
+        "Adding Torrents",
+        "Paste",
+        "Paste a magnet link or torrent file path"
+    );
+    item!(
+        HelpSection::Torrents,
+        "Adding Torrents",
+        "CLI",
+        "Run superseedr add from another terminal"
+    );
+    item!(
+        HelpSection::Torrents,
+        "Torrent Actions",
+        "p",
+        "Pause or resume the selected torrent"
+    );
+    item!(
+        HelpSection::Torrents,
+        "Torrent Actions",
+        "d / D",
+        "Remove the selected torrent; D also removes files after confirmation"
+    );
+    item!(
+        HelpSection::Torrents,
+        "Table Control",
+        "h / l / Left / Right",
+        "Move between table header columns"
+    );
+    item!(
+        HelpSection::Torrents,
+        "Table Control",
+        "s",
+        "Sort by the focused table column"
+    );
+    item!(
+        HelpSection::Torrents,
+        "Table Control",
+        "S",
+        "Clear manual sorting and resume automatic sorting"
+    );
+
+    item!(
+        HelpSection::Graphs,
+        "Chart Panels",
+        "t / T",
+        "Switch graph time scale forward or backward"
+    );
+    item!(
+        HelpSection::Graphs,
+        "Chart Panels",
+        "g / G",
+        "Switch chart panel view forward or backward"
+    );
+    item!(
+        HelpSection::Graphs,
+        "Chart Panels",
+        "[ / ]",
+        "Change UI refresh rate"
+    );
+    item!(
+        HelpSection::Graphs,
+        "Chart Panels",
+        "< / >",
+        "Cycle UI theme"
+    );
+    item!(
+        HelpSection::Graphs,
+        "Layout",
+        "x",
+        "Anonymize torrent names"
+    );
+
+    item!(
+        HelpSection::Legends,
+        "DHT Wave",
+        "DHT panel",
+        "Power multiplier, active queries, and unique peers found in the last 10s"
+    );
+    item!(
+        HelpSection::Legends,
+        "Peer Flags",
+        "Blue",
+        "You are interested; download opportunity"
+    );
+    item!(
+        HelpSection::Legends,
+        "Peer Flags",
+        "Red",
+        "Peer is choking you; download blocked"
+    );
+    item!(
+        HelpSection::Legends,
+        "Peer Flags",
+        "Teal",
+        "Peer is interested; upload opportunity"
+    );
+    item!(
+        HelpSection::Legends,
+        "Peer Flags",
+        "Peach",
+        "You are choking peer; upload restricted"
+    );
+    item!(
+        HelpSection::Legends,
+        "Disk Metrics",
+        "Read",
+        "Data read from disk"
+    );
+    item!(
+        HelpSection::Legends,
+        "Disk Metrics",
+        "Write",
+        "Data written to disk"
+    );
+    item!(
+        HelpSection::Legends,
+        "Disk Metrics",
+        "Seek",
+        "Average distance between I/O operations; lower is better"
+    );
+    item!(
+        HelpSection::Legends,
+        "Disk Metrics",
+        "Latency",
+        "Time to complete one I/O operation; lower is better"
+    );
+    item!(
+        HelpSection::Legends,
+        "Disk Metrics",
+        "IOPS",
+        "I/O operations per second across the current workload"
+    );
+    item!(
+        HelpSection::Legends,
+        "Self Tuning",
+        "Self-Tune",
+        "Tuning state and countdown to the next adjustment cycle"
+    );
+    item!(
+        HelpSection::Legends,
+        "Self Tuning",
+        "Resource rows",
+        "Current limits for peers, reads, writes, and reserve capacity"
+    );
+
+    item!(HelpSection::Screens, "RSS", "Esc / q", "Exit RSS mode");
+    item!(
+        HelpSection::Screens,
+        "RSS",
+        "Tab / h",
+        "Move RSS focus or swap Explorer with History"
+    );
+    item!(HelpSection::Screens, "RSS", "s", "Sync feeds now");
+    item!(
+        HelpSection::Screens,
+        "RSS",
+        "a / d / Space",
+        "Add, delete, or toggle the focused RSS item"
+    );
+    item!(
+        HelpSection::Screens,
+        "RSS",
+        "Enter",
+        "Confirm add or search input"
+    );
+    item!(
+        HelpSection::Screens,
+        "RSS",
+        "/",
+        "Start Explorer search when Explorer is focused"
+    );
+    item!(
+        HelpSection::Screens,
+        "RSS",
+        "Y",
+        "Download the selected Explorer item if it has not been downloaded"
+    );
+    item!(
+        HelpSection::Screens,
+        "Torrent Management",
+        "/",
+        "Search torrent names and paths"
+    );
+    item!(
+        HelpSection::Screens,
+        "Torrent Management",
+        "Tab",
+        "Toggle search mode while the search panel is active"
+    );
+    item!(
+        HelpSection::Screens,
+        "Torrent Management",
+        "Space / A",
+        "Select the current torrent or all visible torrents"
+    );
+    item!(
+        HelpSection::Screens,
+        "Torrent Management",
+        "p / d / D",
+        "Queue pause, remove, or purge draft commands"
+    );
+    item!(
+        HelpSection::Screens,
+        "Torrent Management",
+        "Enter / Y",
+        "Review and submit queued draft commands"
+    );
+    item!(
+        HelpSection::Screens,
+        "Torrent Management",
+        "u",
+        "Clear draft commands for the current target set"
+    );
+    item!(
+        HelpSection::Screens,
+        "Journal",
+        "Tab / Shift+Tab",
+        "Cycle event journal filters"
+    );
+    item!(
+        HelpSection::Screens,
+        "Journal",
+        "Y",
+        "Replay selected archived torrent, magnet, or path source"
+    );
+    item!(
+        HelpSection::Screens,
+        "Config",
+        "Enter",
+        "Start or confirm editing"
+    );
+    item!(
+        HelpSection::Screens,
+        "Config",
+        "h / l",
+        "Decrease or increase the focused value"
+    );
+    item!(
+        HelpSection::Screens,
+        "File Browser",
+        "Y",
+        "Confirm the current file-browser action"
+    );
+    item!(
+        HelpSection::Screens,
+        "File Browser",
+        "/",
+        "Search files and folders"
+    );
+    item!(
+        HelpSection::Screens,
+        "Delete Confirm",
+        "Y / Esc",
+        "Confirm delete or cancel"
+    );
+
+    let (lvl, progress) = calculate_player_stats(app_state);
+    item!(
+        HelpSection::Legends,
+        "Session Level",
+        "Progress",
+        format!(
+            "Level {lvl} with {:.0}% progress to next level",
+            progress * 100.0
+        )
+    );
+
+    for (label, value) in build_help_footer_entries(settings, app_state) {
+        item!(
+            HelpSection::Paths,
+            "Runtime Paths",
+            label,
+            if value.is_empty() {
+                "Unknown location".to_string()
+            } else {
+                value
+            },
+        );
+    }
+
+    if is_shared_config_mode() {
+        item!(
+            HelpSection::Paths,
+            "Shared Mode",
+            "Shared mode",
+            "Settings and inbox paths come from the shared configuration root",
+        );
+    }
+
+    item!(
+        HelpSection::Build,
+        "Feature Set",
+        "DHT",
+        if cfg!(feature = "dht") {
+            "Included in this build"
+        } else {
+            "Not included in this private build"
+        }
+    );
+    item!(
+        HelpSection::Build,
+        "Feature Set",
+        "PEX",
+        if cfg!(feature = "pex") {
+            "Included in this build"
+        } else {
+            "Not included in this private build"
+        }
+    );
+    item!(
+        HelpSection::Build,
+        "Feature Set",
+        "Private mode",
+        if cfg!(all(feature = "dht", feature = "pex")) {
+            "Normal public-tracker feature set"
+        } else {
+            "Private-tracker feature set with public discovery disabled"
+        }
+    );
+
+    items
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+fn help_items_for_view(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> {
+    let all_items = build_help_items(settings, app_state);
+    let query = app_state.ui.help.search_query.trim();
+    let search_view = app_state.ui.help.is_searching || !query.is_empty();
+
+    if search_view {
+        if query.is_empty() {
+            return all_items;
+        }
+        let matcher = SkimMatcherV2::default();
+        return all_items
+            .into_iter()
+            .filter(|item| item.matches_query(query, app_state.ui.help.search_mode, &matcher))
+            .collect();
+    }
+
+    all_items
+        .into_iter()
+        .filter(|item| item.section == app_state.ui.help.active_section)
+        .collect()
+}
+
+enum HelpDisplayRow<'a> {
+    Spacer,
+    Heading { section: HelpSection, title: String },
+    Item(&'a HelpItem),
+}
+
+fn help_display_rows(items: &[HelpItem], search_view: bool) -> Vec<HelpDisplayRow<'_>> {
+    let mut rows = Vec::new();
+    let mut last_heading = String::new();
+
+    for item in items {
+        let heading = if search_view {
+            format!("{} / {}", item.section.label(), item.subsection)
+        } else {
+            item.subsection.clone()
+        };
+
+        if heading != last_heading {
+            if !rows.is_empty() {
+                rows.push(HelpDisplayRow::Spacer);
+            }
+            rows.push(HelpDisplayRow::Heading {
+                section: item.section,
+                title: heading.clone(),
+            });
+            last_heading = heading;
+        }
+        rows.push(HelpDisplayRow::Item(item));
+    }
+
+    rows
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HelpAction {
     Close,
+    SectionNext,
+    SectionPrev,
+    ScrollUp,
+    ScrollDown,
+    Home,
+    End,
+    SearchStart,
+    SearchInsert(char),
+    SearchBackspace,
+    SearchClear,
+    SearchCommit,
+    SearchCancel,
+    ToggleSearchMode,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -120,21 +656,155 @@ pub struct HelpReduceResult {
     pub effects: Vec<HelpEffect>,
 }
 
-fn map_key_to_help_action(key_code: KeyCode, key_kind: KeyEventKind) -> Option<HelpAction> {
-    if key_kind == KeyEventKind::Press
-        && (key_code == KeyCode::Esc || key_code == KeyCode::Char('m'))
-    {
-        return Some(HelpAction::Close);
+fn map_key_to_help_action(key: KeyEvent, search_panel_active: bool) -> Option<HelpAction> {
+    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return None;
     }
-    None
+
+    let has_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let has_alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    if search_panel_active && matches!(key.code, KeyCode::Tab) {
+        return Some(HelpAction::ToggleSearchMode);
+    }
+
+    if search_panel_active {
+        return match key.code {
+            KeyCode::Esc => Some(HelpAction::SearchCancel),
+            KeyCode::Enter => Some(HelpAction::SearchCommit),
+            KeyCode::Backspace => Some(HelpAction::SearchBackspace),
+            KeyCode::Char('u') if has_ctrl => Some(HelpAction::SearchClear),
+            KeyCode::Up => Some(HelpAction::ScrollUp),
+            KeyCode::Down => Some(HelpAction::ScrollDown),
+            KeyCode::Home => Some(HelpAction::Home),
+            KeyCode::End => Some(HelpAction::End),
+            KeyCode::Char(c) if !has_ctrl && !has_alt => Some(HelpAction::SearchInsert(c)),
+            _ => None,
+        };
+    }
+
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('m') | KeyCode::Char('q') => Some(HelpAction::Close),
+        KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => Some(HelpAction::SectionNext),
+        KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => Some(HelpAction::SectionPrev),
+        KeyCode::Up | KeyCode::Char('k') => Some(HelpAction::ScrollUp),
+        KeyCode::Down | KeyCode::Char('j') => Some(HelpAction::ScrollDown),
+        KeyCode::Home => Some(HelpAction::Home),
+        KeyCode::End => Some(HelpAction::End),
+        KeyCode::Char('/') => Some(HelpAction::SearchStart),
+        _ => None,
+    }
 }
 
-pub fn reduce_help_action(action: HelpAction) -> HelpReduceResult {
+pub fn reduce_help_action(app_state: &mut AppState, action: HelpAction) -> HelpReduceResult {
     match action {
         HelpAction::Close => HelpReduceResult {
             consumed: true,
             effects: vec![HelpEffect::ToNormal],
         },
+        HelpAction::SectionNext => {
+            app_state.ui.help.active_section = app_state.ui.help.active_section.next();
+            app_state.ui.help.scroll_offset = 0;
+            HelpReduceResult {
+                consumed: true,
+                effects: Vec::new(),
+            }
+        }
+        HelpAction::SectionPrev => {
+            app_state.ui.help.active_section = app_state.ui.help.active_section.prev();
+            app_state.ui.help.scroll_offset = 0;
+            HelpReduceResult {
+                consumed: true,
+                effects: Vec::new(),
+            }
+        }
+        HelpAction::ScrollUp => {
+            app_state.ui.help.scroll_offset = app_state.ui.help.scroll_offset.saturating_sub(1);
+            HelpReduceResult {
+                consumed: true,
+                effects: Vec::new(),
+            }
+        }
+        HelpAction::ScrollDown => {
+            app_state.ui.help.scroll_offset = app_state.ui.help.scroll_offset.saturating_add(1);
+            HelpReduceResult {
+                consumed: true,
+                effects: Vec::new(),
+            }
+        }
+        HelpAction::Home => {
+            app_state.ui.help.scroll_offset = 0;
+            HelpReduceResult {
+                consumed: true,
+                effects: Vec::new(),
+            }
+        }
+        HelpAction::End => {
+            app_state.ui.help.scroll_offset = usize::MAX;
+            HelpReduceResult {
+                consumed: true,
+                effects: Vec::new(),
+            }
+        }
+        HelpAction::SearchStart => {
+            app_state.ui.help.is_searching = true;
+            app_state.ui.help.scroll_offset = 0;
+            HelpReduceResult {
+                consumed: true,
+                effects: Vec::new(),
+            }
+        }
+        HelpAction::SearchInsert(c) => {
+            app_state.ui.help.search_query.push(c);
+            app_state.ui.help.scroll_offset = 0;
+            HelpReduceResult {
+                consumed: true,
+                effects: Vec::new(),
+            }
+        }
+        HelpAction::SearchBackspace => {
+            app_state.ui.help.search_query.pop();
+            app_state.ui.help.scroll_offset = 0;
+            HelpReduceResult {
+                consumed: true,
+                effects: Vec::new(),
+            }
+        }
+        HelpAction::SearchClear => {
+            app_state.ui.help.search_query.clear();
+            app_state.ui.help.scroll_offset = 0;
+            HelpReduceResult {
+                consumed: true,
+                effects: Vec::new(),
+            }
+        }
+        HelpAction::SearchCommit => {
+            app_state.ui.help.is_searching = false;
+            HelpReduceResult {
+                consumed: true,
+                effects: Vec::new(),
+            }
+        }
+        HelpAction::SearchCancel => {
+            app_state.ui.help.is_searching = false;
+            app_state.ui.help.search_query.clear();
+            app_state.ui.help.scroll_offset = 0;
+            HelpReduceResult {
+                consumed: true,
+                effects: Vec::new(),
+            }
+        }
+        HelpAction::ToggleSearchMode => {
+            app_state.ui.help.search_mode = match app_state.ui.help.search_mode {
+                SearchMode::Fuzzy => SearchMode::Regex,
+                SearchMode::Regex => SearchMode::Fuzzy,
+            };
+            app_state.ui.help.scroll_offset = 0;
+            HelpReduceResult {
+                consumed: true,
+                effects: Vec::new(),
+            }
+        }
     }
 }
 
@@ -152,9 +822,12 @@ pub fn handle_event(event: CrosstermEvent, app_state: &mut AppState) {
     }
 
     if let CrosstermEvent::Key(key) = event {
-        if let Some(action) = map_key_to_help_action(key.code, key.kind) {
-            let reduced = reduce_help_action(action);
+        let search_panel_active =
+            app_state.ui.help.is_searching || !app_state.ui.help.search_query.is_empty();
+        if let Some(action) = map_key_to_help_action(key, search_panel_active) {
+            let reduced = reduce_help_action(app_state, action);
             if reduced.consumed {
+                app_state.ui.needs_redraw = true;
                 execute_help_effects(app_state, reduced.effects);
             }
         }
@@ -165,676 +838,298 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     let app_state = screen.ui;
     let settings = screen.settings;
     let ctx = screen.theme;
-    let footer_entries = build_help_footer_entries(settings, app_state);
-    let footer_height = footer_entries.len() as u16;
+    let items = help_items_for_view(settings, app_state);
+    let search_panel_active =
+        app_state.ui.help.is_searching || !app_state.ui.help.search_query.is_empty();
 
-    let area = centered_rect(60, 100, f.area());
+    let area = centered_rect(88, 94, f.area());
     f.render_widget(Clear, area);
 
-    if let Some(warning_text) = &app_state.system_warning {
-        let warning_width = area.width.saturating_sub(2).max(1) as usize;
-        let warning_lines = (warning_text.len() as f64 / warning_width as f64).ceil() as u16;
-        let warning_block_height = warning_lines.saturating_add(2).max(3);
-        let max_warning_height = (area.height as f64 * 0.25).round() as u16;
-        let final_warning_height = warning_block_height.min(max_warning_height);
-        let chunks = Layout::vertical([
-            Constraint::Length(final_warning_height),
-            Constraint::Min(0),
-            Constraint::Length(footer_height),
-        ])
-        .split(area);
-
-        let warning_paragraph = Paragraph::new(warning_text.as_str())
-            .wrap(Wrap { trim: true })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(ctx.apply(Style::default().fg(ctx.state_error()))),
-            )
-            .style(ctx.apply(Style::default().fg(ctx.state_warning())));
-        f.render_widget(warning_paragraph, chunks[0]);
-        draw_help_table(f, app_state, chunks[1], ctx);
-        draw_help_footer(f, chunks[2], &footer_entries, ctx);
+    let (search_area, help_area) = if search_panel_active && area.height >= 7 {
+        let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(area);
+        (Some(chunks[0]), chunks[1])
     } else {
-        let chunks =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(footer_height)]).split(area);
-        draw_help_table(f, app_state, chunks[0], ctx);
-        draw_help_footer(f, chunks[1], &footer_entries, ctx);
+        (None, area)
+    };
+
+    if let Some(search_area) = search_area {
+        draw_help_search_panel(f, search_area, app_state, items.len(), ctx);
+    }
+
+    let layout = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(help_area);
+    let header_area = layout[0];
+    let panel_area = layout[1];
+    let footer_area = layout[2];
+
+    draw_help_tabs(f, header_area, app_state, ctx);
+    draw_help_controls(f, footer_area, app_state, ctx);
+
+    let outer_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(ctx.apply(Style::default().fg(ctx.theme.semantic.border)))
+        .padding(Padding::new(1, 1, 0, 0));
+    let inner = outer_block.inner(panel_area);
+    f.render_widget(outer_block, panel_area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let mut constraints = Vec::new();
+    if let Some(warning_text) = &app_state.system_warning {
+        let warning_width = inner.width.saturating_sub(2).max(1) as usize;
+        let warning_lines = (warning_text.len() as f64 / warning_width as f64).ceil() as u16;
+        let warning_height = warning_lines.saturating_add(1).clamp(2, 3);
+        constraints.push(Constraint::Length(warning_height));
+    }
+    constraints.push(Constraint::Min(1));
+
+    let chunks = Layout::vertical(constraints).split(inner);
+    let mut chunk_idx = 0;
+
+    if let Some(warning_text) = &app_state.system_warning {
+        draw_warning(f, chunks[chunk_idx], warning_text, ctx);
+        chunk_idx += 1;
+    }
+
+    draw_help_table(f, chunks[chunk_idx], app_state, &items, ctx);
+}
+
+fn draw_warning(f: &mut Frame, area: Rect, warning_text: &str, ctx: &ThemeContext) {
+    if area.height == 0 {
+        return;
+    }
+
+    let warning = Paragraph::new(warning_text)
+        .wrap(Wrap { trim: true })
+        .style(ctx.apply(Style::default().fg(ctx.state_warning())));
+    f.render_widget(warning, area);
+}
+
+fn draw_help_tabs(f: &mut Frame, area: Rect, app_state: &AppState, ctx: &ThemeContext) {
+    if area.height == 0 {
+        return;
+    }
+
+    let mut spans = Vec::new();
+
+    for (idx, section) in HELP_SECTIONS.iter().enumerate() {
+        if idx > 0 {
+            spans.push(Span::styled(
+                "   ",
+                ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
+            ));
+        }
+        let color = help_section_color(*section, ctx);
+        let style = if *section == app_state.ui.help.active_section {
+            ctx.apply(
+                Style::default()
+                    .fg(color)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            )
+        } else {
+            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0))
+        };
+        spans.push(Span::styled(section.label(), style));
+    }
+
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).alignment(Alignment::Center),
+        area,
+    );
+}
+
+fn draw_help_search_panel(
+    f: &mut Frame,
+    area: Rect,
+    app_state: &AppState,
+    visible_count: usize,
+    ctx: &ThemeContext,
+) {
+    if area.height == 0 {
+        return;
+    }
+
+    let mut trailing_spans = help_search_mode_spans(app_state, ctx);
+    trailing_spans.push(Span::styled(
+        format!("  {visible_count} matches"),
+        ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+    ));
+    draw_prompt_panel(
+        f,
+        area,
+        " Help Search ".to_string(),
+        sanitize_text(&app_state.ui.help.search_query),
+        trailing_spans,
+        ctx,
+    );
+}
+
+fn help_search_mode_spans(app_state: &AppState, ctx: &ThemeContext) -> Vec<Span<'static>> {
+    let (fuzzy_style, regex_style) = match app_state.ui.help.search_mode {
+        SearchMode::Fuzzy => (
+            ctx.apply(Style::default().fg(ctx.state_selected()).bold()),
+            ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0)),
+        ),
+        SearchMode::Regex => (
+            ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0)),
+            ctx.apply(Style::default().fg(ctx.state_selected()).bold()),
+        ),
+    };
+    vec![
+        Span::raw("  "),
+        Span::styled("Fuzzy", fuzzy_style),
+        Span::raw(" / "),
+        Span::styled("Regex", regex_style),
+    ]
+}
+
+fn help_section_color(section: HelpSection, ctx: &ThemeContext) -> Color {
+    match section {
+        HelpSection::General => ctx.state_selected(),
+        HelpSection::Torrents => ctx.state_success(),
+        HelpSection::Graphs => ctx.accent_teal(),
+        HelpSection::Legends => ctx.accent_peach(),
+        HelpSection::Screens => ctx.accent_sapphire(),
+        HelpSection::Paths => ctx.state_info(),
+        HelpSection::Build => ctx.state_warning(),
     }
 }
 
-fn draw_help_table(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &ThemeContext) {
-    let mode = &app_state.mode;
+fn help_table_capacity(area: Rect) -> usize {
+    area.height.max(1) as usize
+}
 
-    let (lvl, progress) = calculate_player_stats(app_state);
+fn clamped_scroll_offset(scroll_offset: usize, len: usize, visible_count: usize) -> usize {
+    if len <= visible_count {
+        return 0;
+    }
+    scroll_offset.min(len.saturating_sub(visible_count))
+}
 
-    // Bar styling
-    let gauge_width = 15;
-    let filled_len = (progress * gauge_width as f64).round() as usize;
-    let empty_len = gauge_width - filled_len;
-    let gauge_str = format!("[{}{}]", "=".repeat(filled_len), "-".repeat(empty_len));
-
-    // Text styling
-    let level_text = format!("Level {} ({:.0}%)", lvl, progress * 100.0);
-
-    let (title, mut rows) = match mode {
-        AppMode::Normal | AppMode::Welcome | AppMode::Help => (
-            " Manual / Help ",
-            vec![
-                Row::new(vec![Cell::from(Span::styled(
-                    "General Controls",
-                    ctx.apply(Style::default().fg(ctx.state_warning())),
-                ))]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "Ctrl +",
-                        ctx.apply(Style::default().fg(ctx.accent_teal())),
-                    )),
-                    Cell::from("Zoom in (increase font size)"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "Ctrl -",
-                        ctx.apply(Style::default().fg(ctx.accent_teal())),
-                    )),
-                    Cell::from("Zoom out (decrease font size)"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "Q (shift+q)",
-                        ctx.apply(Style::default().fg(ctx.state_error())),
-                    )),
-                    Cell::from("Quit the application"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "m",
-                        ctx.apply(Style::default().fg(ctx.state_selected())),
-                    )),
-                    Cell::from("Toggle this help screen"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "c",
-                        ctx.apply(Style::default().fg(ctx.accent_peach())),
-                    )),
-                    Cell::from("Open Config screen"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "r",
-                        ctx.apply(Style::default().fg(ctx.accent_sapphire())),
-                    )),
-                    Cell::from("Open RSS screen"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "J",
-                        ctx.apply(Style::default().fg(ctx.state_info())),
-                    )),
-                    Cell::from("Open event journal"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "M",
-                        ctx.apply(Style::default().fg(ctx.state_selected())),
-                    )),
-                    Cell::from("Open torrent management"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "z",
-                        ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
-                    )),
-                    Cell::from("Toggle Zen/Power Saving mode"),
-                ]),
-                Row::new(vec![Cell::from(""), Cell::from("")]).height(1),
-                // --- List Navigation & Sorting ---
-                Row::new(vec![Cell::from(Span::styled(
-                    "List Navigation",
-                    ctx.apply(Style::default().fg(ctx.state_warning())),
-                ))]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "↑ / ↓ / k / j",
-                        ctx.apply(Style::default().fg(ctx.state_info())),
-                    )),
-                    Cell::from("Navigate torrents list"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "← / → / h / l",
-                        ctx.apply(Style::default().fg(ctx.state_info())),
-                    )),
-                    Cell::from("Navigate between header columns"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "s",
-                        ctx.apply(Style::default().fg(ctx.state_success())),
-                    )),
-                    Cell::from("Change sort order for the selected column"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "S (shift+s)",
-                        ctx.apply(Style::default().fg(ctx.state_success())),
-                    )),
-                    Cell::from("Clear manual sorting and resume automatic sorting"),
-                ]),
-                Row::new(vec![Cell::from(""), Cell::from("")]).height(1),
-                // --- Torrent Management ---
-                Row::new(vec![Cell::from(Span::styled(
-                    "Torrent Actions",
-                    ctx.apply(Style::default().fg(ctx.state_warning())),
-                ))]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "p",
-                        ctx.apply(Style::default().fg(ctx.state_success())),
-                    )),
-                    Cell::from("Pause / Resume selected torrent(s)"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "d / D",
-                        ctx.apply(Style::default().fg(ctx.state_error())),
-                    )),
-                    Cell::from("Delete selected torrent(s); D includes downloaded files"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "h / l / s",
-                        ctx.apply(Style::default().fg(ctx.state_info())),
-                    )),
-                    Cell::from("Torrent management columns: move left/right and sort"),
-                ]),
-                Row::new(vec![Cell::from(""), Cell::from("")]).height(1),
-                Row::new(vec![Cell::from(Span::styled(
-                    "Adding Torrents",
-                    ctx.apply(Style::default().fg(ctx.state_warning())),
-                ))]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "a",
-                        ctx.apply(Style::default().fg(ctx.state_success())),
-                    )),
-                    Cell::from("Open file picker to add a .torrent file"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "Paste",
-                        ctx.apply(Style::default().fg(ctx.accent_sapphire())),
-                    )),
-                    Cell::from(
-                        "Use your terminal paste shortcut to add a magnet link or file path",
-                    ),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "CLI",
-                        ctx.apply(Style::default().fg(ctx.accent_sapphire())),
-                    )),
-                    Cell::from("Use `superseedr add ...` from another terminal"),
-                ]),
-                Row::new(vec![Cell::from(""), Cell::from("")]).height(1),
-                // --- Graph Controls ---
-                Row::new(vec![Cell::from(Span::styled(
-                    "Graph & Panes",
-                    ctx.apply(Style::default().fg(ctx.state_warning())),
-                ))]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "t / T",
-                        ctx.apply(Style::default().fg(ctx.accent_teal())),
-                    )),
-                    Cell::from("Switch graph time scale forward/backward"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "g / G",
-                        ctx.apply(Style::default().fg(ctx.accent_teal())),
-                    )),
-                    Cell::from("Switch chart panel view forward/backward"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "f",
-                        ctx.apply(Style::default().fg(ctx.accent_teal())),
-                    )),
-                    Cell::from("Focus files when the peer/files stack cannot fit"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "[ / ]",
-                        ctx.apply(Style::default().fg(ctx.accent_teal())),
-                    )),
-                    Cell::from("Change UI refresh rate (FPS)"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "x",
-                        ctx.apply(Style::default().fg(ctx.accent_teal())),
-                    )),
-                    Cell::from("Anonymize torrent names"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "< / >",
-                        ctx.apply(Style::default().fg(ctx.state_selected())),
-                    )),
-                    Cell::from("Cycle UI theme"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "DHT panel",
-                        ctx.apply(Style::default().fg(ctx.peer_discovered())),
-                    )),
-                    Cell::from(Line::from(vec![
-                        Span::styled("4x", ctx.apply(Style::default().fg(ctx.accent_peach()))),
-                        Span::styled("(", ctx.apply(Style::default().fg(ctx.accent_peach()))),
-                        Span::styled("42", ctx.apply(Style::default().fg(ctx.peer_discovered()))),
-                        Span::raw(" "),
-                        Span::styled("184", ctx.apply(Style::default().fg(ctx.peer_connected()))),
-                        Span::styled(")", ctx.apply(Style::default().fg(ctx.accent_peach()))),
-                        Span::raw(" = power, active queries, unique peers found in last 10s"),
-                    ])),
-                ]),
-                Row::new(vec![Cell::from(""), Cell::from("")]).height(1),
-                // --- Peer Flags Legend ---
-                Row::new(vec![
-                    // First Cell (for the first column)
-                    Cell::from(Span::styled(
-                        "Peer Flags Legend",
-                        ctx.apply(Style::default().fg(ctx.state_warning())),
-                    )),
-                    // Second Cell (for the second column)
-                    Cell::from(Line::from(vec![
-                        // Legend pairing: DL/UL status
-                        Span::raw("DL: (You "),
-                        Span::styled("■", ctx.apply(Style::default().fg(ctx.accent_sapphire()))),
-                        Span::styled("■", ctx.apply(Style::default().fg(ctx.accent_maroon()))),
-                        Span::raw(") | UL: (Peer "),
-                        Span::styled("■", ctx.apply(Style::default().fg(ctx.accent_teal()))),
-                        Span::styled("■", ctx.apply(Style::default().fg(ctx.accent_peach()))),
-                        Span::raw(")"),
-                    ])),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "■",
-                        ctx.apply(Style::default().fg(ctx.accent_sapphire())),
-                    )),
-                    Cell::from("You are interested (DL Potential)"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "■",
-                        ctx.apply(Style::default().fg(ctx.accent_maroon())),
-                    )),
-                    Cell::from("Peer is choking you (DL Block)"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "■",
-                        ctx.apply(Style::default().fg(ctx.accent_teal())),
-                    )),
-                    Cell::from("Peer is interested (UL Opportunity)"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "■",
-                        ctx.apply(Style::default().fg(ctx.accent_peach())),
-                    )),
-                    Cell::from("You are choking peer (UL Restriction)"),
-                ]),
-                Row::new(vec![Cell::from(""), Cell::from("")]).height(1),
-                Row::new(vec![Cell::from(Span::styled(
-                    "Disk Stats Legend",
-                    ctx.apply(Style::default().fg(ctx.state_warning())),
-                ))]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "↑ (Read)",
-                        ctx.apply(Style::default().fg(ctx.state_success())),
-                    )),
-                    Cell::from("Data read from disk"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "↓ (Write)",
-                        ctx.apply(Style::default().fg(ctx.accent_sky())),
-                    )),
-                    Cell::from("Data written to disk"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "Seek",
-                        ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
-                    )),
-                    Cell::from("Avg. distance between I/O ops (lower is better)"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "Latency",
-                        ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
-                    )),
-                    Cell::from("Time to complete one I/O op (lower is better)"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "IOPS",
-                        ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
-                    )),
-                    Cell::from("I/O Operations Per Second (total workload)"),
-                ]),
-                Row::new(vec![Cell::from(""), Cell::from("")]).height(1),
-                Row::new(vec![Cell::from(Span::styled(
-                    "Self-Tuning Legend",
-                    ctx.apply(Style::default().fg(ctx.state_warning())),
-                ))]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "Best Score",
-                        ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
-                    )),
-                    Cell::from("Score measuring if randomized changes resulted in optimal speeds."),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "Self-Tune (Xs):",
-                        ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
-                    )),
-                    Cell::from("Tuning state with countdown to the next adjustment cycle."),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "Resource Rows",
-                        ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
-                    )),
-                    Cell::from("Current limits shown as numbers for Peers/Reads/Writes/Reserve."),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "(+/-/0)",
-                        ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
-                    )),
-                    Cell::from("Signed change vs best limits (green positive, red negative)."),
-                ]),
-                Row::new(vec![Cell::from(""), Cell::from("")]).height(1),
-                Row::new(vec![Cell::from(Span::styled(
-                    "Build Features",
-                    ctx.apply(Style::default().fg(ctx.state_warning())),
-                ))]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "DHT",
-                        ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
-                    )),
-                    Cell::from(Line::from(vec![
-                        #[cfg(feature = "dht")]
-                        Span::styled("ON", ctx.apply(Style::default().fg(ctx.state_success()))),
-                        #[cfg(not(feature = "dht"))]
-                        Span::styled(
-                            "Not included in this [PRIVATE] build of superseedr.",
-                            ctx.apply(Style::default().fg(ctx.state_error())),
-                        ),
-                    ])),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "Pex",
-                        ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
-                    )),
-                    Cell::from(Line::from(vec![
-                        #[cfg(feature = "pex")]
-                        Span::styled("ON", ctx.apply(Style::default().fg(ctx.state_success()))),
-                        #[cfg(not(feature = "pex"))]
-                        Span::styled(
-                            "Not included in this [PRIVATE] build of superseedr.",
-                            ctx.apply(Style::default().fg(ctx.state_error())),
-                        ),
-                    ])),
-                ]),
-                Row::new(vec![Cell::from(""), Cell::from("")]).height(1),
-                // --- NEW: Session Stats at the Bottom ---
-                Row::new(vec![Cell::from(Span::styled(
-                    "Session Stats",
-                    ctx.apply(Style::default().fg(ctx.state_warning())),
-                ))]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "Level Up:",
-                        ctx.apply(Style::default().fg(ctx.state_selected())),
-                    )),
-                    Cell::from("Upload data or keep a large library seeding."),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        gauge_str,
-                        ctx.apply(Style::default().fg(ctx.state_success())),
-                    )),
-                    Cell::from(Span::styled(
-                        level_text,
-                        Style::default().fg(ctx.state_warning()).bold(),
-                    )),
-                ]),
-            ],
-        ),
-        AppMode::Rss => (
-            " Help / RSS ",
-            vec![
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "Esc / q",
-                        ctx.apply(Style::default().fg(ctx.state_error())),
-                    )),
-                    Cell::from("Exit RSS mode"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "Tab / h",
-                        ctx.apply(Style::default().fg(ctx.state_selected())),
-                    )),
-                    Cell::from("Next pane focus (Tab) / swap Explorer with History (h)"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "s",
-                        ctx.apply(Style::default().fg(ctx.state_warning())),
-                    )),
-                    Cell::from("Sync now"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "↑ / ↓ / k / j",
-                        ctx.apply(Style::default().fg(ctx.state_info())),
-                    )),
-                    Cell::from("Move selection in active RSS sub-screen"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "a / d / Space",
-                        ctx.apply(Style::default().fg(ctx.state_complete())),
-                    )),
-                    Cell::from(
-                        "Focused pane actions: Links add/delete/toggle; Filters add/delete/toggle",
-                    ),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "Enter",
-                        ctx.apply(Style::default().fg(ctx.state_warning())),
-                    )),
-                    Cell::from("Confirm add/search input"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "/",
-                        ctx.apply(Style::default().fg(ctx.accent_sapphire())),
-                    )),
-                    Cell::from("Start Explorer search mode (when Explorer pane is focused)"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "Y",
-                        ctx.apply(Style::default().fg(ctx.state_success())),
-                    )),
-                    Cell::from("Download selected Explorer item (if not downloaded)"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "j / k / ↑ / ↓",
-                        ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
-                    )),
-                    Cell::from("Move selection in the focused pane"),
-                ]),
-            ],
-        ),
-        AppMode::Journal => (" Help / Journal ", journal_help_rows(ctx)),
-        AppMode::TorrentManagement => (
-            " Help / Torrent Management ",
-            vec![
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "Esc / q",
-                        ctx.apply(Style::default().fg(ctx.state_error())),
-                    )),
-                    Cell::from("Return to dashboard"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "/",
-                        ctx.apply(Style::default().fg(ctx.state_warning())),
-                    )),
-                    Cell::from("Search torrent names and paths"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "g / Enter",
-                        ctx.apply(Style::default().fg(ctx.state_selected())),
-                    )),
-                    Cell::from("Toggle grouping / expand a group row"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "x",
-                        ctx.apply(Style::default().fg(ctx.accent_peach())),
-                    )),
-                    Cell::from("Toggle anonymized torrent names"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "Space / A / u",
-                        ctx.apply(Style::default().fg(ctx.state_success())),
-                    )),
-                    Cell::from("Select current row / select visible / clear selection"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "p",
-                        ctx.apply(Style::default().fg(ctx.state_success())),
-                    )),
-                    Cell::from("Pause or resume selected torrents"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "d / D",
-                        ctx.apply(Style::default().fg(ctx.state_error())),
-                    )),
-                    Cell::from("Remove selected torrents, or purge files after confirmation"),
-                ]),
-            ],
-        ),
-        AppMode::Config => (
-            " Help / Config ",
-            vec![
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "Esc / q",
-                        ctx.apply(Style::default().fg(ctx.state_success())),
-                    )),
-                    Cell::from("Save and exit config"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "↑ / ↓ / k / j",
-                        ctx.apply(Style::default().fg(ctx.state_info())),
-                    )),
-                    Cell::from("Navigate items"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "← / → / h / l",
-                        ctx.apply(Style::default().fg(ctx.state_info())),
-                    )),
-                    Cell::from("Decrease / Increase value"),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "Enter",
-                        ctx.apply(Style::default().fg(ctx.state_warning())),
-                    )),
-                    Cell::from("Start or confirm editing"),
-                ]),
-            ],
-        ),
-        AppMode::FileBrowser => (
-            " Help / File Browser ",
-            vec![
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        "Esc",
-                        ctx.apply(Style::default().fg(ctx.state_error())),
-                    )),
-                    Cell::from("Cancel selection"),
-                ]),
-                // ... rest of help items ...
-            ],
-        ),
-        _ => (
-            " Help ",
-            vec![Row::new(vec![Cell::from(
-                "No help available for this view.",
-            )])],
-        ),
-    };
-
-    if is_shared_config_mode() && matches!(mode, AppMode::Normal | AppMode::Welcome | AppMode::Help)
-    {
-        rows.extend([
-            Row::new(vec![Cell::from(Span::styled(
-                "Cluster Mode",
-                ctx.apply(Style::default().fg(ctx.state_warning())),
-            ))]),
-            Row::new(vec![
-                Cell::from(Span::styled(
-                    "Leader",
-                    ctx.apply(Style::default().fg(ctx.state_success())),
-                )),
-                Cell::from("Downloads, seeds, and publishes cluster progress"),
-            ]),
-            Row::new(vec![
-                Cell::from(Span::styled(
-                    "Follower",
-                    ctx.apply(Style::default().fg(ctx.state_info())),
-                )),
-                Cell::from("Reads leader progress and may seed complete shared data"),
-            ]),
-            Row::new(vec![Cell::from(""), Cell::from("")]).height(1),
-        ]);
+fn draw_help_table(
+    f: &mut Frame,
+    area: Rect,
+    app_state: &AppState,
+    items: &[HelpItem],
+    ctx: &ThemeContext,
+) {
+    if area.height == 0 {
+        return;
     }
 
-    let help_table = Table::new(rows, [Constraint::Length(20), Constraint::Min(30)]).block(
-        Block::default()
-            .title(title)
-            .borders(Borders::ALL)
-            .border_style(ctx.apply(Style::default().fg(ctx.theme.semantic.border)))
-            .padding(Padding::new(2, 2, 1, 1)),
+    let search_view = app_state.ui.help.is_searching || !app_state.ui.help.search_query.is_empty();
+    let display_rows = help_display_rows(items, search_view);
+    let visible_count = help_table_capacity(area);
+    let scroll = clamped_scroll_offset(
+        app_state.ui.help.scroll_offset,
+        display_rows.len(),
+        visible_count,
     );
+    let visible_rows = display_rows
+        .iter()
+        .skip(scroll)
+        .take(visible_count)
+        .collect::<Vec<_>>();
 
-    f.render_widget(Clear, area);
-    f.render_widget(help_table, area);
+    let rows = if visible_rows.is_empty() {
+        vec![Row::new(vec![
+            Cell::from(Span::styled(
+                "-",
+                ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+            )),
+            Cell::from(Span::styled(
+                if app_state.ui.help.search_query.is_empty() {
+                    "No help entries in this view"
+                } else {
+                    "No help entries match the search"
+                },
+                ctx.apply(Style::default().fg(ctx.state_warning())),
+            )),
+        ])]
+    } else {
+        visible_rows
+            .into_iter()
+            .map(|row| match row {
+                HelpDisplayRow::Spacer => Row::new(vec![Cell::from(""), Cell::from("")]),
+                HelpDisplayRow::Heading { section, title } => {
+                    let color = help_section_color(*section, ctx);
+                    Row::new(vec![
+                        Cell::from(Span::styled(
+                            title.clone(),
+                            ctx.apply(Style::default().fg(color).bold()),
+                        )),
+                        Cell::from(""),
+                    ])
+                }
+                HelpDisplayRow::Item(item) => Row::new(vec![
+                    Cell::from(format!("  {}", item.key)),
+                    Cell::from(Span::styled(
+                        format!("  {}", item.action),
+                        ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
+                    )),
+                ]),
+            })
+            .collect()
+    };
+
+    let table = Table::new(rows, [Constraint::Length(24), Constraint::Min(20)]).column_spacing(2);
+
+    f.render_widget(table, area);
+}
+
+fn draw_help_controls(f: &mut Frame, area: Rect, app_state: &AppState, ctx: &ThemeContext) {
+    if area.height == 0 {
+        return;
+    }
+
+    let search_panel_active =
+        app_state.ui.help.is_searching || !app_state.ui.help.search_query.is_empty();
+    let entries: &[(&str, &str, Color)] = if search_panel_active {
+        &[
+            ("type", "query", ctx.state_selected()),
+            ("Tab", "mode", ctx.state_warning()),
+            ("Enter", "keep", ctx.state_success()),
+            ("Esc", "clear", ctx.state_error()),
+            ("Up/Down", "scroll", ctx.state_info()),
+        ]
+    } else {
+        &[
+            ("Esc/m/q", "close", ctx.state_error()),
+            ("Tab", "section", ctx.state_selected()),
+            ("/", "search", ctx.accent_sapphire()),
+            ("Up/Down", "scroll", ctx.state_info()),
+            ("Home/End", "jump", ctx.state_warning()),
+        ]
+    };
+
+    let mut spans = Vec::new();
+    for (idx, (key, label, color)) in entries.iter().enumerate() {
+        if idx > 0 {
+            spans.push(Span::styled(
+                " | ",
+                ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
+            ));
+        }
+        spans.push(Span::styled(
+            format!("[{key}]"),
+            ctx.apply(Style::default().fg(*color).bold()),
+        ));
+        spans.push(Span::styled(
+            format!(" {label}"),
+            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+        ));
+    }
+
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).alignment(Alignment::Center),
+        area,
+    );
 }
 
 #[cfg(test)]
@@ -900,6 +1195,166 @@ mod tests {
         );
 
         assert!(matches!(app_state.mode, AppMode::Normal));
+    }
+
+    #[test]
+    fn help_tab_cycles_sections_and_resets_scroll() {
+        let mut app_state = AppState {
+            mode: AppMode::Help,
+            ..Default::default()
+        };
+        app_state.ui.help.scroll_offset = 12;
+
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            &mut app_state,
+        );
+
+        assert_eq!(app_state.ui.help.active_section, HelpSection::Torrents);
+        assert_eq!(app_state.ui.help.scroll_offset, 0);
+        assert!(matches!(app_state.mode, AppMode::Help));
+    }
+
+    #[test]
+    fn help_arrow_keys_scroll() {
+        let mut app_state = AppState {
+            mode: AppMode::Help,
+            ..Default::default()
+        };
+
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            &mut app_state,
+        );
+        assert_eq!(app_state.ui.help.scroll_offset, 1);
+
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            &mut app_state,
+        );
+        assert_eq!(app_state.ui.help.scroll_offset, 0);
+    }
+
+    #[test]
+    fn help_display_rows_add_space_between_subsections() {
+        let items = vec![
+            HelpItem::new(HelpSection::General, "One", "a", "First action"),
+            HelpItem::new(HelpSection::General, "Two", "b", "Second action"),
+        ];
+
+        let rows = help_display_rows(&items, false);
+
+        assert!(matches!(rows[0], HelpDisplayRow::Heading { .. }));
+        assert!(matches!(rows[1], HelpDisplayRow::Item(_)));
+        assert!(matches!(rows[2], HelpDisplayRow::Spacer));
+        assert!(matches!(rows[3], HelpDisplayRow::Heading { .. }));
+        assert!(matches!(rows[4], HelpDisplayRow::Item(_)));
+    }
+
+    #[test]
+    fn help_search_filters_across_all_sections() {
+        let settings = Settings::default();
+        let mut app_state = AppState {
+            mode: AppMode::Help,
+            ..Default::default()
+        };
+        app_state.ui.help.active_section = HelpSection::General;
+
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE)),
+            &mut app_state,
+        );
+        for ch in "rss".chars() {
+            handle_event(
+                CrosstermEvent::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)),
+                &mut app_state,
+            );
+        }
+
+        let items = help_items_for_view(&settings, &app_state);
+
+        assert!(app_state.ui.help.is_searching);
+        assert_eq!(app_state.ui.help.search_query, "rss");
+        assert!(items
+            .iter()
+            .any(|item| item.section == HelpSection::Screens));
+        assert!(items.iter().any(|item| item.action.contains("RSS")));
+    }
+
+    #[test]
+    fn help_search_tab_toggles_fuzzy_and_regex() {
+        let mut app_state = AppState {
+            mode: AppMode::Help,
+            ..Default::default()
+        };
+        app_state.ui.help.is_searching = true;
+
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            &mut app_state,
+        );
+
+        assert_eq!(app_state.ui.help.search_mode, SearchMode::Regex);
+
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            &mut app_state,
+        );
+
+        assert_eq!(app_state.ui.help.search_mode, SearchMode::Fuzzy);
+    }
+
+    #[test]
+    fn help_regex_search_filters_all_sections() {
+        let settings = Settings::default();
+        let mut app_state = AppState {
+            mode: AppMode::Help,
+            ..Default::default()
+        };
+        app_state.ui.help.is_searching = true;
+        app_state.ui.help.search_mode = SearchMode::Regex;
+        app_state.ui.help.search_query = "Torrent Management Enter / Y".to_string();
+
+        let items = help_items_for_view(&settings, &app_state);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].subsection, "Torrent Management");
+        assert_eq!(items[0].key, "Enter / Y");
+    }
+
+    #[test]
+    fn help_invalid_regex_matches_no_rows() {
+        let settings = Settings::default();
+        let mut app_state = AppState {
+            mode: AppMode::Help,
+            ..Default::default()
+        };
+        app_state.ui.help.is_searching = true;
+        app_state.ui.help.search_mode = SearchMode::Regex;
+        app_state.ui.help.search_query = "[".to_string();
+
+        let items = help_items_for_view(&settings, &app_state);
+
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn help_esc_clears_search_before_closing() {
+        let mut app_state = AppState {
+            mode: AppMode::Help,
+            ..Default::default()
+        };
+        app_state.ui.help.is_searching = true;
+        app_state.ui.help.search_query = "path".to_string();
+
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            &mut app_state,
+        );
+
+        assert!(matches!(app_state.mode, AppMode::Help));
+        assert!(!app_state.ui.help.is_searching);
+        assert!(app_state.ui.help.search_query.is_empty());
     }
 
     #[test]

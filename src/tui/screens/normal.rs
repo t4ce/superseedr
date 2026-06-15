@@ -399,7 +399,6 @@ pub enum UiAction {
     ClearSystemError,
     StartSearch,
     Navigate(KeyCode),
-    ToggleTorrentFiles,
     ToggleAnonymizeNames,
     EnterPowerSaving,
     RequestQuit,
@@ -467,13 +466,6 @@ pub fn reduce_ui_action(app_state: &mut AppState, action: UiAction) -> ReduceRes
         }
         UiAction::Navigate(key_code) => {
             handle_navigation(app_state, key_code);
-            ReduceResult {
-                redraw: true,
-                effects: Vec::new(),
-            }
-        }
-        UiAction::ToggleTorrentFiles => {
-            app_state.ui.show_torrent_files = !app_state.ui.show_torrent_files;
             ReduceResult {
                 redraw: true,
                 effects: Vec::new(),
@@ -742,7 +734,6 @@ fn map_key_to_ui_action(key: KeyEvent) -> Option<UiAction> {
     match key.code {
         KeyCode::Esc => Some(UiAction::ClearSystemError),
         KeyCode::Char('/') => Some(UiAction::StartSearch),
-        KeyCode::Char('f') => Some(UiAction::ToggleTorrentFiles),
         KeyCode::Char('x') => Some(UiAction::ToggleAnonymizeNames),
         KeyCode::Char('z') => Some(UiAction::EnterPowerSaving),
         KeyCode::Char('Q') => Some(UiAction::RequestQuit),
@@ -879,11 +870,6 @@ enum PeerTableRow {
 }
 
 fn draw_peer_files_area(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &ThemeContext) {
-    if app_state.ui.show_torrent_files {
-        draw_torrent_files_panel(f, app_state, area, ctx);
-        return;
-    }
-
     let Some(layout) = torrent_peer_files_layout(app_state, area) else {
         draw_peers_table(f, app_state, area, ctx);
         return;
@@ -1867,11 +1853,6 @@ pub fn draw_footer(
         "[a]",
         "dd",
         ctx.apply(Style::default().fg(ctx.state_success())),
-    );
-    push_if_fits(
-        "[f]",
-        "iles",
-        ctx.apply(Style::default().fg(ctx.accent_teal())),
     );
     push_if_fits(
         "[d]",
@@ -5242,15 +5223,6 @@ fn peer_is_inactive_for_table(peer: &PeerInfo) -> bool {
     peer.download_speed_bps == 0 && peer.upload_speed_bps == 0
 }
 
-pub fn draw_torrent_files_panel(
-    f: &mut Frame,
-    app_state: &AppState,
-    area: Rect,
-    ctx: &ThemeContext,
-) {
-    draw_torrent_files_panel_impl(f, app_state, area, ctx, true, TorrentFilesRenderMode::Tree);
-}
-
 fn draw_torrent_files_panel_without_swarm(
     f: &mut Frame,
     app_state: &AppState,
@@ -5258,7 +5230,7 @@ fn draw_torrent_files_panel_without_swarm(
     ctx: &ThemeContext,
     files_mode: TorrentFilesRenderMode,
 ) {
-    draw_torrent_files_panel_impl(f, app_state, area, ctx, false, files_mode);
+    draw_torrent_files_panel_impl(f, app_state, area, ctx, files_mode);
 }
 
 fn draw_torrent_files_panel_impl(
@@ -5266,14 +5238,13 @@ fn draw_torrent_files_panel_impl(
     app_state: &AppState,
     area: Rect,
     ctx: &ThemeContext,
-    include_swarm: bool,
     files_mode: TorrentFilesRenderMode,
 ) {
     if area.height < 2 || area.width < 2 {
         return;
     }
 
-    let Some((info_hash, torrent)) = selected_torrent_entry(app_state) else {
+    let Some((_, torrent)) = selected_torrent_entry(app_state) else {
         let body_area = draw_torrent_files_frame(f, area, ctx);
         let empty = Paragraph::new("No torrent selected")
             .alignment(Alignment::Center)
@@ -5282,70 +5253,20 @@ fn draw_torrent_files_panel_impl(
         return;
     };
 
-    let max_files_height_with_swarm = area
-        .height
-        .saturating_sub(MIN_SWARM_AVAILABILITY_HEIGHT)
-        .saturating_sub(FILES_SWARM_SPACER_HEIGHT);
-    let file_block_height_with_swarm = torrent_files_panel_height_needed(
+    let body_area = draw_torrent_files_frame(f, area, ctx);
+    let list_items = build_torrent_file_list_items(
         torrent,
-        area.width,
-        app_state.anonymize_torrent_names,
-        max_files_height_with_swarm,
+        TorrentFilesListRenderOptions {
+            width: body_area.width,
+            height: body_area.height,
+            anonymize: app_state.anonymize_torrent_names,
+            download_phase: app_state.ui.file_activity_download_phase,
+            upload_phase: app_state.ui.file_activity_upload_phase,
+            mode: files_mode,
+        },
+        ctx,
     );
-    let file_block_height_needed = file_block_height_with_swarm.unwrap_or(area.height);
-    let remaining_height = area
-        .height
-        .saturating_sub(file_block_height_needed)
-        .saturating_sub(FILES_SWARM_SPACER_HEIGHT);
-
-    if include_swarm
-        && file_block_height_with_swarm.is_some()
-        && remaining_height >= MIN_SWARM_AVAILABILITY_HEIGHT
-    {
-        let layout_chunks = Layout::vertical([
-            Constraint::Length(file_block_height_needed),
-            Constraint::Length(FILES_SWARM_SPACER_HEIGHT),
-            Constraint::Min(0),
-        ])
-        .split(area);
-        let inner_area = draw_torrent_files_frame(f, layout_chunks[0], ctx);
-        let list_items = build_torrent_file_list_items(
-            torrent,
-            TorrentFilesListRenderOptions {
-                width: inner_area.width,
-                height: inner_area.height,
-                anonymize: app_state.anonymize_torrent_names,
-                download_phase: app_state.ui.file_activity_download_phase,
-                upload_phase: app_state.ui.file_activity_upload_phase,
-                mode: files_mode,
-            },
-            ctx,
-        );
-        f.render_widget(List::new(list_items), inner_area);
-        draw_swarm_heatmap(
-            f,
-            ctx,
-            &torrent.latest_state.peers,
-            torrent.latest_state.number_of_pieces_total,
-            layout_chunks[2],
-            Some(swarm_heatmap_flash(app_state, info_hash)),
-        );
-    } else {
-        let body_area = draw_torrent_files_frame(f, area, ctx);
-        let list_items = build_torrent_file_list_items(
-            torrent,
-            TorrentFilesListRenderOptions {
-                width: body_area.width,
-                height: body_area.height,
-                anonymize: app_state.anonymize_torrent_names,
-                download_phase: app_state.ui.file_activity_download_phase,
-                upload_phase: app_state.ui.file_activity_upload_phase,
-                mode: files_mode,
-            },
-            ctx,
-        );
-        f.render_widget(List::new(list_items), body_area);
-    }
+    f.render_widget(List::new(list_items), body_area);
 }
 
 fn draw_torrent_files_frame(_f: &mut Frame, area: Rect, _ctx: &ThemeContext) -> Rect {
@@ -7278,18 +7199,6 @@ mod tests {
     }
 
     #[test]
-    fn reducer_toggle_torrent_files_flips_flag() {
-        let mut app_state = AppState::default();
-        assert!(!app_state.ui.show_torrent_files);
-
-        reduce_ui_action(&mut app_state, UiAction::ToggleTorrentFiles);
-        assert!(app_state.ui.show_torrent_files);
-
-        reduce_ui_action(&mut app_state, UiAction::ToggleTorrentFiles);
-        assert!(!app_state.ui.show_torrent_files);
-    }
-
-    #[test]
     fn peer_table_shows_more_inactive_peers_when_no_active_peers_exist() {
         let mut state = create_mock_metrics(12);
         for (idx, peer) in state.peers.iter_mut().enumerate() {
@@ -8510,7 +8419,7 @@ mod tests {
         );
         assert_eq!(
             map_key_to_ui_action(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)),
-            Some(UiAction::ToggleTorrentFiles)
+            None
         );
         assert_eq!(
             map_key_to_ui_action(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE)),

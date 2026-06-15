@@ -1482,12 +1482,12 @@ pub struct UiState {
     pub selected_header: SelectedHeader,
     pub selected_torrent_index: usize,
     pub selected_peer_index: usize,
-    pub show_torrent_files: bool,
     pub is_searching: bool,
     pub search_query: String,
     pub config: ConfigUiState,
     pub delete_confirm: DeleteConfirmUiState,
     pub file_browser: FileBrowserUiState,
+    pub help: HelpUiState,
     pub journal: JournalUiState,
     pub torrent_management: TorrentManagementUiState,
     pub normal_paste_burst: PasteBurst,
@@ -1576,6 +1576,27 @@ pub struct FileBrowserUiState {
     pub browser_mode: FileBrowserMode,
     pub is_searching: bool,
     pub search_query: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HelpSection {
+    #[default]
+    General,
+    Torrents,
+    Graphs,
+    Legends,
+    Screens,
+    Paths,
+    Build,
+}
+
+#[derive(Default)]
+pub struct HelpUiState {
+    pub active_section: HelpSection,
+    pub scroll_offset: usize,
+    pub is_searching: bool,
+    pub search_query: String,
+    pub search_mode: SearchMode,
 }
 
 pub fn build_torrent_preview_tree(

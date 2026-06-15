@@ -5,7 +5,6 @@ use crate::app::{AppCommand, AppMode, AppState, JournalFilter};
 use crate::persistence::event_journal::{
     EventCategory, EventDetails, EventJournalEntry, EventType,
 };
-use crate::theme::ThemeContext;
 use crate::tui::app_command::spawn_app_command_sender;
 use crate::tui::formatters::sanitize_text;
 use crate::tui::screen_context::ScreenContext;
@@ -15,16 +14,6 @@ use ratatui::prelude::{Alignment, Constraint, Frame, Line, Modifier, Span, Style
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 use std::path::{Component, Path};
 use tokio::sync::{broadcast, mpsc};
-
-const JOURNAL_CLOSE_KEYS_LABEL: &str = "Esc / q";
-const JOURNAL_FILTER_KEYS_LABEL: &str = "Tab / Shift+Tab";
-const JOURNAL_MOVE_KEYS_LABEL: &str = "Up / Down / k / j";
-const JOURNAL_REPLAY_KEYS_LABEL: &str = "Shift+Y";
-const JOURNAL_CLOSE_DESCRIPTION: &str = "Close the event journal";
-const JOURNAL_FILTER_DESCRIPTION: &str = "Cycle between ALL, QUEUE, COMMANDS, and HEALTH";
-const JOURNAL_MOVE_DESCRIPTION: &str = "Move selection through journal entries";
-const JOURNAL_REPLAY_DESCRIPTION: &str =
-    "Replay the selected archived .torrent, .magnet, or .path source";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JournalAction {
@@ -300,39 +289,6 @@ fn selected_detail_text(app_state: &AppState, entry: Option<&EventJournalEntry>)
     }
 
     detail_text(Some(entry), app_state.anonymize_torrent_names)
-}
-
-pub fn journal_help_rows(ctx: &ThemeContext) -> Vec<Row<'static>> {
-    vec![
-        Row::new(vec![
-            Cell::from(Span::styled(
-                JOURNAL_CLOSE_KEYS_LABEL,
-                ctx.apply(Style::default().fg(ctx.state_error())),
-            )),
-            Cell::from(JOURNAL_CLOSE_DESCRIPTION),
-        ]),
-        Row::new(vec![
-            Cell::from(Span::styled(
-                JOURNAL_FILTER_KEYS_LABEL,
-                ctx.apply(Style::default().fg(ctx.state_selected())),
-            )),
-            Cell::from(JOURNAL_FILTER_DESCRIPTION),
-        ]),
-        Row::new(vec![
-            Cell::from(Span::styled(
-                JOURNAL_MOVE_KEYS_LABEL,
-                ctx.apply(Style::default().fg(ctx.state_info())),
-            )),
-            Cell::from(JOURNAL_MOVE_DESCRIPTION),
-        ]),
-        Row::new(vec![
-            Cell::from(Span::styled(
-                JOURNAL_REPLAY_KEYS_LABEL,
-                ctx.apply(Style::default().fg(ctx.state_success())),
-            )),
-            Cell::from(JOURNAL_REPLAY_DESCRIPTION),
-        ]),
-    ]
 }
 
 fn replay_command_for_path(path: &Path) -> Option<AppCommand> {
