@@ -780,7 +780,11 @@ fn map_key_to_help_action(key: KeyEvent, search_panel_active: bool) -> Option<He
     }
 }
 
-pub fn reduce_help_action(app_state: &mut AppState, action: HelpAction) -> HelpReduceResult {
+pub fn reduce_help_action(
+    app_state: &mut AppState,
+    settings: &Settings,
+    action: HelpAction,
+) -> HelpReduceResult {
     match action {
         HelpAction::Close => HelpReduceResult {
             consumed: true,
@@ -803,14 +807,27 @@ pub fn reduce_help_action(app_state: &mut AppState, action: HelpAction) -> HelpR
             }
         }
         HelpAction::ScrollUp => {
-            app_state.ui.help.scroll_offset = app_state.ui.help.scroll_offset.saturating_sub(1);
+            let max_scroll = max_help_scroll_offset(settings, app_state);
+            app_state.ui.help.scroll_offset = app_state
+                .ui
+                .help
+                .scroll_offset
+                .min(max_scroll)
+                .saturating_sub(1);
             HelpReduceResult {
                 consumed: true,
                 effects: Vec::new(),
             }
         }
         HelpAction::ScrollDown => {
-            app_state.ui.help.scroll_offset = app_state.ui.help.scroll_offset.saturating_add(1);
+            let max_scroll = max_help_scroll_offset(settings, app_state);
+            app_state.ui.help.scroll_offset = app_state
+                .ui
+                .help
+                .scroll_offset
+                .min(max_scroll)
+                .saturating_add(1)
+                .min(max_scroll);
             HelpReduceResult {
                 consumed: true,
                 effects: Vec::new(),
@@ -887,7 +904,16 @@ pub fn execute_help_effects(app_state: &mut AppState, effects: Vec<HelpEffect>) 
     }
 }
 
-pub fn handle_event(event: CrosstermEvent, app_state: &mut AppState) {
+#[cfg(test)]
+fn handle_event(event: CrosstermEvent, app_state: &mut AppState) {
+    handle_event_with_settings(event, app_state, &Settings::default());
+}
+
+pub fn handle_event_with_settings(
+    event: CrosstermEvent,
+    app_state: &mut AppState,
+    settings: &Settings,
+) {
     if !matches!(app_state.mode, AppMode::Help) {
         return;
     }
@@ -896,7 +922,7 @@ pub fn handle_event(event: CrosstermEvent, app_state: &mut AppState) {
         let search_panel_active =
             app_state.ui.help.is_searching || !app_state.ui.help.search_query.is_empty();
         if let Some(action) = map_key_to_help_action(key, search_panel_active) {
-            let reduced = reduce_help_action(app_state, action);
+            let reduced = reduce_help_action(app_state, settings, action);
             if reduced.consumed {
                 app_state.ui.needs_redraw = true;
                 execute_help_effects(app_state, reduced.effects);
@@ -1081,6 +1107,62 @@ fn clamped_scroll_offset(scroll_offset: usize, len: usize, visible_count: usize)
         return 0;
     }
     scroll_offset.min(len.saturating_sub(visible_count))
+}
+
+fn help_table_area_for_state(app_state: &AppState) -> Rect {
+    if app_state.screen_area.width == 0 || app_state.screen_area.height == 0 {
+        return Rect::new(0, 0, 1, 1);
+    }
+
+    let search_panel_active =
+        app_state.ui.help.is_searching || !app_state.ui.help.search_query.is_empty();
+    let area = centered_rect(88, 94, app_state.screen_area);
+    let help_area = if search_panel_active && area.height >= 7 {
+        Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(area)[1]
+    } else {
+        area
+    };
+    let panel_area = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(help_area)[1];
+    let inner = Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::new(2, 2, 0, 0))
+        .inner(panel_area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return inner;
+    }
+
+    let mut constraints = Vec::new();
+    if let Some(warning_text) = &app_state.system_warning {
+        let warning_width = inner.width.saturating_sub(2).max(1) as usize;
+        let warning_lines = (warning_text.len() as f64 / warning_width as f64).ceil() as u16;
+        let warning_height = warning_lines.saturating_add(1).clamp(2, 3);
+        constraints.push(Constraint::Length(warning_height));
+    }
+    constraints.push(Constraint::Min(1));
+
+    let chunks = Layout::vertical(constraints).split(inner);
+    chunks[usize::from(app_state.system_warning.is_some())]
+}
+
+fn help_visible_count_for_state(app_state: &AppState) -> usize {
+    help_table_capacity(help_table_area_for_state(app_state))
+}
+
+fn max_help_scroll_offset(settings: &Settings, app_state: &AppState) -> usize {
+    let items = help_items_for_view(settings, app_state);
+    let search_view = app_state.ui.help.is_searching || !app_state.ui.help.search_query.is_empty();
+    let display_rows = help_display_rows(&items, search_view);
+    clamped_scroll_offset(
+        usize::MAX,
+        display_rows.len(),
+        help_visible_count_for_state(app_state),
+    )
 }
 
 fn help_marker_key_cell(
@@ -1339,6 +1421,34 @@ mod tests {
             &mut app_state,
         );
         assert_eq!(app_state.ui.help.scroll_offset, 0);
+    }
+
+    #[test]
+    fn help_down_scroll_clamps_at_visible_bottom() {
+        let settings = Settings::default();
+        let mut app_state = AppState {
+            mode: AppMode::Help,
+            screen_area: Rect::new(0, 0, 120, 14),
+            ..Default::default()
+        };
+        let max_scroll = max_help_scroll_offset(&settings, &app_state);
+        assert!(max_scroll > 0);
+
+        for _ in 0..max_scroll + 8 {
+            handle_event_with_settings(
+                CrosstermEvent::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+                &mut app_state,
+                &settings,
+            );
+        }
+        assert_eq!(app_state.ui.help.scroll_offset, max_scroll);
+
+        handle_event_with_settings(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            &mut app_state,
+            &settings,
+        );
+        assert_eq!(app_state.ui.help.scroll_offset, max_scroll - 1);
     }
 
     #[test]

@@ -181,7 +181,7 @@ fn should_debounce_escape(event: &CrosstermEvent) -> bool {
 async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
     match app.app_state.mode {
         AppMode::Help => {
-            help::handle_event(event, &mut app.app_state);
+            help::handle_event_with_settings(event, &mut app.app_state, &app.client_configs);
         }
         AppMode::Journal => {
             journal::handle_event_with_shutdown(
