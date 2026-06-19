@@ -6757,22 +6757,28 @@ async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
             } else {
                 app.app_state.pending_torrent_link = magnet_link.to_string();
                 let initial_path = app.get_initial_destination_path();
-                let _ = app.app_command_tx.try_send(AppCommand::FetchFileTree {
-                    path: initial_path,
-                    browser_mode: FileBrowserMode::DownloadLocSelection {
-                        target: DownloadSelectionTarget::PendingAdd,
-                        torrent_files: vec![],
-                        container_name: String::new(),
-                        use_container: false,
-                        is_editing_name: false,
-                        focused_pane: BrowserPane::FileSystem,
-                        preview_tree: Vec::new(),
-                        preview_state: TreeViewState::default(),
-                        cursor_pos: 0,
-                        original_name_backup: "Magnet Download".to_string(),
+                let browser_generation = app.app_state.ui.file_browser.next_browser_generation();
+                spawn_app_command_sender(
+                    app.app_command_tx.clone(),
+                    app.shutdown_tx.subscribe(),
+                    AppCommand::FetchFileTree {
+                        browser_generation,
+                        path: initial_path,
+                        browser_mode: FileBrowserMode::DownloadLocSelection {
+                            target: DownloadSelectionTarget::PendingAdd,
+                            torrent_files: vec![],
+                            container_name: String::new(),
+                            use_container: false,
+                            is_editing_name: false,
+                            focused_pane: BrowserPane::FileSystem,
+                            preview_tree: Vec::new(),
+                            preview_state: TreeViewState::default(),
+                            cursor_pos: 0,
+                            original_name_backup: "Magnet Download".to_string(),
+                        },
+                        highlight_path: None,
                     },
-                    highlight_path: None,
-                });
+                );
             }
         }
         PastedContent::TorrentFile(path) => {
@@ -6879,11 +6885,17 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
         }
         UiEffect::OpenAddTorrentFileBrowser => {
             let initial_path = app.get_initial_source_path();
-            let _ = app.app_command_tx.try_send(AppCommand::FetchFileTree {
-                path: initial_path,
-                browser_mode: FileBrowserMode::File(vec![".torrent".to_string()]),
-                highlight_path: None,
-            });
+            let browser_generation = app.app_state.ui.file_browser.next_browser_generation();
+            spawn_app_command_sender(
+                app.app_command_tx.clone(),
+                app.shutdown_tx.subscribe(),
+                AppCommand::FetchFileTree {
+                    browser_generation,
+                    path: initial_path,
+                    browser_mode: FileBrowserMode::File(vec![".torrent".to_string()]),
+                    highlight_path: None,
+                },
+            );
         }
         UiEffect::OpenExistingTorrentFileBrowser(info_hash) => {
             app.open_existing_torrent_file_browser(info_hash);
@@ -6992,8 +7004,8 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
 mod tests {
     use super::*;
     use crate::app::{
-        AppState, DataRate, PeerInfo, SelectedHeader, TorrentControlState, TorrentDisplayState,
-        TorrentMetrics,
+        AppState, BrowserSearchState, DataRate, PeerInfo, SelectedHeader, TorrentControlState,
+        TorrentDisplayState, TorrentMetrics,
     };
     use crate::config::{PeerSortColumn, SortDirection, TorrentSortColumn};
     use crate::errors::StorageError;
@@ -7117,14 +7129,17 @@ mod tests {
     #[test]
     fn reducer_start_search_keeps_browser_search_state_intact() {
         let mut app_state = AppState::default();
-        app_state.ui.file_browser.is_searching = true;
+        app_state.ui.file_browser.search_state = BrowserSearchState::Editing;
         app_state.ui.file_browser.search_query = "downloads".to_string();
 
         let result = reduce_ui_action(&mut app_state, UiAction::StartSearch);
 
         assert!(result.redraw);
         assert!(app_state.ui.is_searching);
-        assert!(app_state.ui.file_browser.is_searching);
+        assert_eq!(
+            app_state.ui.file_browser.search_state,
+            BrowserSearchState::Editing
+        );
         assert_eq!(app_state.ui.file_browser.search_query, "downloads");
     }
 

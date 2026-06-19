@@ -210,6 +210,7 @@ async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
                     editing: &mut app.app_state.ui.config.editing,
                     app_command_tx: &app.app_command_tx,
                     shutdown_tx: &app.shutdown_tx,
+                    file_browser_generation: &mut app.app_state.ui.file_browser.browser_generation,
                     global_dl_bucket: &app.global_dl_bucket,
                     global_ul_bucket: &app.global_ul_bucket,
                 },

@@ -52,6 +52,7 @@ pub struct ConfigHandleContext<'a> {
     pub editing: &'a mut Option<(ConfigItem, String)>,
     pub app_command_tx: &'a mpsc::Sender<AppCommand>,
     pub shutdown_tx: &'a broadcast::Sender<()>,
+    pub file_browser_generation: &'a mut u64,
     pub global_dl_bucket: &'a Arc<TokenBucket>,
     pub global_ul_bucket: &'a Arc<TokenBucket>,
 }
@@ -160,6 +161,7 @@ pub fn reduce_config_action(
 
                     result.effects.push(ConfigEffect::AppCommand(Box::new(
                         AppCommand::FetchFileTree {
+                            browser_generation: 0,
                             path: initial_path,
                             browser_mode: FileBrowserMode::ConfigPathSelection {
                                 target_item: selected_item,
@@ -490,10 +492,19 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> bool
             for effect in reduced.effects {
                 match effect {
                     ConfigEffect::AppCommand(command) => {
+                        let mut command = *command;
+                        if let AppCommand::FetchFileTree {
+                            browser_generation, ..
+                        } = &mut command
+                        {
+                            *ctx.file_browser_generation =
+                                ctx.file_browser_generation.wrapping_add(1);
+                            *browser_generation = *ctx.file_browser_generation;
+                        }
                         spawn_app_command_sender(
                             ctx.app_command_tx.clone(),
                             ctx.shutdown_tx.subscribe(),
-                            *command,
+                            command,
                         );
                     }
                     ConfigEffect::SetDownloadRate(new_rate) => {
@@ -509,6 +520,7 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> bool
                         });
                     }
                     ConfigEffect::ToNormal => {
+                        *ctx.file_browser_generation = ctx.file_browser_generation.wrapping_add(1);
                         *ctx.mode = AppMode::Normal;
                     }
                 }

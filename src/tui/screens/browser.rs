@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::app::{
-    App, AppCommand, AppMode, BrowserPane, ConfigItem, ConfigUiState, DownloadSelectionTarget,
-    FileBrowserMode, FileMetadata, FilePriority, SearchMode, TorrentDisplayState,
-    TorrentPreviewPayload,
+    App, AppCommand, AppMode, BrowserPane, BrowserSearchState, ConfigItem, ConfigUiState,
+    DownloadSelectionTarget, FileBrowserMode, FileMetadata, FilePriority, SearchMode,
+    TorrentDisplayState, TorrentPreviewPayload,
 };
 use crate::integrations::control::{ControlFilePriorityOverride, ControlRequest};
 use crate::theme::ThemeContext;
@@ -66,10 +66,7 @@ pub fn draw(
     };
 
     let focused_pane = focused_pane(browser_mode);
-    let search_panel_active = browser_search_panel_active(
-        app_state.ui.file_browser.is_searching,
-        &app_state.ui.file_browser.search_query,
-    );
+    let search_panel_active = browser_search_panel_active(app_state.ui.file_browser.search_state);
     let max_area = centered_rect(90, 80, f.area());
     f.render_widget(Clear, max_area);
 
@@ -374,8 +371,8 @@ pub fn draw(
     );
 }
 
-fn browser_search_panel_active(is_searching: bool, search_query: &str) -> bool {
-    is_searching || !search_query.is_empty()
+fn browser_search_panel_active(search_state: BrowserSearchState) -> bool {
+    search_state.is_visible()
 }
 
 fn draw_browser_search_panel(
@@ -780,20 +777,18 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
 
 fn handle_browser_search_key(key: KeyEvent, app: &mut App) -> bool {
     let file_browser = &mut app.app_state.ui.file_browser;
-    if matches!(key.code, KeyCode::Tab)
-        && browser_search_panel_active(file_browser.is_searching, &file_browser.search_query)
-    {
+    if matches!(key.code, KeyCode::Tab) && browser_search_panel_active(file_browser.search_state) {
         toggle_browser_search_mode(&mut file_browser.search_mode);
         reset_active_browser_search_view(&mut file_browser.browser_mode, &mut file_browser.state);
         app.app_state.ui.needs_redraw = true;
         return true;
     }
 
-    if let Some(action) = map_search_key_to_browser_action(key, file_browser.is_searching) {
+    if let Some(action) = map_search_key_to_browser_action(key, file_browser.search_state) {
         let reset_view = browser_action_resets_search_view(action);
         let reduced = reduce_browser_action(
             action,
-            &mut file_browser.is_searching,
+            &mut file_browser.search_state,
             &mut file_browser.search_query,
             &mut file_browser.search_mode,
         );
@@ -833,7 +828,7 @@ async fn handle_browser_download_key(key_code: KeyCode, app: &mut App) -> bool {
 
     if preview_search_should_start(key_code, &app.app_state.ui.file_browser.browser_mode) {
         start_browser_search(
-            &mut app.app_state.ui.file_browser.is_searching,
+            &mut app.app_state.ui.file_browser.search_state,
             &mut app.app_state.ui.file_browser.search_query,
             &mut app.app_state.ui.file_browser.search_mode,
         );
@@ -860,9 +855,9 @@ async fn handle_browser_download_key(key_code: KeyCode, app: &mut App) -> bool {
     }
 
     let screen_area = app.app_state.screen_area;
-    let is_searching = app.app_state.ui.file_browser.is_searching;
+    let search_state = app.app_state.ui.file_browser.search_state;
     let search_query = app.app_state.ui.file_browser.search_query.clone();
-    let search_panel_active = browser_search_panel_active(is_searching, &search_query);
+    let search_panel_active = browser_search_panel_active(search_state);
     let search_mode = app.app_state.ui.file_browser.search_mode;
     let consumed_preview_input = {
         let browser_mode = &mut app.app_state.ui.file_browser.browser_mode;
@@ -916,17 +911,17 @@ fn preview_search_should_start(key_code: KeyCode, browser_mode: &FileBrowserMode
 }
 
 fn start_browser_search(
-    is_searching: &mut bool,
+    search_state: &mut BrowserSearchState,
     search_query: &mut String,
     search_mode: &mut SearchMode,
 ) {
-    *is_searching = true;
+    *search_state = BrowserSearchState::Editing;
     search_query.clear();
     *search_mode = SearchMode::Regex;
 }
 
-fn clear_browser_search(is_searching: &mut bool, search_query: &mut String) {
-    *is_searching = false;
+fn clear_browser_search(search_state: &mut BrowserSearchState, search_query: &mut String) {
+    *search_state = BrowserSearchState::Closed;
     search_query.clear();
 }
 
@@ -972,8 +967,7 @@ async fn handle_browser_common_key(key_code: KeyCode, app: &mut App) -> bool {
             file_browser.state.cursor_path.as_ref(),
         );
         let pane = focused_pane(&file_browser.browser_mode);
-        let search_panel_active =
-            browser_search_panel_active(file_browser.is_searching, &file_browser.search_query);
+        let search_panel_active = browser_search_panel_active(file_browser.search_state);
         calculate_list_height(
             app.app_state.screen_area,
             has_preview,
@@ -990,11 +984,13 @@ async fn handle_browser_common_key(key_code: KeyCode, app: &mut App) -> bool {
                 state: &mut file_browser.state,
                 data: &file_browser.data,
                 browser_mode: &file_browser.browser_mode,
-                is_searching: &mut file_browser.is_searching,
+                search_state: &mut file_browser.search_state,
                 search_query: &mut file_browser.search_query,
                 search_mode: &mut file_browser.search_mode,
                 list_height,
                 app_command_tx: &app.app_command_tx,
+                shutdown_tx: &app.shutdown_tx,
+                browser_generation: file_browser.browser_generation,
             },
         )
     };
@@ -1147,26 +1143,35 @@ pub struct BrowserFilesystemNavContext<'a> {
     pub state: &'a mut TreeViewState,
     pub data: &'a [RawNode<FileMetadata>],
     pub browser_mode: &'a FileBrowserMode,
-    pub is_searching: &'a mut bool,
+    pub search_state: &'a mut BrowserSearchState,
     pub search_query: &'a mut String,
     pub search_mode: &'a mut SearchMode,
     pub list_height: usize,
     pub app_command_tx: &'a mpsc::Sender<AppCommand>,
+    pub shutdown_tx: &'a broadcast::Sender<()>,
+    pub browser_generation: u64,
 }
 
 pub struct BrowserFilesystemReduceContext<'a> {
     pub state: &'a mut TreeViewState,
     pub data: &'a [RawNode<FileMetadata>],
     pub browser_mode: &'a FileBrowserMode,
-    pub is_searching: &'a mut bool,
+    pub search_state: &'a mut BrowserSearchState,
     pub search_query: &'a mut String,
     pub search_mode: &'a mut SearchMode,
     pub list_height: usize,
 }
 
-fn map_search_key_to_browser_action(key: KeyEvent, is_searching: bool) -> Option<BrowserAction> {
-    if !is_searching {
-        return None;
+fn map_search_key_to_browser_action(
+    key: KeyEvent,
+    search_state: BrowserSearchState,
+) -> Option<BrowserAction> {
+    if !search_state.is_editing() {
+        return if search_state.is_visible() && matches!(key.code, KeyCode::Esc) {
+            Some(BrowserAction::Esc)
+        } else {
+            None
+        };
     }
 
     Some(match key.code {
@@ -1181,16 +1186,20 @@ fn map_search_key_to_browser_action(key: KeyEvent, is_searching: bool) -> Option
 
 pub fn reduce_browser_action(
     action: BrowserAction,
-    is_searching: &mut bool,
+    search_state: &mut BrowserSearchState,
     search_query: &mut String,
     search_mode: &mut SearchMode,
 ) -> BrowserReduceResult {
     match action {
         BrowserAction::Esc => {
-            clear_browser_search(is_searching, search_query);
+            clear_browser_search(search_state, search_query);
         }
         BrowserAction::Enter => {
-            *is_searching = false;
+            *search_state = if search_query.is_empty() {
+                BrowserSearchState::Closed
+            } else {
+                BrowserSearchState::Applied
+            };
         }
         BrowserAction::Backspace => {
             search_query.pop();
@@ -1232,7 +1241,7 @@ pub fn reduce_filesystem_navigation_action(
 
     match action {
         BrowserFsAction::StartSearch => {
-            start_browser_search(ctx.is_searching, ctx.search_query, ctx.search_mode);
+            start_browser_search(ctx.search_state, ctx.search_query, ctx.search_mode);
             ctx.state.top_most_offset = 0;
         }
         BrowserFsAction::Move(tree_action) => {
@@ -1241,7 +1250,7 @@ pub fn reduce_filesystem_navigation_action(
         BrowserFsAction::EnterDir => {
             if let Some(path) = ctx.state.cursor_path.clone() {
                 if path.is_dir() {
-                    clear_browser_search(ctx.is_searching, ctx.search_query);
+                    clear_browser_search(ctx.search_state, ctx.search_query);
                     result.effects.push(BrowserFsEffect::FetchFileTree {
                         path,
                         browser_mode: ctx.browser_mode.clone(),
@@ -1686,7 +1695,7 @@ pub fn handle_filesystem_navigation(
                 state: ctx.state,
                 data: ctx.data,
                 browser_mode: ctx.browser_mode,
-                is_searching: ctx.is_searching,
+                search_state: ctx.search_state,
                 search_query: ctx.search_query,
                 search_mode: ctx.search_mode,
                 list_height: ctx.list_height,
@@ -1699,11 +1708,16 @@ pub fn handle_filesystem_navigation(
                     browser_mode,
                     highlight_path,
                 } => {
-                    let _ = ctx.app_command_tx.try_send(AppCommand::FetchFileTree {
-                        path,
-                        browser_mode,
-                        highlight_path,
-                    });
+                    spawn_app_command_sender(
+                        ctx.app_command_tx.clone(),
+                        ctx.shutdown_tx.subscribe(),
+                        AppCommand::FetchFileTree {
+                            browser_generation: ctx.browser_generation,
+                            path,
+                            browser_mode,
+                            highlight_path,
+                        },
+                    );
                 }
             }
         }
@@ -1801,7 +1815,7 @@ pub async fn execute_browser_dialog_effects(app: &mut App, effects: Vec<BrowserD
                 app.app_state.pending_torrent_link.clear();
             }
             BrowserDialogEffect::ClearSearch => {
-                app.app_state.ui.file_browser.is_searching = false;
+                app.app_state.ui.file_browser.search_state = BrowserSearchState::Closed;
                 app.app_state.ui.file_browser.search_query.clear();
             }
         }
@@ -1810,8 +1824,20 @@ pub async fn execute_browser_dialog_effects(app: &mut App, effects: Vec<BrowserD
 
 fn apply_browser_transition(app: &mut App, transition: BrowserTransition) {
     match transition {
-        BrowserTransition::ToNormal => app.app_state.mode = AppMode::Normal,
-        BrowserTransition::ToConfig => app.app_state.mode = AppMode::Config,
+        BrowserTransition::ToNormal => {
+            app.app_state
+                .ui
+                .file_browser
+                .invalidate_browser_generation();
+            app.app_state.mode = AppMode::Normal;
+        }
+        BrowserTransition::ToConfig => {
+            app.app_state
+                .ui
+                .file_browser
+                .invalidate_browser_generation();
+            app.app_state.mode = AppMode::Config;
+        }
     }
 }
 
@@ -2196,83 +2222,125 @@ mod tests {
 
     #[test]
     fn search_reducer_clears_on_escape() {
-        let mut is_searching = true;
+        let mut search_state = BrowserSearchState::Editing;
         let mut query = String::from("abc");
         let mut search_mode = SearchMode::Fuzzy;
-        let action = map_search_key_to_browser_action(KeyEvent::from(KeyCode::Esc), is_searching)
+        let action = map_search_key_to_browser_action(KeyEvent::from(KeyCode::Esc), search_state)
             .expect("expected search action");
-        let out = reduce_browser_action(action, &mut is_searching, &mut query, &mut search_mode);
+        let out = reduce_browser_action(action, &mut search_state, &mut query, &mut search_mode);
         assert!(out.redraw);
-        assert!(!is_searching);
+        assert_eq!(search_state, BrowserSearchState::Closed);
         assert!(query.is_empty());
     }
 
     #[test]
+    fn applied_search_escape_closes_search_before_dialog() {
+        let mut search_state = BrowserSearchState::Applied;
+        let mut query = String::from("abc");
+        let mut search_mode = SearchMode::Regex;
+        let action = map_search_key_to_browser_action(KeyEvent::from(KeyCode::Esc), search_state)
+            .expect("expected applied search escape action");
+
+        let out = reduce_browser_action(action, &mut search_state, &mut query, &mut search_mode);
+
+        assert!(out.redraw);
+        assert_eq!(search_state, BrowserSearchState::Closed);
+        assert!(query.is_empty());
+    }
+
+    #[test]
+    fn closed_search_escape_falls_through_to_dialog() {
+        assert!(map_search_key_to_browser_action(
+            KeyEvent::from(KeyCode::Esc),
+            BrowserSearchState::Closed
+        )
+        .is_none());
+    }
+
+    #[test]
     fn reducer_search_char_appends_and_consumes() {
-        let mut is_searching = true;
+        let mut search_state = BrowserSearchState::Editing;
         let mut query = String::from("ab");
         let mut search_mode = SearchMode::Fuzzy;
 
         let out = reduce_browser_action(
             BrowserAction::Char('c'),
-            &mut is_searching,
+            &mut search_state,
             &mut query,
             &mut search_mode,
         );
 
         assert!(out.redraw);
-        assert!(is_searching);
+        assert_eq!(search_state, BrowserSearchState::Editing);
         assert_eq!(query, "abc");
     }
 
     #[test]
     fn reducer_search_noop_still_consumes_when_searching() {
-        let mut is_searching = true;
+        let mut search_state = BrowserSearchState::Editing;
         let mut query = String::from("abc");
         let mut search_mode = SearchMode::Fuzzy;
 
         let out = reduce_browser_action(
             BrowserAction::Noop,
-            &mut is_searching,
+            &mut search_state,
             &mut query,
             &mut search_mode,
         );
 
         assert!(out.redraw);
-        assert!(is_searching);
+        assert_eq!(search_state, BrowserSearchState::Editing);
         assert_eq!(query, "abc");
     }
 
     #[test]
     fn reducer_search_tab_toggles_mode() {
-        let mut is_searching = true;
+        let mut search_state = BrowserSearchState::Editing;
         let mut query = String::from("abc");
         let mut search_mode = SearchMode::Fuzzy;
-        let action = map_search_key_to_browser_action(KeyEvent::from(KeyCode::Tab), is_searching)
+        let action = map_search_key_to_browser_action(KeyEvent::from(KeyCode::Tab), search_state)
             .expect("expected mode toggle");
 
-        let out = reduce_browser_action(action, &mut is_searching, &mut query, &mut search_mode);
+        let out = reduce_browser_action(action, &mut search_state, &mut query, &mut search_mode);
 
         assert!(out.redraw);
-        assert!(is_searching);
+        assert_eq!(search_state, BrowserSearchState::Editing);
         assert_eq!(query, "abc");
         assert_eq!(search_mode, SearchMode::Regex);
     }
 
     #[test]
     fn clear_browser_search_disables_and_clears_query() {
-        let mut is_searching = true;
+        let mut search_state = BrowserSearchState::Editing;
         let mut query = String::from("abc");
 
-        clear_browser_search(&mut is_searching, &mut query);
+        clear_browser_search(&mut search_state, &mut query);
 
-        assert!(!is_searching);
+        assert_eq!(search_state, BrowserSearchState::Closed);
         assert!(query.is_empty());
     }
 
     #[test]
+    fn reducer_search_enter_applies_non_empty_query() {
+        let mut search_state = BrowserSearchState::Editing;
+        let mut query = String::from("abc");
+        let mut search_mode = SearchMode::Regex;
+
+        let out = reduce_browser_action(
+            BrowserAction::Enter,
+            &mut search_state,
+            &mut query,
+            &mut search_mode,
+        );
+
+        assert!(out.redraw);
+        assert_eq!(search_state, BrowserSearchState::Applied);
+        assert_eq!(query, "abc");
+    }
+
+    #[test]
     fn reducer_filesystem_start_search_sets_flag_and_clears_query() {
-        let mut is_searching = false;
+        let mut search_state = BrowserSearchState::Closed;
         let mut query = String::from("abc");
         let mut state = TreeViewState {
             top_most_offset: 12,
@@ -2288,7 +2356,7 @@ mod tests {
                 state: &mut state,
                 data: &data,
                 browser_mode: &mode,
-                is_searching: &mut is_searching,
+                search_state: &mut search_state,
                 search_query: &mut query,
                 search_mode: &mut search_mode,
                 list_height: 5,
@@ -2296,7 +2364,7 @@ mod tests {
         );
 
         assert!(out.consumed);
-        assert!(is_searching);
+        assert_eq!(search_state, BrowserSearchState::Editing);
         assert!(query.is_empty());
         assert_eq!(search_mode, SearchMode::Regex);
         assert_eq!(state.top_most_offset, 0);
@@ -2304,7 +2372,7 @@ mod tests {
 
     #[test]
     fn reducer_filesystem_enter_dir_emits_fetch_effect() {
-        let mut is_searching = true;
+        let mut search_state = BrowserSearchState::Editing;
         let mut query = String::from("abc");
         let mut state = TreeViewState {
             current_path: PathBuf::from("."),
@@ -2321,7 +2389,7 @@ mod tests {
                 state: &mut state,
                 data: &data,
                 browser_mode: &mode,
-                is_searching: &mut is_searching,
+                search_state: &mut search_state,
                 search_query: &mut query,
                 search_mode: &mut search_mode,
                 list_height: 5,
@@ -2329,7 +2397,7 @@ mod tests {
         );
 
         assert!(out.consumed);
-        assert!(!is_searching);
+        assert_eq!(search_state, BrowserSearchState::Closed);
         assert!(query.is_empty());
         assert_eq!(out.effects.len(), 1);
         assert!(matches!(
@@ -2906,7 +2974,8 @@ mod tests {
         let data: Vec<RawNode<FileMetadata>> = vec![];
         let mode = FileBrowserMode::Directory;
         let (tx, _rx) = mpsc::channel(1);
-        let mut is_searching = false;
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let mut search_state = BrowserSearchState::Closed;
         let mut query = String::from("abc");
         let mut search_mode = SearchMode::Fuzzy;
         let consumed = handle_filesystem_navigation(
@@ -2915,18 +2984,69 @@ mod tests {
                 state: &mut state,
                 data: &data,
                 browser_mode: &mode,
-                is_searching: &mut is_searching,
+                search_state: &mut search_state,
                 search_query: &mut query,
                 search_mode: &mut search_mode,
                 list_height: 5,
                 app_command_tx: &tx,
+                shutdown_tx: &shutdown_tx,
+                browser_generation: 7,
             },
         );
         assert!(consumed);
-        assert!(is_searching);
+        assert_eq!(search_state, BrowserSearchState::Editing);
         assert!(query.is_empty());
         assert_eq!(search_mode, SearchMode::Regex);
         assert_eq!(state.top_most_offset, 0);
+    }
+
+    #[tokio::test]
+    async fn filesystem_navigation_queues_fetch_when_channel_is_full() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let mut state = TreeViewState {
+            current_path: dir.path().to_path_buf(),
+            cursor_path: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let data: Vec<RawNode<FileMetadata>> = vec![];
+        let mode = FileBrowserMode::Directory;
+        let (tx, mut rx) = mpsc::channel(1);
+        let (shutdown_tx, _) = broadcast::channel(1);
+        tx.try_send(AppCommand::RssSyncNow).expect("fill channel");
+        let mut search_state = BrowserSearchState::Closed;
+        let mut query = String::new();
+        let mut search_mode = SearchMode::Regex;
+
+        let consumed = handle_filesystem_navigation(
+            KeyCode::Enter,
+            BrowserFilesystemNavContext {
+                state: &mut state,
+                data: &data,
+                browser_mode: &mode,
+                search_state: &mut search_state,
+                search_query: &mut query,
+                search_mode: &mut search_mode,
+                list_height: 5,
+                app_command_tx: &tx,
+                shutdown_tx: &shutdown_tx,
+                browser_generation: 7,
+            },
+        );
+
+        assert!(consumed);
+        assert!(matches!(rx.recv().await, Some(AppCommand::RssSyncNow)));
+        let next = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("queued fetch should send after capacity opens");
+        assert!(matches!(
+            next,
+            Some(AppCommand::FetchFileTree {
+                browser_generation: 7,
+                ref path,
+                highlight_path: None,
+                ..
+            }) if path == dir.path()
+        ));
     }
 
     fn sample_preview_tree() -> Vec<RawNode<TorrentPreviewPayload>> {

@@ -48,6 +48,7 @@ use crate::persistence::rss::{load_rss_state, save_rss_state, RssPersistedState}
 
 use crate::token_bucket::{rate_limit_bps_to_bucket_bytes_per_sec, TokenBucket};
 
+use crate::tui::app_command::spawn_app_command_sender;
 use crate::tui::effects::compute_effects_activity_speed_multiplier;
 use crate::tui::events;
 use crate::tui::layout::common::{ColumnId, PeerColumnId};
@@ -797,11 +798,14 @@ pub enum AppCommand {
     ClientShutdown(PathBuf),
     PortFileChanged(PathBuf),
     FetchFileTree {
+        browser_generation: u64,
         path: PathBuf,
         browser_mode: FileBrowserMode,
         highlight_path: Option<PathBuf>,
     },
     UpdateFileBrowserData {
+        request_id: u64,
+        path: PathBuf,
         data: Vec<tree::RawNode<FileMetadata>>,
         highlight_path: Option<PathBuf>,
     },
@@ -1584,9 +1588,11 @@ pub struct FileBrowserUiState {
     pub state: TreeViewState,
     pub data: Vec<RawNode<FileMetadata>>,
     pub browser_mode: FileBrowserMode,
-    pub is_searching: bool,
+    pub search_state: BrowserSearchState,
     pub search_query: String,
     pub search_mode: SearchMode,
+    pub fetch_request_id: u64,
+    pub browser_generation: u64,
 }
 
 impl Default for FileBrowserUiState {
@@ -1595,10 +1601,23 @@ impl Default for FileBrowserUiState {
             state: TreeViewState::default(),
             data: Vec::new(),
             browser_mode: FileBrowserMode::default(),
-            is_searching: false,
+            search_state: BrowserSearchState::default(),
             search_query: String::new(),
             search_mode: SearchMode::Regex,
+            fetch_request_id: 0,
+            browser_generation: 0,
         }
+    }
+}
+
+impl FileBrowserUiState {
+    pub fn next_browser_generation(&mut self) -> u64 {
+        self.browser_generation = self.browser_generation.wrapping_add(1);
+        self.browser_generation
+    }
+
+    pub fn invalidate_browser_generation(&mut self) {
+        let _ = self.next_browser_generation();
     }
 }
 
@@ -1797,6 +1816,24 @@ pub enum SearchMode {
     #[default]
     Fuzzy,
     Regex,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BrowserSearchState {
+    #[default]
+    Closed,
+    Editing,
+    Applied,
+}
+
+impl BrowserSearchState {
+    pub fn is_editing(self) -> bool {
+        matches!(self, Self::Editing)
+    }
+
+    pub fn is_visible(self) -> bool {
+        !matches!(self, Self::Closed)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3643,8 +3680,10 @@ impl App {
 
         self.app_state.pending_torrent_path = Some(final_path);
         let initial_path = self.get_initial_destination_path();
+        let browser_generation = self.app_state.ui.file_browser.next_browser_generation();
 
-        let _ = self.app_command_tx.try_send(AppCommand::FetchFileTree {
+        self.queue_app_command(AppCommand::FetchFileTree {
+            browser_generation,
             path: initial_path,
             browser_mode: FileBrowserMode::DownloadLocSelection {
                 target: DownloadSelectionTarget::PendingAdd,
@@ -3675,7 +3714,10 @@ impl App {
                 } else {
                     self.app_state.pending_torrent_path = Some(source_path);
                     let initial_path = self.get_initial_destination_path();
-                    let _ = self.app_command_tx.try_send(AppCommand::FetchFileTree {
+                    let browser_generation =
+                        self.app_state.ui.file_browser.next_browser_generation();
+                    self.queue_app_command(AppCommand::FetchFileTree {
+                        browser_generation,
                         path: initial_path,
                         browser_mode: FileBrowserMode::DownloadLocSelection {
                             target: DownloadSelectionTarget::PendingAdd,
@@ -3697,7 +3739,9 @@ impl App {
             ResolvedAddPayload::MagnetLink { magnet_link } => {
                 self.app_state.pending_torrent_link = magnet_link;
                 let initial_path = self.get_initial_destination_path();
-                let _ = self.app_command_tx.try_send(AppCommand::FetchFileTree {
+                let browser_generation = self.app_state.ui.file_browser.next_browser_generation();
+                self.queue_app_command(AppCommand::FetchFileTree {
+                    browser_generation,
                     path: initial_path,
                     browser_mode: FileBrowserMode::DownloadLocSelection {
                         target: DownloadSelectionTarget::PendingAdd,
@@ -3768,7 +3812,9 @@ impl App {
 
         self.app_state.pending_torrent_path = None;
         self.app_state.pending_torrent_link.clear();
-        let _ = self.app_command_tx.try_send(AppCommand::FetchFileTree {
+        let browser_generation = self.app_state.ui.file_browser.next_browser_generation();
+        self.queue_app_command(AppCommand::FetchFileTree {
+            browser_generation,
             path: initial_path,
             browser_mode: FileBrowserMode::DownloadLocSelection {
                 target: DownloadSelectionTarget::ExistingTorrent { info_hash },
@@ -3784,6 +3830,25 @@ impl App {
             },
             highlight_path: None,
         });
+    }
+
+    fn queue_app_command(&self, command: AppCommand) {
+        match self.app_command_tx.try_send(command) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(command)) => {
+                spawn_app_command_sender(
+                    self.app_command_tx.clone(),
+                    self.shutdown_tx.subscribe(),
+                    command,
+                );
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_command)) => {
+                tracing_event!(
+                    Level::WARN,
+                    "App command channel closed while queuing app command"
+                );
+            }
+        }
     }
 
     async fn execute_add_ingress_action(
@@ -5336,14 +5401,34 @@ impl App {
             }
 
             AppCommand::FetchFileTree {
+                browser_generation,
                 path,
                 browser_mode,
                 highlight_path,
             } => {
+                if browser_generation != self.app_state.ui.file_browser.browser_generation {
+                    tracing::debug!(
+                        target: "superseedr",
+                        browser_generation,
+                        current_browser_generation =
+                            self.app_state.ui.file_browser.browser_generation,
+                        ?path,
+                        "Ignoring stale file browser fetch"
+                    );
+                    return;
+                }
+
                 let tx = self.app_command_tx.clone();
                 let mut shutdown_rx = self.shutdown_tx.subscribe();
                 let path_clone = path.clone();
                 let highlight_clone = highlight_path.clone();
+                let request_id = self
+                    .app_state
+                    .ui
+                    .file_browser
+                    .fetch_request_id
+                    .wrapping_add(1);
+                self.app_state.ui.file_browser.fetch_request_id = request_id;
 
                 // 1. Update or Initialize the UI state immediately
                 if matches!(self.app_state.mode, AppMode::FileBrowser) {
@@ -5367,6 +5452,8 @@ impl App {
                             if let Ok(nodes) = result {
                                 // Pass the highlight_path back so the Update arm can find it
                                 let _ = tx.send(AppCommand::UpdateFileBrowserData {
+                                    request_id,
+                                    path: path_clone,
                                     data: nodes,
                                     highlight_path: highlight_clone
                                 }).await;
@@ -5380,10 +5467,26 @@ impl App {
             }
 
             AppCommand::UpdateFileBrowserData {
+                request_id,
+                path,
                 mut data,
                 highlight_path,
             } => {
                 if matches!(self.app_state.mode, AppMode::FileBrowser) {
+                    if request_id != self.app_state.ui.file_browser.fetch_request_id
+                        || path != self.app_state.ui.file_browser.state.current_path
+                    {
+                        tracing::debug!(
+                            target: "superseedr",
+                            request_id,
+                            ?path,
+                            current_request_id = self.app_state.ui.file_browser.fetch_request_id,
+                            current_path = ?self.app_state.ui.file_browser.state.current_path,
+                            "Ignoring stale file browser data"
+                        );
+                        return;
+                    }
+
                     let state = &mut self.app_state.ui.file_browser.state;
                     let existing_data = &mut self.app_state.ui.file_browser.data;
                     let browser_mode = &mut self.app_state.ui.file_browser.browser_mode;
@@ -8791,9 +8894,9 @@ mod tests {
         torrent_is_effectively_incomplete, App, AppClusterRole, AppCommand, AppMode,
         AppRuntimeMode, AppState, BrowserPane, ColumnId, CommandIngestResult, DataRate,
         DhtWaveTargets, DhtWaveUiState, DiskBackpressureDecision, DiskBackpressureDownloadThrottle,
-        DiskBackpressureSample, DownloadSelectionTarget, FileBrowserMode, FilePriority,
-        IngestSource, ListenerSet, PeerInfo, PeerListenerTransportMode, PeerSortColumn,
-        PersistPayload, ResolvedAddPayload, SelectedHeader, SortDirection,
+        DiskBackpressureSample, DownloadSelectionTarget, FileBrowserMode, FileMetadata,
+        FilePriority, IngestSource, ListenerSet, PeerInfo, PeerListenerTransportMode,
+        PeerSortColumn, PersistPayload, ResolvedAddPayload, SelectedHeader, SortDirection,
         SwarmAvailabilityFlashState, TorrentControlState, TorrentDisplayState, TorrentMetrics,
         TorrentPreviewPayload, TorrentSortColumn, UiState, WakeLagPeerThrottle,
         BITTORRENT_PROTOCOL_STR, DHT_WAVE_PHASE_WRAP_PERIOD, DISK_WRITE_THROTTLE_MIN_BYTES_PER_SEC,
@@ -8818,6 +8921,7 @@ mod tests {
     use crate::torrent_manager::{
         FileProbeBatchResult, FileProbeEntry, ManagerCommand, ManagerEvent, TorrentFileProbeStatus,
     };
+    use crate::tui::tree::RawNode;
     use std::collections::{HashMap, VecDeque};
     use std::env;
     use std::io;
@@ -12354,6 +12458,97 @@ mod tests {
             _ => panic!("expected download location selection"),
         }
 
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn stale_file_browser_fetch_is_ignored() {
+        let stale_dir = tempfile::tempdir().expect("create stale dir");
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        app.app_state.mode = AppMode::Normal;
+        app.app_state.ui.file_browser.browser_generation = 2;
+        let initial_path = app.app_state.ui.file_browser.state.current_path.clone();
+        let initial_request_id = app.app_state.ui.file_browser.fetch_request_id;
+
+        app.handle_app_command(AppCommand::FetchFileTree {
+            browser_generation: 1,
+            path: stale_dir.path().to_path_buf(),
+            browser_mode: FileBrowserMode::Directory,
+            highlight_path: None,
+        })
+        .await;
+
+        assert!(matches!(app.app_state.mode, AppMode::Normal));
+        assert_eq!(
+            app.app_state.ui.file_browser.state.current_path,
+            initial_path
+        );
+        assert_eq!(
+            app.app_state.ui.file_browser.fetch_request_id,
+            initial_request_id
+        );
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn stale_file_browser_update_is_ignored() {
+        let current_dir = tempfile::tempdir().expect("create current dir");
+        let stale_dir = tempfile::tempdir().expect("create stale dir");
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        app.app_state.mode = AppMode::FileBrowser;
+        app.app_state.ui.file_browser.fetch_request_id = 2;
+        app.app_state.ui.file_browser.state.current_path = current_dir.path().to_path_buf();
+
+        app.handle_app_command(AppCommand::UpdateFileBrowserData {
+            request_id: 1,
+            path: stale_dir.path().to_path_buf(),
+            data: vec![RawNode {
+                name: "stale.bin".to_string(),
+                full_path: stale_dir.path().join("stale.bin"),
+                children: vec![],
+                payload: FileMetadata {
+                    size: 1,
+                    modified: std::time::UNIX_EPOCH,
+                },
+                is_dir: false,
+            }],
+            highlight_path: None,
+        })
+        .await;
+
+        assert!(app.app_state.ui.file_browser.data.is_empty());
+
+        app.handle_app_command(AppCommand::UpdateFileBrowserData {
+            request_id: 2,
+            path: current_dir.path().to_path_buf(),
+            data: vec![RawNode {
+                name: "current.bin".to_string(),
+                full_path: current_dir.path().join("current.bin"),
+                children: vec![],
+                payload: FileMetadata {
+                    size: 1,
+                    modified: std::time::UNIX_EPOCH,
+                },
+                is_dir: false,
+            }],
+            highlight_path: None,
+        })
+        .await;
+
+        assert_eq!(app.app_state.ui.file_browser.data.len(), 1);
+        assert_eq!(app.app_state.ui.file_browser.data[0].name, "current.bin");
         let _ = app.shutdown_tx.send(());
     }
 
