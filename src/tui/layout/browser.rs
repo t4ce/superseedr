@@ -30,6 +30,15 @@ pub fn calculate_file_browser_layout(
     plan.content = main_chunks[0];
     plan.footer = main_chunks[1];
 
+    let content_area = if show_search {
+        let search_chunks =
+            Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(plan.content);
+        plan.search = Some(search_chunks[0]);
+        search_chunks[1]
+    } else {
+        plan.content
+    };
+
     let is_narrow = area.width < 100 || (area.height as f32 > (area.width as f32 * 0.6));
 
     let content_chunks = if show_preview {
@@ -40,7 +49,7 @@ pub fn calculate_file_browser_layout(
                     [Constraint::Percentage(60), Constraint::Percentage(40)]
                 }
             };
-            Layout::vertical(constraints).split(plan.content)
+            Layout::vertical(constraints).split(content_area)
         } else {
             let constraints = match focused_pane {
                 BrowserPane::FileSystem => [Constraint::Percentage(35), Constraint::Percentage(65)],
@@ -48,11 +57,11 @@ pub fn calculate_file_browser_layout(
                     [Constraint::Percentage(60), Constraint::Percentage(40)]
                 }
             };
-            Layout::horizontal(constraints).split(plan.content)
+            Layout::horizontal(constraints).split(content_area)
         }
     } else {
         Layout::horizontal([Constraint::Percentage(0), Constraint::Percentage(100)])
-            .split(plan.content)
+            .split(content_area)
     };
 
     plan.preview = if show_preview {
@@ -61,23 +70,7 @@ pub fn calculate_file_browser_layout(
         None
     };
     plan.browser = content_chunks[1];
-
-    let browser_chunks = if show_search {
-        Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(plan.browser)
-    } else {
-        Layout::vertical([Constraint::Min(0)]).split(plan.browser)
-    };
-
-    plan.search = if show_search {
-        Some(browser_chunks[0])
-    } else {
-        None
-    };
-    plan.list = if show_search {
-        browser_chunks[1]
-    } else {
-        browser_chunks[0]
-    };
+    plan.list = plan.browser;
 
     plan
 }

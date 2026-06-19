@@ -192,6 +192,7 @@ pub struct Settings {
     pub ui_refresh_rate: DataRate,
     pub watch_folder: Option<PathBuf>,
     pub default_download_folder: Option<PathBuf>,
+    pub always_show_add_location_prompt: bool,
     pub max_connected_peers: usize,
     pub bootstrap_nodes: Vec<String>,
     pub global_download_limit_bps: u64,
@@ -228,6 +229,7 @@ impl Default for Settings {
             peer_sort_pinned: false,
             ui_theme: ThemeName::default(),
             ui_refresh_rate: DataRate::default(),
+            always_show_add_location_prompt: false,
             max_connected_peers: 2000,
             bootstrap_nodes: vec![
                 "router.utorrent.com:6881".to_string(),
@@ -474,6 +476,7 @@ struct HostConfig {
     pub client_id: Option<String>,
     pub client_port: u16,
     pub watch_folder: Option<PathBuf>,
+    pub always_show_add_location_prompt: bool,
 }
 
 impl Default for HostConfig {
@@ -483,6 +486,7 @@ impl Default for HostConfig {
             client_id: None,
             client_port: settings.client_port,
             watch_folder: settings.watch_folder,
+            always_show_add_location_prompt: settings.always_show_add_location_prompt,
         }
     }
 }
@@ -969,6 +973,7 @@ impl HostConfig {
             client_id: None,
             client_port: settings.client_port,
             watch_folder: settings.watch_folder.clone(),
+            always_show_add_location_prompt: settings.always_show_add_location_prompt,
         }
     }
 
@@ -977,6 +982,7 @@ impl HostConfig {
             client_id: (settings.client_id != shared_client_id).then(|| settings.client_id.clone()),
             client_port: settings.client_port,
             watch_folder: settings.watch_folder.clone(),
+            always_show_add_location_prompt: settings.always_show_add_location_prompt,
         }
     }
 
@@ -986,6 +992,7 @@ impl HostConfig {
         }
         settings.client_port = self.client_port;
         settings.watch_folder = self.watch_folder.clone();
+        settings.always_show_add_location_prompt = self.always_show_add_location_prompt;
     }
 }
 fn sanitize_host_id(raw: &str) -> String {
@@ -3788,6 +3795,7 @@ mod tests {
             client_id: Some("host-a".to_string()),
             client_port: 7777,
             watch_folder: Some(PathBuf::from("/watch")),
+            always_show_add_location_prompt: true,
         };
 
         let mut settings = Settings::default();
@@ -5745,6 +5753,7 @@ mod tests {
         let mut host_only = current.clone();
         host_only.client_port = 4200;
         host_only.watch_folder = Some(PathBuf::from("/watch-b"));
+        host_only.always_show_add_location_prompt = true;
         assert_eq!(
             classify_shared_mode_settings_change(&current, &host_only),
             SettingsChangeScope::HostOnly

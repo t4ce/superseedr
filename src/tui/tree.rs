@@ -162,6 +162,7 @@ type FilterRule<T> = Rc<dyn Fn(&RawNode<T>) -> bool>;
 pub struct TreeFilter<T> {
     pub queries: Vec<String>,
     pub node_rule: Option<FilterRule<T>>,
+    pub match_name: bool,
 }
 
 impl<T> Default for TreeFilter<T> {
@@ -169,6 +170,7 @@ impl<T> Default for TreeFilter<T> {
         Self {
             queries: Vec::new(),
             node_rule: None,
+            match_name: true,
         }
     }
 }
@@ -183,11 +185,19 @@ impl<T> TreeFilter<T> {
         Self {
             queries,
             node_rule: None,
+            match_name: true,
         }
     }
 
     pub fn new(input: &str, rule: impl Fn(&RawNode<T>) -> bool + 'static) -> Self {
         let mut filter = Self::from_text(input);
+        filter.node_rule = Some(Rc::new(rule));
+        filter
+    }
+
+    pub fn rule_only(input: &str, rule: impl Fn(&RawNode<T>) -> bool + 'static) -> Self {
+        let mut filter = Self::from_text(input);
+        filter.match_name = false;
         filter.node_rule = Some(Rc::new(rule));
         filter
     }
@@ -198,7 +208,7 @@ impl<T> TreeFilter<T> {
                 return false;
             }
         }
-        if self.queries.is_empty() {
+        if self.queries.is_empty() || !self.match_name {
             return true;
         }
         let name_lower = node.name.to_lowercase();
@@ -273,7 +283,9 @@ impl TreeMathHelper {
         let mut full_list = Vec::new();
         Self::project_recursive(nodes, state, &filter, 0, &mut full_list);
 
-        let start = state.top_most_offset.min(full_list.len());
+        let effective_height = max_height.max(1);
+        let max_start = full_list.len().saturating_sub(effective_height);
+        let start = state.top_most_offset.min(max_start);
         let end = (start + max_height).min(full_list.len());
 
         if start < end {
@@ -540,6 +552,21 @@ mod tests {
         assert_eq!(list.len(), 3);
         assert!(list[0].is_expanded);
         assert!(list[1].is_expanded);
+        assert_eq!(list[2].node.name, "leaf1");
+    }
+
+    #[test]
+    fn test_search_clamps_stale_scroll_offset() {
+        let tree = mock_complex_tree();
+        let state = TreeViewState {
+            top_most_offset: 20,
+            ..Default::default()
+        };
+
+        let list =
+            TreeMathHelper::get_visible_slice(&tree, &state, TreeFilter::from_text("leaf1"), 10);
+
+        assert_eq!(list.len(), 3);
         assert_eq!(list[2].node.name, "leaf1");
     }
 

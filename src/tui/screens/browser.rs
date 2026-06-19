@@ -2,18 +2,23 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::app::{
-    App, AppCommand, AppMode, BrowserPane, ConfigItem, ConfigUiState, FileBrowserMode,
-    FileMetadata, FilePriority, TorrentDisplayState, TorrentPreviewPayload,
+    App, AppCommand, AppMode, BrowserPane, ConfigItem, ConfigUiState, DownloadSelectionTarget,
+    FileBrowserMode, FileMetadata, FilePriority, SearchMode, TorrentDisplayState,
+    TorrentPreviewPayload,
 };
+use crate::integrations::control::{ControlFilePriorityOverride, ControlRequest};
 use crate::theme::ThemeContext;
 use crate::torrent_manager::ManagerCommand;
 use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::app_command::spawn_app_command_sender;
-use crate::tui::formatters::{centered_rect, format_bytes, truncate_with_ellipsis};
+use crate::tui::formatters::{centered_rect, format_bytes, sanitize_text, truncate_with_ellipsis};
 use crate::tui::layout::browser::calculate_file_browser_layout;
 use crate::tui::screen_context::ScreenContext;
+use crate::tui::screens::input_panel::draw_prompt_panel;
 use crate::tui::tree::{RawNode, TreeAction, TreeFilter, TreeMathHelper, TreeViewState};
-use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
+use fuzzy_matcher::skim::SkimMatcherV2;
+use fuzzy_matcher::FuzzyMatcher;
+use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::prelude::{Alignment, Frame, Line, Modifier, Span, Style};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
@@ -33,6 +38,8 @@ pub struct DownloadConfirmPayload {
     pub base_path: PathBuf,
     pub container_name_to_use: Option<String>,
     pub file_priorities: HashMap<usize, FilePriority>,
+    pub target: DownloadSelectionTarget,
+    pub has_preview_files: bool,
 }
 
 pub fn draw(
@@ -59,6 +66,10 @@ pub fn draw(
     };
 
     let focused_pane = focused_pane(browser_mode);
+    let search_panel_active = browser_search_panel_active(
+        app_state.ui.file_browser.is_searching,
+        &app_state.ui.file_browser.search_query,
+    );
     let max_area = centered_rect(90, 80, f.area());
     f.render_widget(Clear, max_area);
 
@@ -66,7 +77,7 @@ pub fn draw(
     let layout = calculate_file_browser_layout(
         area,
         has_preview_content,
-        app_state.ui.file_browser.is_searching,
+        search_panel_active,
         &focused_pane,
     );
 
@@ -90,37 +101,36 @@ pub fn draw(
         };
 
     if let Some(preview_area) = layout.preview {
+        let preview_filter = if matches!(focused_pane, BrowserPane::TorrentPreview) {
+            build_torrent_preview_filter(
+                &app_state.ui.file_browser.search_query,
+                app_state.ui.file_browser.search_mode,
+            )
+        } else {
+            TreeFilter::default()
+        };
         draw_torrent_preview_panel(
             f,
             ctx,
             preview_area,
-            preview_file_path.map(|p| p.as_path()),
-            browser_mode,
-            preview_border_style,
-            &state.current_path,
+            TorrentPreviewPanelProps {
+                path: preview_file_path.map(|p| p.as_path()),
+                browser_mode,
+                border_style: preview_border_style,
+                current_fs_path: &state.current_path,
+                preview_filter,
+            },
         );
     }
     if let Some(search_area) = layout.search {
-        let search_block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(ctx.apply(Style::default().fg(ctx.state_warning())))
-            .title(" Search Filter ");
-        let search_text = Line::from(vec![
-            Span::styled(
-                "/",
-                ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
-            ),
-            Span::raw(&app_state.ui.file_browser.search_query),
-            Span::styled(
-                "_",
-                ctx.apply(
-                    Style::default()
-                        .fg(ctx.state_warning())
-                        .add_modifier(Modifier::SLOW_BLINK),
-                ),
-            ),
-        ]);
-        f.render_widget(Paragraph::new(search_text).block(search_block), search_area);
+        draw_browser_search_panel(
+            f,
+            app_state.ui.file_browser.search_mode,
+            &focused_pane,
+            &app_state.ui.file_browser.search_query,
+            search_area,
+            ctx,
+        );
     }
 
     let mut footer_spans = Vec::new();
@@ -156,14 +166,35 @@ pub fn draw(
                 "[Tab]",
                 footer_key_style(ctx, ActionTone::Mode),
             ));
-            footer_spans.push(Span::raw(" Switch Pane | "));
+            if search_panel_active {
+                footer_spans.push(Span::raw(" Search Mode | "));
+            } else {
+                footer_spans.push(Span::raw(" Switch Pane | "));
+            }
+            footer_spans.push(Span::styled("[/]", footer_key_style(ctx, ActionTone::Edit)));
+            footer_spans.push(Span::raw(" Search | "));
 
             if matches!(focused_pane, BrowserPane::TorrentPreview) {
                 footer_spans.push(Span::styled(
-                    "[Space]",
+                    "[Space/p]",
                     footer_key_style(ctx, ActionTone::Toggle),
                 ));
                 footer_spans.push(Span::raw(" Priority | "));
+                footer_spans.push(Span::styled(
+                    "[P]",
+                    footer_key_style(ctx, ActionTone::Toggle),
+                ));
+                footer_spans.push(Span::raw(" Priority All | "));
+                footer_spans.push(Span::styled(
+                    "[e]",
+                    footer_key_style(ctx, ActionTone::Navigate),
+                ));
+                footer_spans.push(Span::raw(" Expand | "));
+                footer_spans.push(Span::styled(
+                    "[c]",
+                    footer_key_style(ctx, ActionTone::Navigate),
+                ));
+                footer_spans.push(Span::raw(" Close | "));
             }
 
             footer_spans.push(Span::styled(
@@ -205,7 +236,16 @@ pub fn draw(
 
     let inner_height = layout.list.height.saturating_sub(2) as usize;
     let list_width = layout.list.width.saturating_sub(2) as usize;
-    let filter = build_filter(browser_mode, &app_state.ui.file_browser.search_query);
+    let filesystem_search_query = if matches!(focused_pane, BrowserPane::FileSystem) {
+        app_state.ui.file_browser.search_query.as_str()
+    } else {
+        ""
+    };
+    let filter = build_filesystem_filter(
+        browser_mode,
+        filesystem_search_query,
+        app_state.ui.file_browser.search_mode,
+    );
 
     let abs_path = state.current_path.to_string_lossy();
     let item_count = data.len();
@@ -334,15 +374,73 @@ pub fn draw(
     );
 }
 
+fn browser_search_panel_active(is_searching: bool, search_query: &str) -> bool {
+    is_searching || !search_query.is_empty()
+}
+
+fn draw_browser_search_panel(
+    f: &mut Frame,
+    search_mode: SearchMode,
+    focused_pane: &BrowserPane,
+    search_query: &str,
+    area: Rect,
+    ctx: &ThemeContext,
+) {
+    let title = match focused_pane {
+        BrowserPane::TorrentPreview => " Torrent File Search ".to_string(),
+        BrowserPane::FileSystem => " File Browser Search ".to_string(),
+    };
+    draw_prompt_panel(
+        f,
+        area,
+        title,
+        sanitize_text(search_query),
+        browser_search_mode_spans(search_mode, ctx),
+        ctx,
+    );
+}
+
+fn browser_search_mode_spans(search_mode: SearchMode, ctx: &ThemeContext) -> Vec<Span<'static>> {
+    let (fuzzy_style, regex_style) = match search_mode {
+        SearchMode::Fuzzy => (
+            ctx.apply(Style::default().fg(ctx.state_selected()).bold()),
+            ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0)),
+        ),
+        SearchMode::Regex => (
+            ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0)),
+            ctx.apply(Style::default().fg(ctx.state_selected()).bold()),
+        ),
+    };
+    vec![
+        Span::raw("  "),
+        Span::styled("Fuzzy", fuzzy_style),
+        Span::raw(" / "),
+        Span::styled("Regex", regex_style),
+        Span::raw("  Tab"),
+    ]
+}
+
+struct TorrentPreviewPanelProps<'a> {
+    path: Option<&'a Path>,
+    browser_mode: &'a FileBrowserMode,
+    border_style: Style,
+    current_fs_path: &'a Path,
+    preview_filter: TreeFilter<TorrentPreviewPayload>,
+}
+
 fn draw_torrent_preview_panel(
     f: &mut Frame,
     ctx: &ThemeContext,
     area: Rect,
-    path: Option<&Path>,
-    browser_mode: &FileBrowserMode,
-    border_style: Style,
-    current_fs_path: &Path,
+    props: TorrentPreviewPanelProps<'_>,
 ) {
+    let TorrentPreviewPanelProps {
+        path,
+        browser_mode,
+        border_style,
+        current_fs_path,
+        preview_filter,
+    } = props;
     let is_narrow = area.width < 50;
     let raw_title = "Torrent Preview";
     let avail_width = area.width.saturating_sub(4) as usize;
@@ -376,7 +474,7 @@ fn draw_torrent_preview_panel(
         let visible_rows = TreeMathHelper::get_visible_slice(
             preview_tree,
             preview_state,
-            TreeFilter::default(),
+            preview_filter,
             list_height,
         );
 
@@ -481,7 +579,6 @@ fn draw_torrent_preview_panel(
                         "",
                     ),
                 };
-
                 let final_content_style = if is_cursor {
                     base_content_style
                         .add_modifier(Modifier::BOLD)
@@ -668,7 +765,7 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
 
     if let CrosstermEvent::Key(key) = event {
         if key.kind == KeyEventKind::Press {
-            if handle_browser_search_key(key.code, app) {
+            if handle_browser_search_key(key, app) {
                 return;
             }
 
@@ -681,15 +778,31 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
     }
 }
 
-fn handle_browser_search_key(key_code: KeyCode, app: &mut App) -> bool {
-    if let Some(action) =
-        map_search_key_to_browser_action(key_code, app.app_state.ui.file_browser.is_searching)
+fn handle_browser_search_key(key: KeyEvent, app: &mut App) -> bool {
+    let file_browser = &mut app.app_state.ui.file_browser;
+    if matches!(key.code, KeyCode::Tab)
+        && browser_search_panel_active(file_browser.is_searching, &file_browser.search_query)
     {
+        toggle_browser_search_mode(&mut file_browser.search_mode);
+        reset_active_browser_search_view(&mut file_browser.browser_mode, &mut file_browser.state);
+        app.app_state.ui.needs_redraw = true;
+        return true;
+    }
+
+    if let Some(action) = map_search_key_to_browser_action(key, file_browser.is_searching) {
+        let reset_view = browser_action_resets_search_view(action);
         let reduced = reduce_browser_action(
             action,
-            &mut app.app_state.ui.file_browser.is_searching,
-            &mut app.app_state.ui.file_browser.search_query,
+            &mut file_browser.is_searching,
+            &mut file_browser.search_query,
+            &mut file_browser.search_mode,
         );
+        if reset_view {
+            reset_active_browser_search_view(
+                &mut file_browser.browser_mode,
+                &mut file_browser.state,
+            );
+        }
         if reduced.redraw {
             app.app_state.ui.needs_redraw = true;
         }
@@ -718,6 +831,20 @@ async fn handle_browser_download_key(key_code: KeyCode, app: &mut App) -> bool {
         return false;
     }
 
+    if preview_search_should_start(key_code, &app.app_state.ui.file_browser.browser_mode) {
+        start_browser_search(
+            &mut app.app_state.ui.file_browser.is_searching,
+            &mut app.app_state.ui.file_browser.search_query,
+            &mut app.app_state.ui.file_browser.search_mode,
+        );
+        reset_active_browser_search_view(
+            &mut app.app_state.ui.file_browser.browser_mode,
+            &mut app.app_state.ui.file_browser.state,
+        );
+        app.app_state.ui.needs_redraw = true;
+        return true;
+    }
+
     if key_code == KeyCode::Esc {
         let reduced = {
             let file_browser = &app.app_state.ui.file_browser;
@@ -734,6 +861,9 @@ async fn handle_browser_download_key(key_code: KeyCode, app: &mut App) -> bool {
 
     let screen_area = app.app_state.screen_area;
     let is_searching = app.app_state.ui.file_browser.is_searching;
+    let search_query = app.app_state.ui.file_browser.search_query.clone();
+    let search_panel_active = browser_search_panel_active(is_searching, &search_query);
+    let search_mode = app.app_state.ui.file_browser.search_mode;
     let consumed_preview_input = {
         let browser_mode = &mut app.app_state.ui.file_browser.browser_mode;
         if let FileBrowserMode::DownloadLocSelection {
@@ -747,7 +877,7 @@ async fn handle_browser_download_key(key_code: KeyCode, app: &mut App) -> bool {
             if matches!(focused_pane, BrowserPane::TorrentPreview) {
                 let list_height = calculate_preview_list_height(
                     screen_area,
-                    is_searching,
+                    search_panel_active,
                     focused_pane,
                     *use_container,
                 );
@@ -755,6 +885,7 @@ async fn handle_browser_download_key(key_code: KeyCode, app: &mut App) -> bool {
                     map_preview_key_to_action(key_code),
                     preview_state,
                     preview_tree,
+                    build_torrent_preview_filter(&search_query, search_mode),
                     list_height,
                 )
                 .consumed
@@ -772,6 +903,65 @@ async fn handle_browser_download_key(key_code: KeyCode, app: &mut App) -> bool {
     false
 }
 
+fn preview_search_should_start(key_code: KeyCode, browser_mode: &FileBrowserMode) -> bool {
+    matches!(key_code, KeyCode::Char('/'))
+        && matches!(
+            browser_mode,
+            FileBrowserMode::DownloadLocSelection {
+                focused_pane: BrowserPane::TorrentPreview,
+                is_editing_name: false,
+                ..
+            }
+        )
+}
+
+fn start_browser_search(
+    is_searching: &mut bool,
+    search_query: &mut String,
+    search_mode: &mut SearchMode,
+) {
+    *is_searching = true;
+    search_query.clear();
+    *search_mode = SearchMode::Regex;
+}
+
+fn clear_browser_search(is_searching: &mut bool, search_query: &mut String) {
+    *is_searching = false;
+    search_query.clear();
+}
+
+fn toggle_browser_search_mode(search_mode: &mut SearchMode) {
+    *search_mode = match *search_mode {
+        SearchMode::Fuzzy => SearchMode::Regex,
+        SearchMode::Regex => SearchMode::Fuzzy,
+    };
+}
+
+fn browser_action_resets_search_view(action: BrowserAction) -> bool {
+    matches!(
+        action,
+        BrowserAction::Backspace | BrowserAction::ToggleSearchMode | BrowserAction::Char(_)
+    )
+}
+
+fn reset_active_browser_search_view(
+    browser_mode: &mut FileBrowserMode,
+    filesystem_state: &mut TreeViewState,
+) {
+    match browser_mode {
+        FileBrowserMode::DownloadLocSelection {
+            focused_pane: BrowserPane::TorrentPreview,
+            preview_state,
+            ..
+        } => {
+            preview_state.top_most_offset = 0;
+        }
+        _ => {
+            filesystem_state.top_most_offset = 0;
+        }
+    }
+}
+
 async fn handle_browser_common_key(key_code: KeyCode, app: &mut App) -> bool {
     let list_height = {
         let file_browser = &app.app_state.ui.file_browser;
@@ -782,10 +972,12 @@ async fn handle_browser_common_key(key_code: KeyCode, app: &mut App) -> bool {
             file_browser.state.cursor_path.as_ref(),
         );
         let pane = focused_pane(&file_browser.browser_mode);
+        let search_panel_active =
+            browser_search_panel_active(file_browser.is_searching, &file_browser.search_query);
         calculate_list_height(
             app.app_state.screen_area,
             has_preview,
-            app.app_state.ui.file_browser.is_searching,
+            search_panel_active,
             &pane,
         )
     };
@@ -800,6 +992,7 @@ async fn handle_browser_common_key(key_code: KeyCode, app: &mut App) -> bool {
                 browser_mode: &file_browser.browser_mode,
                 is_searching: &mut file_browser.is_searching,
                 search_query: &mut file_browser.search_query,
+                search_mode: &mut file_browser.search_mode,
                 list_height,
                 app_command_tx: &app.app_command_tx,
             },
@@ -843,6 +1036,7 @@ pub enum BrowserAction {
     Esc,
     Enter,
     Backspace,
+    ToggleSearchMode,
     Char(char),
     Noop,
 }
@@ -939,6 +1133,9 @@ pub enum BrowserPreviewAction {
     ConfirmSelection,
     Navigate(TreeAction),
     CyclePriority,
+    CycleAllPriorities,
+    ExpandAll,
+    CollapseAll,
     Ignore,
 }
 
@@ -952,21 +1149,30 @@ pub struct BrowserFilesystemNavContext<'a> {
     pub browser_mode: &'a FileBrowserMode,
     pub is_searching: &'a mut bool,
     pub search_query: &'a mut String,
+    pub search_mode: &'a mut SearchMode,
     pub list_height: usize,
     pub app_command_tx: &'a mpsc::Sender<AppCommand>,
 }
 
-fn map_search_key_to_browser_action(
-    key_code: KeyCode,
-    is_searching: bool,
-) -> Option<BrowserAction> {
+pub struct BrowserFilesystemReduceContext<'a> {
+    pub state: &'a mut TreeViewState,
+    pub data: &'a [RawNode<FileMetadata>],
+    pub browser_mode: &'a FileBrowserMode,
+    pub is_searching: &'a mut bool,
+    pub search_query: &'a mut String,
+    pub search_mode: &'a mut SearchMode,
+    pub list_height: usize,
+}
+
+fn map_search_key_to_browser_action(key: KeyEvent, is_searching: bool) -> Option<BrowserAction> {
     if !is_searching {
         return None;
     }
 
-    Some(match key_code {
+    Some(match key.code {
         KeyCode::Esc => BrowserAction::Esc,
         KeyCode::Enter => BrowserAction::Enter,
+        KeyCode::Tab => BrowserAction::ToggleSearchMode,
         KeyCode::Backspace => BrowserAction::Backspace,
         KeyCode::Char(c) => BrowserAction::Char(c),
         _ => BrowserAction::Noop,
@@ -977,17 +1183,20 @@ pub fn reduce_browser_action(
     action: BrowserAction,
     is_searching: &mut bool,
     search_query: &mut String,
+    search_mode: &mut SearchMode,
 ) -> BrowserReduceResult {
     match action {
         BrowserAction::Esc => {
-            *is_searching = false;
-            search_query.clear();
+            clear_browser_search(is_searching, search_query);
         }
         BrowserAction::Enter => {
             *is_searching = false;
         }
         BrowserAction::Backspace => {
             search_query.pop();
+        }
+        BrowserAction::ToggleSearchMode => {
+            toggle_browser_search_mode(search_mode);
         }
         BrowserAction::Char(c) => {
             search_query.push(c);
@@ -1013,14 +1222,9 @@ fn map_filesystem_key_to_action(key_code: KeyCode) -> Option<BrowserFsAction> {
 
 pub fn reduce_filesystem_navigation_action(
     action: BrowserFsAction,
-    state: &mut TreeViewState,
-    data: &[RawNode<FileMetadata>],
-    browser_mode: &FileBrowserMode,
-    is_searching: &mut bool,
-    search_query: &mut String,
-    list_height: usize,
+    ctx: BrowserFilesystemReduceContext<'_>,
 ) -> BrowserFsReduceResult {
-    let filter = build_filter(browser_mode, search_query);
+    let filter = build_filesystem_filter(ctx.browser_mode, ctx.search_query, *ctx.search_mode);
     let mut result = BrowserFsReduceResult {
         consumed: true,
         effects: Vec::new(),
@@ -1028,31 +1232,30 @@ pub fn reduce_filesystem_navigation_action(
 
     match action {
         BrowserFsAction::StartSearch => {
-            *is_searching = true;
-            search_query.clear();
+            start_browser_search(ctx.is_searching, ctx.search_query, ctx.search_mode);
+            ctx.state.top_most_offset = 0;
         }
         BrowserFsAction::Move(tree_action) => {
-            TreeMathHelper::apply_action(state, data, tree_action, filter, list_height);
+            TreeMathHelper::apply_action(ctx.state, ctx.data, tree_action, filter, ctx.list_height);
         }
         BrowserFsAction::EnterDir => {
-            if let Some(path) = state.cursor_path.clone() {
+            if let Some(path) = ctx.state.cursor_path.clone() {
                 if path.is_dir() {
-                    *is_searching = false;
-                    search_query.clear();
+                    clear_browser_search(ctx.is_searching, ctx.search_query);
                     result.effects.push(BrowserFsEffect::FetchFileTree {
                         path,
-                        browser_mode: browser_mode.clone(),
+                        browser_mode: ctx.browser_mode.clone(),
                         highlight_path: None,
                     });
                 }
             }
         }
         BrowserFsAction::GoParent => {
-            let child_to_highlight = state.current_path.clone();
-            if let Some(parent) = state.current_path.parent() {
+            let child_to_highlight = ctx.state.current_path.clone();
+            if let Some(parent) = ctx.state.current_path.parent() {
                 result.effects.push(BrowserFsEffect::FetchFileTree {
                     path: parent.to_path_buf(),
-                    browser_mode: browser_mode.clone(),
+                    browser_mode: ctx.browser_mode.clone(),
                     highlight_path: Some(child_to_highlight),
                 });
             }
@@ -1237,8 +1440,15 @@ pub fn has_preview_content(
     cursor_path: Option<&std::path::PathBuf>,
 ) -> bool {
     match browser_mode {
-        FileBrowserMode::DownloadLocSelection { .. } => {
-            pending_torrent_path || pending_torrent_link
+        FileBrowserMode::DownloadLocSelection {
+            target,
+            preview_tree,
+            ..
+        } => {
+            pending_torrent_path
+                || pending_torrent_link
+                || !preview_tree.is_empty()
+                || matches!(target, DownloadSelectionTarget::ExistingTorrent { .. })
         }
         FileBrowserMode::File(_) => {
             cursor_path.is_some_and(|p| p.extension().is_some_and(|ext| ext == "torrent"))
@@ -1307,7 +1517,10 @@ pub fn map_preview_key_to_action(key_code: KeyCode) -> BrowserPreviewAction {
         KeyCode::Down | KeyCode::Char('j') => BrowserPreviewAction::Navigate(TreeAction::Down),
         KeyCode::Left | KeyCode::Char('h') => BrowserPreviewAction::Navigate(TreeAction::Left),
         KeyCode::Right | KeyCode::Char('l') => BrowserPreviewAction::Navigate(TreeAction::Right),
-        KeyCode::Char(' ') => BrowserPreviewAction::CyclePriority,
+        KeyCode::Char('P') => BrowserPreviewAction::CycleAllPriorities,
+        KeyCode::Char(' ') | KeyCode::Char('p') => BrowserPreviewAction::CyclePriority,
+        KeyCode::Char('e') => BrowserPreviewAction::ExpandAll,
+        KeyCode::Char('c') => BrowserPreviewAction::CollapseAll,
         _ => BrowserPreviewAction::Ignore,
     }
 }
@@ -1316,6 +1529,7 @@ pub fn reduce_browser_preview_action(
     action: BrowserPreviewAction,
     preview_state: &mut TreeViewState,
     preview_tree: &mut [RawNode<TorrentPreviewPayload>],
+    filter: TreeFilter<TorrentPreviewPayload>,
     list_height: Option<usize>,
 ) -> BrowserPreviewReduceResult {
     match action {
@@ -1326,7 +1540,7 @@ pub fn reduce_browser_preview_action(
                     preview_state,
                     preview_tree,
                     tree_action,
-                    TreeFilter::default(),
+                    filter,
                     height,
                 );
             }
@@ -1340,25 +1554,125 @@ pub fn reduce_browser_preview_action(
             }
             BrowserPreviewReduceResult { consumed: true }
         }
+        BrowserPreviewAction::CycleAllPriorities => {
+            if let Some(_height) = list_height {
+                apply_priority_cycle_to_all(preview_tree);
+            }
+            BrowserPreviewReduceResult { consumed: true }
+        }
+        BrowserPreviewAction::ExpandAll => {
+            expand_preview_tree(preview_state, preview_tree);
+            BrowserPreviewReduceResult { consumed: true }
+        }
+        BrowserPreviewAction::CollapseAll => {
+            collapse_preview_tree(preview_state, preview_tree);
+            BrowserPreviewReduceResult { consumed: true }
+        }
         BrowserPreviewAction::Ignore => BrowserPreviewReduceResult { consumed: true },
     }
 }
 
-pub fn build_filter(
+pub fn build_filesystem_filter(
     browser_mode: &FileBrowserMode,
     search_query: &str,
+    search_mode: SearchMode,
 ) -> TreeFilter<FileMetadata> {
-    match browser_mode {
+    if search_query.trim().is_empty() {
+        return match browser_mode {
+            FileBrowserMode::File(extensions) => {
+                let exts = extensions.clone();
+                TreeFilter::new("", move |node| filesystem_node_allowed(node, &exts))
+            }
+            FileBrowserMode::Directory
+            | FileBrowserMode::DownloadLocSelection { .. }
+            | FileBrowserMode::ConfigPathSelection { .. } => TreeFilter::default(),
+        };
+    }
+
+    let extensions = match browser_mode {
+        FileBrowserMode::File(extensions) => Some(extensions.clone()),
         FileBrowserMode::Directory
         | FileBrowserMode::DownloadLocSelection { .. }
-        | FileBrowserMode::ConfigPathSelection { .. } => TreeFilter::from_text(search_query),
-        FileBrowserMode::File(extensions) => {
-            let exts = extensions.clone();
-            TreeFilter::new(search_query, move |node| {
-                node.is_dir || exts.iter().any(|ext| node.name.ends_with(ext))
+        | FileBrowserMode::ConfigPathSelection { .. } => None,
+    };
+
+    match search_mode {
+        SearchMode::Fuzzy => {
+            let matcher = SkimMatcherV2::default();
+            let query = search_query.to_lowercase();
+            TreeFilter::rule_only(search_query, move |node| {
+                filesystem_node_allowed_for_mode(node, extensions.as_deref())
+                    && matcher
+                        .fuzzy_match(&filesystem_search_haystack(node).to_lowercase(), &query)
+                        .is_some()
             })
         }
+        SearchMode::Regex => {
+            let regex = regex::RegexBuilder::new(search_query)
+                .case_insensitive(true)
+                .build();
+            match regex {
+                Ok(regex) => TreeFilter::rule_only(search_query, move |node| {
+                    filesystem_node_allowed_for_mode(node, extensions.as_deref())
+                        && regex.is_match(&filesystem_search_haystack(node))
+                }),
+                Err(_) => TreeFilter::rule_only(search_query, |_| false),
+            }
+        }
     }
+}
+
+fn filesystem_node_allowed_for_mode(
+    node: &RawNode<FileMetadata>,
+    extensions: Option<&[String]>,
+) -> bool {
+    match extensions {
+        Some(exts) => filesystem_node_allowed(node, exts),
+        None => true,
+    }
+}
+
+fn filesystem_node_allowed(node: &RawNode<FileMetadata>, extensions: &[String]) -> bool {
+    node.is_dir || extensions.iter().any(|ext| node.name.ends_with(ext))
+}
+
+fn filesystem_search_haystack(node: &RawNode<FileMetadata>) -> String {
+    format!("{} {}", node.name, node.full_path.to_string_lossy())
+}
+
+pub fn build_torrent_preview_filter(
+    search_query: &str,
+    search_mode: SearchMode,
+) -> TreeFilter<TorrentPreviewPayload> {
+    if search_query.trim().is_empty() {
+        return TreeFilter::default();
+    }
+
+    match search_mode {
+        SearchMode::Fuzzy => {
+            let matcher = SkimMatcherV2::default();
+            let query = search_query.to_lowercase();
+            TreeFilter::rule_only(search_query, move |node| {
+                let haystack = torrent_preview_search_haystack(node).to_lowercase();
+                matcher.fuzzy_match(&haystack, &query).is_some()
+            })
+        }
+        SearchMode::Regex => {
+            let regex = regex::RegexBuilder::new(search_query)
+                .case_insensitive(true)
+                .build();
+            match regex {
+                Ok(regex) => TreeFilter::rule_only(search_query, move |node| {
+                    regex.is_match(&torrent_preview_search_haystack(node))
+                }),
+                Err(_) => TreeFilter::rule_only(search_query, |_| false),
+            }
+        }
+    }
+}
+
+fn torrent_preview_search_haystack(node: &RawNode<TorrentPreviewPayload>) -> String {
+    format!("{} {}", node.name, node.full_path.to_string_lossy())
 }
 
 pub fn handle_filesystem_navigation(
@@ -1368,12 +1682,15 @@ pub fn handle_filesystem_navigation(
     if let Some(action) = map_filesystem_key_to_action(key_code) {
         let reduced = reduce_filesystem_navigation_action(
             action,
-            ctx.state,
-            ctx.data,
-            ctx.browser_mode,
-            ctx.is_searching,
-            ctx.search_query,
-            ctx.list_height,
+            BrowserFilesystemReduceContext {
+                state: ctx.state,
+                data: ctx.data,
+                browser_mode: ctx.browser_mode,
+                is_searching: ctx.is_searching,
+                search_query: ctx.search_query,
+                search_mode: ctx.search_mode,
+                list_height: ctx.list_height,
+            },
         );
         for effect in reduced.effects {
             match effect {
@@ -1579,6 +1896,29 @@ pub fn resolve_confirm_decision(
     ConfirmDecision::None
 }
 
+fn priority_overrides(
+    priorities: HashMap<usize, FilePriority>,
+) -> Vec<ControlFilePriorityOverride> {
+    let mut overrides: Vec<_> = priorities
+        .into_iter()
+        .filter(|(_, priority)| !matches!(priority, FilePriority::Normal))
+        .map(|(file_index, priority)| ControlFilePriorityOverride {
+            file_index,
+            priority,
+        })
+        .collect();
+    overrides.sort_by_key(|override_value| override_value.file_index);
+    overrides
+}
+
+fn existing_torrent_priorities(app: &App, info_hash: &[u8]) -> HashMap<usize, FilePriority> {
+    app.app_state
+        .torrents
+        .get(info_hash)
+        .map(|torrent| torrent.latest_state.file_priorities.clone())
+        .unwrap_or_default()
+}
+
 pub async fn execute_confirm_decision(
     app: &mut App,
     decision: ConfirmDecision,
@@ -1590,39 +1930,61 @@ pub async fn execute_confirm_decision(
             Some(BrowserTransition::ToConfig)
         }
         ConfirmDecision::Download(payload) => {
-            if let Some(pending_path) = app.app_state.pending_torrent_path.take() {
-                match app.prepare_add_torrent_file_request(
-                    pending_path,
-                    Some(payload.base_path.clone()),
-                    payload.container_name_to_use.clone(),
-                    payload.file_priorities.clone(),
-                ) {
-                    Ok(request) => {
+            match payload.target {
+                DownloadSelectionTarget::PendingAdd => {
+                    if let Some(pending_path) = app.app_state.pending_torrent_path.take() {
+                        match app.prepare_add_torrent_file_request(
+                            pending_path,
+                            Some(payload.base_path.clone()),
+                            payload.container_name_to_use.clone(),
+                            payload.file_priorities.clone(),
+                        ) {
+                            Ok(request) => {
+                                spawn_app_command_sender(
+                                    app.app_command_tx.clone(),
+                                    app.shutdown_tx.subscribe(),
+                                    AppCommand::SubmitControlRequest(request),
+                                );
+                            }
+                            Err(error) => {
+                                app.app_state.system_error = Some(error);
+                            }
+                        }
+                    } else if !app.app_state.pending_torrent_link.is_empty() {
+                        let request = app.prepare_add_magnet_request(
+                            app.app_state.pending_torrent_link.clone(),
+                            Some(payload.base_path),
+                            payload.container_name_to_use,
+                            payload.file_priorities,
+                        );
                         spawn_app_command_sender(
                             app.app_command_tx.clone(),
                             app.shutdown_tx.subscribe(),
                             AppCommand::SubmitControlRequest(request),
                         );
-                    }
-                    Err(error) => {
-                        app.app_state.system_error = Some(error);
+                        app.app_state.pending_torrent_link.clear();
+                    } else {
+                        tracing::warn!(target: "superseedr", "SHIFT+Y pressed but no pending content was found");
                     }
                 }
-            } else if !app.app_state.pending_torrent_link.is_empty() {
-                let request = app.prepare_add_magnet_request(
-                    app.app_state.pending_torrent_link.clone(),
-                    Some(payload.base_path),
-                    payload.container_name_to_use,
-                    payload.file_priorities,
-                );
-                spawn_app_command_sender(
-                    app.app_command_tx.clone(),
-                    app.shutdown_tx.subscribe(),
-                    AppCommand::SubmitControlRequest(request),
-                );
-                app.app_state.pending_torrent_link.clear();
-            } else {
-                tracing::warn!(target: "superseedr", "SHIFT+Y pressed but no pending content was found");
+                DownloadSelectionTarget::ExistingTorrent { info_hash } => {
+                    let file_priorities = if payload.has_preview_files {
+                        payload.file_priorities
+                    } else {
+                        existing_torrent_priorities(app, &info_hash)
+                    };
+                    let request = ControlRequest::SetTorrentConfig {
+                        info_hash_hex: hex::encode(info_hash),
+                        download_path: Some(payload.base_path),
+                        container_name: payload.container_name_to_use,
+                        file_priorities: priority_overrides(file_priorities),
+                    };
+                    spawn_app_command_sender(
+                        app.app_command_tx.clone(),
+                        app.shutdown_tx.subscribe(),
+                        AppCommand::SubmitControlRequest(request),
+                    );
+                }
             }
             Some(BrowserTransition::ToNormal)
         }
@@ -1649,6 +2011,7 @@ pub fn build_download_confirm_payload(
     browser_mode: &FileBrowserMode,
 ) -> Option<DownloadConfirmPayload> {
     if let FileBrowserMode::DownloadLocSelection {
+        target,
         container_name,
         use_container,
         preview_tree,
@@ -1671,6 +2034,8 @@ pub fn build_download_confirm_payload(
             base_path,
             container_name_to_use,
             file_priorities,
+            target: target.clone(),
+            has_preview_files: !preview_tree.is_empty(),
         });
     }
     None
@@ -1747,6 +2112,81 @@ pub fn apply_priority_cycle(
     false
 }
 
+pub fn expand_preview_tree(
+    preview_state: &mut TreeViewState,
+    preview_tree: &[RawNode<TorrentPreviewPayload>],
+) {
+    for node in preview_tree {
+        node.expand_all(preview_state);
+    }
+}
+
+pub fn collapse_preview_tree(
+    preview_state: &mut TreeViewState,
+    preview_tree: &[RawNode<TorrentPreviewPayload>],
+) {
+    preview_state.expanded_paths.clear();
+    preview_state.top_most_offset = 0;
+
+    let cursor_is_root = match &preview_state.cursor_path {
+        Some(cursor_path) => preview_tree
+            .iter()
+            .any(|node| node.full_path == *cursor_path),
+        None => false,
+    };
+    if !cursor_is_root {
+        preview_state.cursor_path = preview_tree.first().map(|node| node.full_path.clone());
+    }
+}
+
+fn common_file_priority(nodes: &[RawNode<TorrentPreviewPayload>]) -> Option<FilePriority> {
+    let mut common = None;
+    let mut is_mixed = false;
+    collect_common_file_priority(nodes, &mut common, &mut is_mixed);
+
+    if is_mixed {
+        Some(FilePriority::Mixed)
+    } else {
+        common
+    }
+}
+
+fn collect_common_file_priority(
+    nodes: &[RawNode<TorrentPreviewPayload>],
+    common: &mut Option<FilePriority>,
+    is_mixed: &mut bool,
+) {
+    for node in nodes {
+        if node.is_dir {
+            collect_common_file_priority(&node.children, common, is_mixed);
+            continue;
+        }
+
+        match common {
+            Some(priority) if *priority != node.payload.priority => {
+                *is_mixed = true;
+            }
+            Some(_) => {}
+            None => {
+                *common = Some(node.payload.priority);
+            }
+        }
+    }
+}
+
+pub fn apply_priority_cycle_to_all(nodes: &mut [RawNode<TorrentPreviewPayload>]) -> bool {
+    let Some(next_priority) = common_file_priority(nodes).map(|priority| priority.next()) else {
+        return false;
+    };
+
+    for node in nodes {
+        node.apply_recursive(&|target| {
+            target.payload.priority = next_priority;
+        });
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1758,9 +2198,10 @@ mod tests {
     fn search_reducer_clears_on_escape() {
         let mut is_searching = true;
         let mut query = String::from("abc");
-        let action = map_search_key_to_browser_action(KeyCode::Esc, is_searching)
+        let mut search_mode = SearchMode::Fuzzy;
+        let action = map_search_key_to_browser_action(KeyEvent::from(KeyCode::Esc), is_searching)
             .expect("expected search action");
-        let out = reduce_browser_action(action, &mut is_searching, &mut query);
+        let out = reduce_browser_action(action, &mut is_searching, &mut query, &mut search_mode);
         assert!(out.redraw);
         assert!(!is_searching);
         assert!(query.is_empty());
@@ -1770,8 +2211,14 @@ mod tests {
     fn reducer_search_char_appends_and_consumes() {
         let mut is_searching = true;
         let mut query = String::from("ab");
+        let mut search_mode = SearchMode::Fuzzy;
 
-        let out = reduce_browser_action(BrowserAction::Char('c'), &mut is_searching, &mut query);
+        let out = reduce_browser_action(
+            BrowserAction::Char('c'),
+            &mut is_searching,
+            &mut query,
+            &mut search_mode,
+        );
 
         assert!(out.redraw);
         assert!(is_searching);
@@ -1782,8 +2229,14 @@ mod tests {
     fn reducer_search_noop_still_consumes_when_searching() {
         let mut is_searching = true;
         let mut query = String::from("abc");
+        let mut search_mode = SearchMode::Fuzzy;
 
-        let out = reduce_browser_action(BrowserAction::Noop, &mut is_searching, &mut query);
+        let out = reduce_browser_action(
+            BrowserAction::Noop,
+            &mut is_searching,
+            &mut query,
+            &mut search_mode,
+        );
 
         assert!(out.redraw);
         assert!(is_searching);
@@ -1791,26 +2244,62 @@ mod tests {
     }
 
     #[test]
+    fn reducer_search_tab_toggles_mode() {
+        let mut is_searching = true;
+        let mut query = String::from("abc");
+        let mut search_mode = SearchMode::Fuzzy;
+        let action = map_search_key_to_browser_action(KeyEvent::from(KeyCode::Tab), is_searching)
+            .expect("expected mode toggle");
+
+        let out = reduce_browser_action(action, &mut is_searching, &mut query, &mut search_mode);
+
+        assert!(out.redraw);
+        assert!(is_searching);
+        assert_eq!(query, "abc");
+        assert_eq!(search_mode, SearchMode::Regex);
+    }
+
+    #[test]
+    fn clear_browser_search_disables_and_clears_query() {
+        let mut is_searching = true;
+        let mut query = String::from("abc");
+
+        clear_browser_search(&mut is_searching, &mut query);
+
+        assert!(!is_searching);
+        assert!(query.is_empty());
+    }
+
+    #[test]
     fn reducer_filesystem_start_search_sets_flag_and_clears_query() {
         let mut is_searching = false;
         let mut query = String::from("abc");
-        let mut state = TreeViewState::default();
+        let mut state = TreeViewState {
+            top_most_offset: 12,
+            ..Default::default()
+        };
         let data: Vec<RawNode<FileMetadata>> = vec![];
         let mode = FileBrowserMode::Directory;
+        let mut search_mode = SearchMode::Fuzzy;
 
         let out = reduce_filesystem_navigation_action(
             BrowserFsAction::StartSearch,
-            &mut state,
-            &data,
-            &mode,
-            &mut is_searching,
-            &mut query,
-            5,
+            BrowserFilesystemReduceContext {
+                state: &mut state,
+                data: &data,
+                browser_mode: &mode,
+                is_searching: &mut is_searching,
+                search_query: &mut query,
+                search_mode: &mut search_mode,
+                list_height: 5,
+            },
         );
 
         assert!(out.consumed);
         assert!(is_searching);
         assert!(query.is_empty());
+        assert_eq!(search_mode, SearchMode::Regex);
+        assert_eq!(state.top_most_offset, 0);
     }
 
     #[test]
@@ -1824,15 +2313,19 @@ mod tests {
         };
         let data: Vec<RawNode<FileMetadata>> = vec![];
         let mode = FileBrowserMode::Directory;
+        let mut search_mode = SearchMode::Fuzzy;
 
         let out = reduce_filesystem_navigation_action(
             BrowserFsAction::EnterDir,
-            &mut state,
-            &data,
-            &mode,
-            &mut is_searching,
-            &mut query,
-            5,
+            BrowserFilesystemReduceContext {
+                state: &mut state,
+                data: &data,
+                browser_mode: &mode,
+                is_searching: &mut is_searching,
+                search_query: &mut query,
+                search_mode: &mut search_mode,
+                list_height: 5,
+            },
         );
 
         assert!(out.consumed);
@@ -1849,6 +2342,7 @@ mod tests {
     #[test]
     fn reducer_download_edit_insert_updates_buffer_and_cursor() {
         let mut mode = FileBrowserMode::DownloadLocSelection {
+            target: DownloadSelectionTarget::PendingAdd,
             torrent_files: vec![],
             container_name: "ab".to_string(),
             use_container: true,
@@ -1940,6 +2434,7 @@ mod tests {
     #[test]
     fn map_download_key_prefers_edit_action_while_editing() {
         let mode = FileBrowserMode::DownloadLocSelection {
+            target: DownloadSelectionTarget::PendingAdd,
             torrent_files: vec![],
             container_name: "x".to_string(),
             use_container: true,
@@ -1962,6 +2457,7 @@ mod tests {
     #[test]
     fn reduce_browser_download_shortcut_updates_mode() {
         let mut mode = FileBrowserMode::DownloadLocSelection {
+            target: DownloadSelectionTarget::PendingAdd,
             torrent_files: vec![],
             container_name: "seed".to_string(),
             use_container: true,
@@ -2012,6 +2508,7 @@ mod tests {
     #[test]
     fn reducer_download_shortcuts_toggle_pane() {
         let mut mode = FileBrowserMode::DownloadLocSelection {
+            target: DownloadSelectionTarget::PendingAdd,
             torrent_files: vec![],
             container_name: "x".to_string(),
             use_container: true,
@@ -2043,6 +2540,113 @@ mod tests {
     }
 
     #[test]
+    fn has_preview_content_shows_existing_torrent_priority_pane() {
+        let mode = FileBrowserMode::DownloadLocSelection {
+            target: DownloadSelectionTarget::ExistingTorrent {
+                info_hash: vec![7; 20],
+            },
+            torrent_files: vec![],
+            container_name: "Sample Files".to_string(),
+            use_container: true,
+            is_editing_name: false,
+            focused_pane: BrowserPane::TorrentPreview,
+            preview_tree: vec![],
+            preview_state: TreeViewState::default(),
+            cursor_pos: 0,
+            original_name_backup: "Sample Files".to_string(),
+        };
+
+        assert!(has_preview_content(&mode, false, false, None));
+    }
+
+    #[test]
+    fn preview_search_starts_only_from_preview_pane() {
+        let mut mode = FileBrowserMode::DownloadLocSelection {
+            target: DownloadSelectionTarget::PendingAdd,
+            torrent_files: vec![],
+            container_name: "Sample Files".to_string(),
+            use_container: true,
+            is_editing_name: false,
+            focused_pane: BrowserPane::TorrentPreview,
+            preview_tree: vec![],
+            preview_state: TreeViewState::default(),
+            cursor_pos: 0,
+            original_name_backup: "Sample Files".to_string(),
+        };
+
+        assert!(preview_search_should_start(KeyCode::Char('/'), &mode));
+
+        if let FileBrowserMode::DownloadLocSelection { focused_pane, .. } = &mut mode {
+            *focused_pane = BrowserPane::FileSystem;
+        }
+        assert!(!preview_search_should_start(KeyCode::Char('/'), &mode));
+    }
+
+    #[test]
+    fn torrent_preview_fuzzy_filter_matches_relative_path() {
+        let tree = sample_preview_tree();
+        let state = TreeViewState::default();
+        let filter = build_torrent_preview_filter("alpb", SearchMode::Fuzzy);
+
+        let rows = TreeMathHelper::get_visible_slice(&tree, &state, filter, 10);
+
+        assert!(rows.iter().any(|row| row.node.name == "alpha.bin"));
+        assert!(!rows.iter().any(|row| row.node.name == "beta.bin"));
+    }
+
+    #[test]
+    fn torrent_preview_regex_filter_is_case_insensitive() {
+        let tree = sample_preview_tree();
+        let state = TreeViewState::default();
+        let filter = build_torrent_preview_filter(r"group/[A-Z]+\.bin", SearchMode::Regex);
+
+        let rows = TreeMathHelper::get_visible_slice(&tree, &state, filter, 10);
+
+        assert!(rows.iter().any(|row| row.node.name == "alpha.bin"));
+        assert!(rows.iter().any(|row| row.node.name == "beta.bin"));
+    }
+
+    #[test]
+    fn torrent_preview_invalid_regex_matches_no_rows() {
+        let tree = sample_preview_tree();
+        let state = TreeViewState::default();
+        let filter = build_torrent_preview_filter("[", SearchMode::Regex);
+
+        let rows = TreeMathHelper::get_visible_slice(&tree, &state, filter, 10);
+
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn filesystem_fuzzy_filter_matches_relative_path() {
+        let tree = sample_filesystem_tree();
+        let state = TreeViewState::default();
+        let filter =
+            build_filesystem_filter(&FileBrowserMode::Directory, "alpb", SearchMode::Fuzzy);
+
+        let rows = TreeMathHelper::get_visible_slice(&tree, &state, filter, 10);
+
+        assert!(rows.iter().any(|row| row.node.name == "alpha.bin"));
+        assert!(!rows.iter().any(|row| row.node.name == "beta.bin"));
+    }
+
+    #[test]
+    fn filesystem_regex_filter_is_case_insensitive() {
+        let tree = sample_filesystem_tree();
+        let state = TreeViewState::default();
+        let filter = build_filesystem_filter(
+            &FileBrowserMode::Directory,
+            r"group/[A-Z]+\.bin",
+            SearchMode::Regex,
+        );
+
+        let rows = TreeMathHelper::get_visible_slice(&tree, &state, filter, 10);
+
+        assert!(rows.iter().any(|row| row.node.name == "alpha.bin"));
+        assert!(rows.iter().any(|row| row.node.name == "beta.bin"));
+    }
+
+    #[test]
     fn preview_reducer_navigate_consumes_direction_key() {
         let mut tree = vec![RawNode {
             name: "root".to_string(),
@@ -2064,10 +2668,45 @@ mod tests {
             map_preview_key_to_action(KeyCode::Down),
             &mut state,
             &mut tree,
+            TreeFilter::default(),
             Some(10),
         );
         assert!(out.consumed);
         assert_eq!(state.cursor_path, Some(PathBuf::from("root/child")));
+    }
+
+    #[test]
+    fn preview_reducer_navigates_filtered_rows() {
+        let mut tree = sample_preview_tree();
+        let mut state = TreeViewState {
+            cursor_path: Some(PathBuf::from("root")),
+            ..Default::default()
+        };
+
+        let out = reduce_browser_preview_action(
+            map_preview_key_to_action(KeyCode::Down),
+            &mut state,
+            &mut tree,
+            build_torrent_preview_filter("beta", SearchMode::Fuzzy),
+            Some(10),
+        );
+
+        assert!(out.consumed);
+        assert_eq!(state.cursor_path, Some(PathBuf::from("root/group")));
+
+        let out = reduce_browser_preview_action(
+            map_preview_key_to_action(KeyCode::Down),
+            &mut state,
+            &mut tree,
+            build_torrent_preview_filter("beta", SearchMode::Fuzzy),
+            Some(10),
+        );
+
+        assert!(out.consumed);
+        assert_eq!(
+            state.cursor_path,
+            Some(PathBuf::from("root/group/beta.bin"))
+        );
     }
 
     #[test]
@@ -2078,6 +2717,7 @@ mod tests {
             map_preview_key_to_action(KeyCode::Char('Y')),
             &mut state,
             &mut tree,
+            TreeFilter::default(),
             Some(10),
         );
         assert!(!out.consumed);
@@ -2091,6 +2731,7 @@ mod tests {
             map_preview_key_to_action(KeyCode::Char('z')),
             &mut state,
             &mut tree,
+            TreeFilter::default(),
             Some(10),
         );
         assert!(out.consumed);
@@ -2114,6 +2755,7 @@ mod tests {
             map_preview_key_to_action(KeyCode::Char(' ')),
             &mut state,
             &mut tree,
+            TreeFilter::default(),
             Some(10),
         );
 
@@ -2122,13 +2764,151 @@ mod tests {
     }
 
     #[test]
+    fn preview_reducer_cycles_priority_on_p() {
+        let mut tree = vec![RawNode {
+            name: "root".to_string(),
+            full_path: PathBuf::from("root"),
+            children: vec![],
+            payload: TorrentPreviewPayload::default(),
+            is_dir: true,
+        }];
+        let mut state = TreeViewState {
+            cursor_path: Some(PathBuf::from("root")),
+            ..Default::default()
+        };
+
+        let out = reduce_browser_preview_action(
+            map_preview_key_to_action(KeyCode::Char('p')),
+            &mut state,
+            &mut tree,
+            TreeFilter::default(),
+            Some(10),
+        );
+
+        assert!(out.consumed);
+        assert_eq!(tree[0].payload.priority, FilePriority::Skip);
+    }
+
+    #[test]
+    fn preview_keymap_includes_bulk_preview_shortcuts() {
+        assert_eq!(
+            map_preview_key_to_action(KeyCode::Char('P')),
+            BrowserPreviewAction::CycleAllPriorities
+        );
+        assert_eq!(
+            map_preview_key_to_action(KeyCode::Char('e')),
+            BrowserPreviewAction::ExpandAll
+        );
+        assert_eq!(
+            map_preview_key_to_action(KeyCode::Char('c')),
+            BrowserPreviewAction::CollapseAll
+        );
+    }
+
+    #[test]
+    fn preview_reducer_expands_and_collapses_all() {
+        let mut tree = vec![RawNode {
+            name: "root".to_string(),
+            full_path: PathBuf::from("root"),
+            children: vec![RawNode {
+                name: "group".to_string(),
+                full_path: PathBuf::from("root/group"),
+                children: vec![RawNode {
+                    name: "leaf".to_string(),
+                    full_path: PathBuf::from("root/group/leaf"),
+                    children: vec![],
+                    payload: TorrentPreviewPayload::default(),
+                    is_dir: false,
+                }],
+                payload: TorrentPreviewPayload::default(),
+                is_dir: true,
+            }],
+            payload: TorrentPreviewPayload::default(),
+            is_dir: true,
+        }];
+        let mut state = TreeViewState {
+            cursor_path: Some(PathBuf::from("root/group/leaf")),
+            ..Default::default()
+        };
+
+        let out = reduce_browser_preview_action(
+            map_preview_key_to_action(KeyCode::Char('e')),
+            &mut state,
+            &mut tree,
+            TreeFilter::default(),
+            Some(10),
+        );
+        assert!(out.consumed);
+        assert!(state.expanded_paths.contains(&PathBuf::from("root")));
+        assert!(state.expanded_paths.contains(&PathBuf::from("root/group")));
+
+        let out = reduce_browser_preview_action(
+            map_preview_key_to_action(KeyCode::Char('c')),
+            &mut state,
+            &mut tree,
+            TreeFilter::default(),
+            Some(10),
+        );
+        assert!(out.consumed);
+        assert!(state.expanded_paths.is_empty());
+        assert_eq!(state.cursor_path, Some(PathBuf::from("root")));
+    }
+
+    #[test]
+    fn preview_reducer_cycles_all_file_priorities_on_p() {
+        let mut tree = vec![RawNode {
+            name: "root".to_string(),
+            full_path: PathBuf::from("root"),
+            children: vec![
+                RawNode {
+                    name: "alpha.bin".to_string(),
+                    full_path: PathBuf::from("root/alpha.bin"),
+                    children: vec![],
+                    payload: TorrentPreviewPayload::default(),
+                    is_dir: false,
+                },
+                RawNode {
+                    name: "beta.bin".to_string(),
+                    full_path: PathBuf::from("root/beta.bin"),
+                    children: vec![],
+                    payload: TorrentPreviewPayload::default(),
+                    is_dir: false,
+                },
+            ],
+            payload: TorrentPreviewPayload::default(),
+            is_dir: true,
+        }];
+        let mut state = TreeViewState {
+            cursor_path: Some(PathBuf::from("root")),
+            ..Default::default()
+        };
+
+        let out = reduce_browser_preview_action(
+            map_preview_key_to_action(KeyCode::Char('P')),
+            &mut state,
+            &mut tree,
+            TreeFilter::default(),
+            Some(10),
+        );
+
+        assert!(out.consumed);
+        assert_eq!(tree[0].payload.priority, FilePriority::Skip);
+        assert_eq!(tree[0].children[0].payload.priority, FilePriority::Skip);
+        assert_eq!(tree[0].children[1].payload.priority, FilePriority::Skip);
+    }
+
+    #[test]
     fn filesystem_navigation_starts_search() {
-        let mut state = TreeViewState::default();
+        let mut state = TreeViewState {
+            top_most_offset: 12,
+            ..Default::default()
+        };
         let data: Vec<RawNode<FileMetadata>> = vec![];
         let mode = FileBrowserMode::Directory;
         let (tx, _rx) = mpsc::channel(1);
         let mut is_searching = false;
         let mut query = String::from("abc");
+        let mut search_mode = SearchMode::Fuzzy;
         let consumed = handle_filesystem_navigation(
             KeyCode::Char('/'),
             BrowserFilesystemNavContext {
@@ -2137,6 +2917,7 @@ mod tests {
                 browser_mode: &mode,
                 is_searching: &mut is_searching,
                 search_query: &mut query,
+                search_mode: &mut search_mode,
                 list_height: 5,
                 app_command_tx: &tx,
             },
@@ -2144,6 +2925,82 @@ mod tests {
         assert!(consumed);
         assert!(is_searching);
         assert!(query.is_empty());
+        assert_eq!(search_mode, SearchMode::Regex);
+        assert_eq!(state.top_most_offset, 0);
+    }
+
+    fn sample_preview_tree() -> Vec<RawNode<TorrentPreviewPayload>> {
+        vec![RawNode {
+            name: "root".to_string(),
+            full_path: PathBuf::from("root"),
+            children: vec![RawNode {
+                name: "group".to_string(),
+                full_path: PathBuf::from("root/group"),
+                children: vec![
+                    RawNode {
+                        name: "alpha.bin".to_string(),
+                        full_path: PathBuf::from("root/group/alpha.bin"),
+                        children: vec![],
+                        payload: TorrentPreviewPayload::default(),
+                        is_dir: false,
+                    },
+                    RawNode {
+                        name: "beta.bin".to_string(),
+                        full_path: PathBuf::from("root/group/beta.bin"),
+                        children: vec![],
+                        payload: TorrentPreviewPayload::default(),
+                        is_dir: false,
+                    },
+                ],
+                payload: TorrentPreviewPayload::default(),
+                is_dir: true,
+            }],
+            payload: TorrentPreviewPayload::default(),
+            is_dir: true,
+        }]
+    }
+
+    fn sample_filesystem_tree() -> Vec<RawNode<FileMetadata>> {
+        vec![RawNode {
+            name: "root".to_string(),
+            full_path: PathBuf::from("root"),
+            children: vec![RawNode {
+                name: "group".to_string(),
+                full_path: PathBuf::from("root/group"),
+                children: vec![
+                    RawNode {
+                        name: "alpha.bin".to_string(),
+                        full_path: PathBuf::from("root/group/alpha.bin"),
+                        children: vec![],
+                        payload: FileMetadata {
+                            size: 1,
+                            modified: std::time::UNIX_EPOCH,
+                        },
+                        is_dir: false,
+                    },
+                    RawNode {
+                        name: "beta.bin".to_string(),
+                        full_path: PathBuf::from("root/group/beta.bin"),
+                        children: vec![],
+                        payload: FileMetadata {
+                            size: 1,
+                            modified: std::time::UNIX_EPOCH,
+                        },
+                        is_dir: false,
+                    },
+                ],
+                payload: FileMetadata {
+                    size: 0,
+                    modified: std::time::UNIX_EPOCH,
+                },
+                is_dir: true,
+            }],
+            payload: FileMetadata {
+                size: 0,
+                modified: std::time::UNIX_EPOCH,
+            },
+            is_dir: true,
+        }]
     }
 
     #[test]
@@ -2239,6 +3096,7 @@ mod tests {
     #[test]
     fn reducer_dialog_escape_download_with_pending_cleans_then_exits() {
         let mode = FileBrowserMode::DownloadLocSelection {
+            target: DownloadSelectionTarget::PendingAdd,
             torrent_files: vec![],
             container_name: "x".to_string(),
             use_container: true,
@@ -2270,6 +3128,7 @@ mod tests {
     #[test]
     fn reducer_dialog_cancel_download_emits_async_cleanup_and_exit() {
         let mode = FileBrowserMode::DownloadLocSelection {
+            target: DownloadSelectionTarget::PendingAdd,
             torrent_files: vec![],
             container_name: "x".to_string(),
             use_container: true,

@@ -24,6 +24,8 @@ const UNLIMITED_RATE_LIMIT_BPS: u64 = crate::config::UNLIMITED_RATE_LIMIT_BPS;
 pub enum ConfigAction {
     SaveAndExit,
     StartEditOrBrowse,
+    ToggleSelectedBool,
+    SetSelectedBool(bool),
     MoveUp,
     MoveDown,
     ResetSelected,
@@ -100,6 +102,9 @@ fn map_key_to_config_action(
     match key_code {
         KeyCode::Esc | KeyCode::Char('Q') => Some(ConfigAction::SaveAndExit),
         KeyCode::Enter => Some(ConfigAction::StartEditOrBrowse),
+        KeyCode::Char(' ') => Some(ConfigAction::ToggleSelectedBool),
+        KeyCode::Char('t') => Some(ConfigAction::SetSelectedBool(true)),
+        KeyCode::Char('f') => Some(ConfigAction::SetSelectedBool(false)),
         KeyCode::Up | KeyCode::Char('k') => Some(ConfigAction::MoveUp),
         KeyCode::Down | KeyCode::Char('j') => Some(ConfigAction::MoveDown),
         KeyCode::Char('r') => Some(ConfigAction::ResetSelected),
@@ -134,6 +139,10 @@ pub fn reduce_config_action(
                 | ConfigItem::ClientPort => {
                     *editing = Some((selected_item, String::new()));
                 }
+                ConfigItem::AlwaysShowAddLocationPrompt => {
+                    settings_edit.always_show_add_location_prompt =
+                        !settings_edit.always_show_add_location_prompt;
+                }
                 ConfigItem::DefaultDownloadFolder | ConfigItem::WatchFolder => {
                     if shared_path_is_manual(selected_item) {
                         return result;
@@ -164,6 +173,19 @@ pub fn reduce_config_action(
                 }
             }
         }
+        ConfigAction::ToggleSelectedBool => {
+            result.consumed = true;
+            if items[*selected_index] == ConfigItem::AlwaysShowAddLocationPrompt {
+                settings_edit.always_show_add_location_prompt =
+                    !settings_edit.always_show_add_location_prompt;
+            }
+        }
+        ConfigAction::SetSelectedBool(value) => {
+            result.consumed = true;
+            if items[*selected_index] == ConfigItem::AlwaysShowAddLocationPrompt {
+                settings_edit.always_show_add_location_prompt = value;
+            }
+        }
         ConfigAction::MoveUp => {
             result.consumed = true;
             *selected_index = selected_index.saturating_sub(1);
@@ -190,6 +212,10 @@ pub fn reduce_config_action(
                 }
                 ConfigItem::WatchFolder => {
                     settings_edit.watch_folder = default_settings.watch_folder;
+                }
+                ConfigItem::AlwaysShowAddLocationPrompt => {
+                    settings_edit.always_show_add_location_prompt =
+                        default_settings.always_show_add_location_prompt;
                 }
                 ConfigItem::GlobalDownloadLimit => {
                     settings_edit.global_download_limit_bps =
@@ -339,6 +365,14 @@ pub fn draw(
                 "Torrent Watch Folder",
                 path_to_string(settings.watch_folder.as_deref()),
             ),
+            ConfigItem::AlwaysShowAddLocationPrompt => (
+                "Always Show Add Files/Location",
+                if settings.always_show_add_location_prompt {
+                    "[x] true".to_string()
+                } else {
+                    "[ ] false".to_string()
+                },
+            ),
             ConfigItem::GlobalDownloadLimit => (
                 "Global DL Limit",
                 format_limit_bps(settings.global_download_limit_bps),
@@ -408,6 +442,17 @@ pub fn draw(
                 ctx.apply(Style::default().fg(ctx.state_warning())),
             ),
             Span::raw(". Host-local fields still save here."),
+        ])
+    } else if items.get(selected_index) == Some(&ConfigItem::AlwaysShowAddLocationPrompt) {
+        Line::from(vec![
+            Span::styled("[t]", footer_key_style(ctx, ActionTone::Toggle)),
+            Span::raw(" true, "),
+            Span::styled("[f]", footer_key_style(ctx, ActionTone::Toggle)),
+            Span::raw(" false, "),
+            Span::styled("[Enter]|[Space]", footer_key_style(ctx, ActionTone::Toggle)),
+            Span::raw(" toggle. "),
+            Span::styled("[Esc]|[Q]", footer_key_style(ctx, ActionTone::Confirm)),
+            Span::raw(" to Save & Exit."),
         ])
     } else {
         Line::from(vec![
@@ -484,6 +529,7 @@ mod tests {
             ConfigItem::ClientPort,
             ConfigItem::DefaultDownloadFolder,
             ConfigItem::WatchFolder,
+            ConfigItem::AlwaysShowAddLocationPrompt,
             ConfigItem::GlobalDownloadLimit,
             ConfigItem::GlobalUploadLimit,
         ]
@@ -512,7 +558,7 @@ mod tests {
     #[test]
     fn reducer_edit_commit_updates_download_limit_and_emits_effect() {
         let mut settings = Box::new(Settings::default());
-        let mut idx = 3usize;
+        let mut idx = 4usize;
         let mut items = config_items();
         let mut editing = Some((ConfigItem::GlobalDownloadLimit, "123".to_string()));
 
@@ -533,7 +579,7 @@ mod tests {
     #[test]
     fn reducer_rate_limit_arrows_keep_unlimited_as_sentinel() {
         let mut settings = Box::new(Settings::default());
-        let mut idx = 3usize;
+        let mut idx = 4usize;
         let mut items = config_items();
         let mut editing = None;
 
@@ -581,7 +627,7 @@ mod tests {
     fn reducer_upload_rate_decrease_from_small_cap_returns_to_unlimited() {
         let mut settings = Box::new(Settings::default());
         settings.global_upload_limit_bps = RATE_LIMIT_STEP_BPS / 2;
-        let mut idx = 4usize;
+        let mut idx = 5usize;
         let mut items = config_items();
         let mut editing = None;
 
@@ -598,6 +644,44 @@ mod tests {
             out.effects.as_slice(),
             [ConfigEffect::SetUploadRate(UNLIMITED_RATE_LIMIT_BPS)]
         ));
+    }
+
+    #[test]
+    fn reducer_boolean_row_accepts_toggle_true_and_false() {
+        let mut settings = Box::new(Settings::default());
+        let mut idx = 3usize;
+        let mut items = config_items();
+        let mut editing = None;
+
+        let out = reduce_config_action(
+            ConfigAction::ToggleSelectedBool,
+            &mut settings,
+            &mut idx,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+        assert!(out.consumed);
+        assert!(settings.always_show_add_location_prompt);
+
+        let out = reduce_config_action(
+            ConfigAction::SetSelectedBool(false),
+            &mut settings,
+            &mut idx,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+        assert!(out.consumed);
+        assert!(!settings.always_show_add_location_prompt);
+
+        let out = reduce_config_action(
+            ConfigAction::SetSelectedBool(true),
+            &mut settings,
+            &mut idx,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+        assert!(out.consumed);
+        assert!(settings.always_show_add_location_prompt);
     }
 
     #[test]

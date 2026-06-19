@@ -10,7 +10,6 @@ use crate::app::torrent_is_effectively_incomplete;
 use crate::app::AppCommand;
 use crate::app::BrowserPane;
 use crate::app::ChartPanelView;
-use crate::app::FileBrowserMode;
 use crate::app::FilePriority;
 use crate::app::GraphDisplayMode;
 use crate::app::PeerInfo;
@@ -19,6 +18,7 @@ use crate::app::{
     App, AppMode, AppState, ConfigItem, RssScreen, SelectedHeader, TorrentControlState,
     TorrentDisplayState,
 };
+use crate::app::{DownloadSelectionTarget, FileBrowserMode};
 use crate::config::{PeerSortColumn, Settings, SortDirection, TorrentSortColumn};
 use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
 use crate::integrations::control::ControlRequest;
@@ -408,6 +408,7 @@ pub enum UiAction {
     GraphNext,
     GraphPrev,
     OpenAddTorrentBrowser,
+    OpenSelectedTorrentFiles,
     OpenDeleteConfirm { with_files: bool },
     OpenConfig,
     OpenRss,
@@ -429,6 +430,7 @@ pub enum UiEffect {
     ToPowerSaving,
     ToDeleteConfirm,
     OpenAddTorrentFileBrowser,
+    OpenExistingTorrentFileBrowser(Vec<u8>),
     OpenConfigScreen,
     OpenRssScreen,
     OpenJournalScreen,
@@ -522,6 +524,23 @@ pub fn reduce_ui_action(app_state: &mut AppState, action: UiAction) -> ReduceRes
             redraw: true,
             effects: vec![UiEffect::OpenAddTorrentFileBrowser],
         },
+        UiAction::OpenSelectedTorrentFiles => {
+            let selected_hash = app_state
+                .torrent_list_order
+                .get(app_state.ui.selected_torrent_index)
+                .cloned();
+            if let Some(info_hash) = selected_hash {
+                ReduceResult {
+                    redraw: true,
+                    effects: vec![UiEffect::OpenExistingTorrentFileBrowser(info_hash)],
+                }
+            } else {
+                ReduceResult {
+                    redraw: true,
+                    effects: Vec::new(),
+                }
+            }
+        }
         UiAction::OpenDeleteConfirm { with_files } => {
             if let Some(info_hash) = app_state
                 .torrent_list_order
@@ -743,6 +762,7 @@ fn map_key_to_ui_action(key: KeyEvent) -> Option<UiAction> {
         KeyCode::Char('t') => Some(UiAction::GraphNext),
         KeyCode::Char('T') => Some(UiAction::GraphPrev),
         KeyCode::Char('a') => Some(UiAction::OpenAddTorrentBrowser),
+        KeyCode::Char('f') => Some(UiAction::OpenSelectedTorrentFiles),
         KeyCode::Char('d') => Some(UiAction::OpenDeleteConfirm { with_files: false }),
         KeyCode::Char('D') => Some(UiAction::OpenDeleteConfirm { with_files: true }),
         KeyCode::Char('c') => Some(UiAction::OpenConfig),
@@ -6720,7 +6740,9 @@ async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
         PastedContent::Magnet(magnet_link) => {
             let download_path = app.client_configs.default_download_folder.clone();
 
-            if let Some(download_path) = download_path {
+            if let Some(download_path) =
+                download_path.filter(|_| !app.client_configs.always_show_add_location_prompt)
+            {
                 let request = app.prepare_add_magnet_request(
                     magnet_link.to_string(),
                     Some(download_path),
@@ -6738,6 +6760,7 @@ async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
                 let _ = app.app_command_tx.try_send(AppCommand::FetchFileTree {
                     path: initial_path,
                     browser_mode: FileBrowserMode::DownloadLocSelection {
+                        target: DownloadSelectionTarget::PendingAdd,
                         torrent_files: vec![],
                         container_name: String::new(),
                         use_container: false,
@@ -6753,7 +6776,12 @@ async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
             }
         }
         PastedContent::TorrentFile(path) => {
-            if let Some(download_path) = app.client_configs.default_download_folder.clone() {
+            if let Some(download_path) = app
+                .client_configs
+                .default_download_folder
+                .clone()
+                .filter(|_| !app.client_configs.always_show_add_location_prompt)
+            {
                 match app.prepare_add_torrent_file_request(
                     path.to_path_buf(),
                     Some(download_path),
@@ -6856,6 +6884,9 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
                 browser_mode: FileBrowserMode::File(vec![".torrent".to_string()]),
                 highlight_path: None,
             });
+        }
+        UiEffect::OpenExistingTorrentFileBrowser(info_hash) => {
+            app.open_existing_torrent_file_browser(info_hash);
         }
         UiEffect::OpenConfigScreen => {
             *app.app_state.ui.config.settings_edit = app.client_configs.clone();
@@ -8356,7 +8387,7 @@ mod tests {
         );
         assert_eq!(
             map_key_to_ui_action(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)),
-            None
+            Some(UiAction::OpenSelectedTorrentFiles)
         );
         assert_eq!(
             map_key_to_ui_action(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE)),
@@ -8446,6 +8477,23 @@ mod tests {
 
         assert!(result.redraw);
         assert_eq!(result.effects, vec![UiEffect::OpenAddTorrentFileBrowser]);
+    }
+
+    #[test]
+    fn reducer_open_selected_torrent_files_emits_selected_hash_effect() {
+        let mut app_state = AppState::default();
+        let first_hash = vec![1; 20];
+        let second_hash = vec![2; 20];
+        app_state.torrent_list_order = vec![first_hash, second_hash.clone()];
+        app_state.ui.selected_torrent_index = 1;
+
+        let result = reduce_ui_action(&mut app_state, UiAction::OpenSelectedTorrentFiles);
+
+        assert!(result.redraw);
+        assert_eq!(
+            result.effects,
+            vec![UiEffect::OpenExistingTorrentFileBrowser(second_hash)]
+        );
     }
 
     #[test]

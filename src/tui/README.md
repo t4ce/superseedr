@@ -66,7 +66,8 @@
 - `FileBrowser`:
   - `Y` confirms current action.
   - `Esc` returns to `Normal` or `Config` depending on browser mode.
-  - `/` enters browser search.
+  - `/` enters browser search for the active pane; while the search bar is active, `Tab` toggles fuzzy/regex instead of switching panes.
+  - Torrent preview pane: `Space` or `p` cycles the selected file/folder priority, `P` cycles all file priorities, `e` expands all, and `c` closes all.
 - `DeleteConfirm`: `Y` confirms and returns to `Normal`; `Esc` cancels.
 
 ## Navigation Contract (Minimal)
