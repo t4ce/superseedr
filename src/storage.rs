@@ -103,7 +103,6 @@ pub async fn create_and_allocate_files(
     let mut is_fresh_download = true;
 
     for file_info in &multi_file_info.files {
-        // Optimization: Don't allocate padding or skipped files
         if file_info.is_padding {
             continue;
         }
@@ -120,9 +119,19 @@ pub async fn create_and_allocate_files(
         {
             is_fresh_download = false;
         }
-        if file_info.is_skipped {
+    }
+
+    for file_info in &multi_file_info.files {
+        // Optimization: Don't allocate padding or skipped files
+        if file_info.is_padding || file_info.is_skipped {
             continue;
         }
+
+        let should_resize = |metadata: &std::fs::Metadata| {
+            metadata.is_file()
+                && metadata.len() != file_info.length
+                && (!is_fresh_download || metadata.len() > 0)
+        };
 
         // Ensure the parent directory for the file exists.
         if let Some(parent_dir) = file_info.path.parent() {
@@ -132,13 +141,12 @@ pub async fn create_and_allocate_files(
         }
 
         // Create fresh files without preallocating; some mounted filesystems can
-        // block indefinitely when resizing sparse placeholders up front.
+        // block indefinitely when resizing sparse placeholders up front. Once a
+        // download is known to be partial, however, zero-byte placeholders must
+        // be sized before validation/uploads can read their sparse zeroes as
+        // real in-span data.
         match fs::metadata(&file_info.path).await {
-            Ok(metadata)
-                if metadata.is_file()
-                    && metadata.len() > 0
-                    && metadata.len() != file_info.length =>
-            {
+            Ok(metadata) if should_resize(&metadata) => {
                 let file = OpenOptions::new()
                     .write(true)
                     .truncate(false)
@@ -155,7 +163,7 @@ pub async fn create_and_allocate_files(
                     .open(&file_info.path)
                     .await?;
                 let metadata = file.metadata().await?;
-                if metadata.is_file() && metadata.len() > 0 && metadata.len() != file_info.length {
+                if should_resize(&metadata) {
                     file.set_len(file_info.length).await?;
                 }
             }
@@ -539,6 +547,26 @@ mod tests {
         assert!(is_fresh);
         let metadata = tokio::fs::metadata(file_path).await.unwrap();
         assert_eq!(metadata.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_create_and_allocate_sizes_zero_placeholders_for_partial_download() {
+        let (_dir, mfi) = setup_multi_file();
+        tokio::fs::write(&mfi.files[0].path, b"partial")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(mfi.files[1].path.parent().unwrap())
+            .await
+            .unwrap();
+        File::create(&mfi.files[1].path).await.unwrap();
+
+        let is_fresh = create_and_allocate_files(&mfi).await.unwrap();
+
+        assert!(!is_fresh);
+        let metadata_a = tokio::fs::metadata(&mfi.files[0].path).await.unwrap();
+        assert_eq!(metadata_a.len(), mfi.files[0].length);
+        let metadata_b = tokio::fs::metadata(&mfi.files[1].path).await.unwrap();
+        assert_eq!(metadata_b.len(), mfi.files[1].length);
     }
 
     #[tokio::test]
