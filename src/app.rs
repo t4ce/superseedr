@@ -6024,35 +6024,24 @@ impl App {
                         return;
                     }
 
-                    // 2. Build the tree payloads
+                    // 2. Hydrate the tree structure
                     let file_list = torrent.file_list();
-                    let payloads: Vec<(Vec<String>, TorrentPreviewPayload)> = file_list
-                        .into_iter()
-                        .enumerate()
-                        .map(|(idx, (parts, size))| {
-                            (
-                                parts,
-                                TorrentPreviewPayload {
-                                    file_index: Some(idx),
-                                    size,
-                                    priority: FilePriority::Normal,
-                                },
-                            )
-                        })
-                        .collect();
+                    let has_multiple_files = file_list.len() > 1;
+                    let hydrated_file_priorities = match target {
+                        DownloadSelectionTarget::ExistingTorrent { .. } => file_priorities.clone(),
+                        DownloadSelectionTarget::PendingAdd => HashMap::new(),
+                    };
+                    *preview_tree =
+                        build_torrent_preview_tree(file_list, &hydrated_file_priorities);
 
-                    // 3. Hydrate the tree structure
-                    let has_multiple_files = payloads.len() > 1;
-                    *preview_tree = RawNode::from_path_list(None, payloads);
-
-                    // 4. Update Display Name and State
+                    // 3. Update Display Name and State
                     let info_hash_hex = hex::encode(&info_hash);
                     let name = format!("{} [{}]", torrent.info.name, &info_hash_hex);
                     *container_name = name.clone();
                     *original_name_backup = name;
                     *use_container = has_multiple_files;
 
-                    // 5. INITIALIZE UI STATE: Set the initial cursor
+                    // 4. INITIALIZE UI STATE: Set the initial cursor
                     if let Some(first) = preview_tree.first() {
                         preview_state.cursor_path = Some(std::path::PathBuf::from(&first.name));
                     }
@@ -12525,6 +12514,107 @@ mod tests {
             }
             _ => panic!("expected priority-only existing torrent browser"),
         }
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn metadata_loaded_preserves_existing_torrent_priority_overrides_in_empty_preview() {
+        fn record_leaf_priorities(
+            node: &RawNode<TorrentPreviewPayload>,
+            priorities_by_index: &mut HashMap<usize, FilePriority>,
+        ) {
+            if let Some(file_index) = node.payload.file_index {
+                priorities_by_index.insert(file_index, node.payload.priority);
+            }
+            for child in &node.children {
+                record_leaf_priorities(child, priorities_by_index);
+            }
+        }
+
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        let info_hash = vec![3; 20];
+        let file_priorities = HashMap::from([(0, FilePriority::Skip), (2, FilePriority::High)]);
+        app.app_state.torrents.insert(
+            info_hash.clone(),
+            TorrentDisplayState {
+                latest_state: TorrentMetrics {
+                    info_hash: info_hash.clone(),
+                    torrent_name: "Priority Hydration".to_string(),
+                    file_priorities,
+                    ..Default::default()
+                },
+                file_preview_tree: Vec::new(),
+                ..Default::default()
+            },
+        );
+        app.app_state.ui.file_browser.browser_mode = FileBrowserMode::DownloadLocSelection {
+            target: DownloadSelectionTarget::ExistingTorrent {
+                info_hash: info_hash.clone(),
+            },
+            torrent_files: Vec::new(),
+            container_name: String::new(),
+            use_container: false,
+            is_editing_name: false,
+            preview_tree: Vec::new(),
+            preview_state: Default::default(),
+            focused_pane: BrowserPane::TorrentPreview,
+            cursor_pos: 0,
+            original_name_backup: String::new(),
+        };
+
+        let torrent = crate::torrent_file::Torrent {
+            info: crate::torrent_file::Info {
+                name: "Priority Hydration".to_string(),
+                files: vec![
+                    crate::torrent_file::InfoFile {
+                        length: 10,
+                        path: vec!["group".to_string(), "skip.bin".to_string()],
+                        md5sum: None,
+                        attr: None,
+                    },
+                    crate::torrent_file::InfoFile {
+                        length: 20,
+                        path: vec!["group".to_string(), "normal.bin".to_string()],
+                        md5sum: None,
+                        attr: None,
+                    },
+                    crate::torrent_file::InfoFile {
+                        length: 30,
+                        path: vec!["group".to_string(), "high.bin".to_string()],
+                        md5sum: None,
+                        attr: None,
+                    },
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        app.handle_manager_event(ManagerEvent::MetadataLoaded {
+            info_hash: info_hash.clone(),
+            torrent: Box::new(torrent),
+        });
+
+        let FileBrowserMode::DownloadLocSelection { preview_tree, .. } =
+            &app.app_state.ui.file_browser.browser_mode
+        else {
+            panic!("expected download selection browser");
+        };
+        let mut priorities_by_index = HashMap::new();
+        for node in preview_tree {
+            record_leaf_priorities(node, &mut priorities_by_index);
+        }
+
+        assert_eq!(priorities_by_index.get(&0), Some(&FilePriority::Skip));
+        assert_eq!(priorities_by_index.get(&1), Some(&FilePriority::Normal));
+        assert_eq!(priorities_by_index.get(&2), Some(&FilePriority::High));
 
         let _ = app.shutdown_tx.send(());
     }
