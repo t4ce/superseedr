@@ -4,7 +4,7 @@
 use crate::app::{AppCommand, AppMode, AppState, RssScreen, RssSectionFocus};
 use crate::config::RssFilterMode;
 use crate::tui::action_style::{footer_key_style, ActionTone};
-use crate::tui::app_command::spawn_app_command_sender;
+use crate::tui::app_command::spawn_app_command_batch_sender;
 use crate::tui::formatters::centered_rect;
 use crate::tui::screen_context::ScreenContext;
 use crate::tui::screens::input_panel::draw_prompt_panel;
@@ -353,6 +353,30 @@ fn execute_rss_effects(
     fn set_rss_status(app_state: &mut AppState, message: impl Into<String>) {
         app_state.ui.rss.status_message = Some(message.into());
     }
+    fn try_send_app_commands_ordered(
+        app_state: &mut AppState,
+        app_command_tx: &mpsc::Sender<AppCommand>,
+        shutdown_tx: Option<&broadcast::Sender<()>>,
+        commands: Vec<AppCommand>,
+        failure_message: &str,
+    ) -> bool {
+        if let Some(shutdown_tx) = shutdown_tx {
+            spawn_app_command_batch_sender(
+                app_command_tx.clone(),
+                shutdown_tx.subscribe(),
+                commands,
+            );
+            true
+        } else {
+            for command in commands {
+                if app_command_tx.try_send(command).is_err() {
+                    set_rss_status(app_state, failure_message);
+                    return false;
+                }
+            }
+            true
+        }
+    }
     fn try_update_config(
         app_state: &mut AppState,
         app_command_tx: &mpsc::Sender<AppCommand>,
@@ -360,17 +384,13 @@ fn execute_rss_effects(
         new_settings: crate::config::Settings,
         success_message: Option<&str>,
     ) -> bool {
-        if let Some(shutdown_tx) = shutdown_tx {
-            spawn_app_command_sender(
-                app_command_tx.clone(),
-                shutdown_tx.subscribe(),
-                AppCommand::UpdateConfig(new_settings),
-            );
-        } else if app_command_tx
-            .try_send(AppCommand::UpdateConfig(new_settings))
-            .is_err()
-        {
-            set_rss_status(app_state, "RSS settings enqueue failed");
+        if !try_send_app_commands_ordered(
+            app_state,
+            app_command_tx,
+            shutdown_tx,
+            vec![AppCommand::UpdateConfig(new_settings)],
+            "RSS settings enqueue failed",
+        ) {
             return false;
         }
         if let Some(message) = success_message {
@@ -438,20 +458,28 @@ fn execute_rss_effects(
                 if !settings.rss.enabled {
                     let mut new_settings = settings.clone();
                     new_settings.rss.enabled = true;
-                    if !try_update_config(
+                    if try_send_app_commands_ordered(
                         app_state,
                         app_command_tx,
                         shutdown_tx,
-                        new_settings,
-                        None,
+                        vec![
+                            AppCommand::UpdateConfig(new_settings),
+                            AppCommand::RssSyncNow,
+                        ],
+                        "RSS sync enqueue failed",
                     ) {
-                        continue;
+                        set_rss_status(app_state, "RSS sync requested");
                     }
-                }
-                if app_command_tx.try_send(AppCommand::RssSyncNow).is_err() {
-                    set_rss_status(app_state, "RSS sync enqueue failed");
-                } else {
+                } else if try_send_app_commands_ordered(
+                    app_state,
+                    app_command_tx,
+                    shutdown_tx,
+                    vec![AppCommand::RssSyncNow],
+                    "RSS sync enqueue failed",
+                ) {
                     set_rss_status(app_state, "RSS sync requested");
+                } else {
+                    continue;
                 }
             }
             RssAction::InsertChar(c) => {
@@ -2453,6 +2481,35 @@ mod tests {
         }
 
         let second = rx.try_recv().expect("expected second command");
+        assert!(matches!(second, AppCommand::RssSyncNow));
+    }
+
+    #[tokio::test]
+    async fn sync_key_with_shutdown_batches_enable_before_sync() {
+        let mut app_state = base_state();
+        let mut settings = crate::config::Settings::default();
+        settings.rss.enabled = false;
+        let (tx, mut rx) = mpsc::channel(4);
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        handle_event_inner(
+            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+                KeyCode::Char('s'),
+                ratatui::crossterm::event::KeyModifiers::NONE,
+            )),
+            &mut app_state,
+            &settings,
+            &tx,
+            Some(&shutdown_tx),
+        );
+
+        let first = rx.recv().await.expect("expected first command");
+        match first {
+            AppCommand::UpdateConfig(s) => assert!(s.rss.enabled),
+            _ => panic!("expected enable config update before sync"),
+        }
+
+        let second = rx.recv().await.expect("expected second command");
         assert!(matches!(second, AppCommand::RssSyncNow));
     }
 
