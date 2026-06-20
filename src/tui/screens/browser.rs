@@ -1132,6 +1132,7 @@ pub enum BrowserDialogEffect {
 pub enum BrowserTransition {
     ToNormal,
     ToConfig,
+    Close,
 }
 
 pub struct BrowserDialogReduceResult {
@@ -1958,6 +1959,7 @@ fn apply_browser_transition(app: &mut App, transition: BrowserTransition) {
                 .return_to_torrent_management_on_close = false;
             app.app_state.mode = AppMode::Config;
         }
+        BrowserTransition::Close => apply_browser_close_transition(app),
     }
 }
 
@@ -2096,72 +2098,71 @@ pub async fn execute_confirm_decision(
             app.app_state.ui.config = config_ui;
             Some(BrowserTransition::ToConfig)
         }
-        ConfirmDecision::Download(payload) => {
-            match payload.target {
-                DownloadSelectionTarget::PendingAdd => {
-                    if let Some(pending_path) = app.app_state.pending_torrent_path.take() {
-                        match app.prepare_add_torrent_file_request(
-                            pending_path,
-                            Some(payload.base_path.clone()),
-                            payload.container_name_to_use.clone(),
-                            payload.file_priorities.clone(),
-                        ) {
-                            Ok(request) => {
-                                spawn_app_command_sender(
-                                    app.app_command_tx.clone(),
-                                    app.shutdown_tx.subscribe(),
-                                    AppCommand::SubmitControlRequest(request),
-                                );
-                            }
-                            Err(error) => {
-                                app.app_state.system_error = Some(error);
-                            }
+        ConfirmDecision::Download(payload) => match payload.target {
+            DownloadSelectionTarget::PendingAdd => {
+                if let Some(pending_path) = app.app_state.pending_torrent_path.take() {
+                    match app.prepare_add_torrent_file_request(
+                        pending_path,
+                        Some(payload.base_path.clone()),
+                        payload.container_name_to_use.clone(),
+                        payload.file_priorities.clone(),
+                    ) {
+                        Ok(request) => {
+                            spawn_app_command_sender(
+                                app.app_command_tx.clone(),
+                                app.shutdown_tx.subscribe(),
+                                AppCommand::SubmitControlRequest(request),
+                            );
                         }
-                    } else if !app.app_state.pending_torrent_link.is_empty() {
-                        let request = app.prepare_add_magnet_request(
-                            app.app_state.pending_torrent_link.clone(),
-                            Some(payload.base_path),
-                            payload.container_name_to_use,
-                            payload.file_priorities,
-                        );
-                        spawn_app_command_sender(
-                            app.app_command_tx.clone(),
-                            app.shutdown_tx.subscribe(),
-                            AppCommand::SubmitControlRequest(request),
-                        );
-                        app.app_state.pending_torrent_link.clear();
-                    } else {
-                        tracing::warn!(target: "superseedr", "SHIFT+Y pressed but no pending content was found");
+                        Err(error) => {
+                            app.app_state.system_error = Some(error);
+                        }
                     }
-                }
-                DownloadSelectionTarget::ExistingTorrent { info_hash } => {
-                    let file_priorities = if payload.has_preview_files {
-                        payload.file_priorities
-                    } else {
-                        existing_torrent_priorities(app, &info_hash)
-                    };
-                    let existing = app.app_state.torrents.get(&info_hash).map(|torrent| {
-                        (
-                            torrent.latest_state.download_path.clone(),
-                            torrent.latest_state.container_name.clone(),
-                        )
-                    });
-                    let (download_path, container_name) = existing.unwrap_or_default();
-                    let request = ControlRequest::SetTorrentConfig {
-                        info_hash_hex: hex::encode(info_hash),
-                        download_path,
-                        container_name,
-                        file_priorities: priority_overrides(file_priorities),
-                    };
+                } else if !app.app_state.pending_torrent_link.is_empty() {
+                    let request = app.prepare_add_magnet_request(
+                        app.app_state.pending_torrent_link.clone(),
+                        Some(payload.base_path),
+                        payload.container_name_to_use,
+                        payload.file_priorities,
+                    );
                     spawn_app_command_sender(
                         app.app_command_tx.clone(),
                         app.shutdown_tx.subscribe(),
                         AppCommand::SubmitControlRequest(request),
                     );
+                    app.app_state.pending_torrent_link.clear();
+                } else {
+                    tracing::warn!(target: "superseedr", "SHIFT+Y pressed but no pending content was found");
                 }
+                Some(BrowserTransition::ToNormal)
             }
-            Some(BrowserTransition::ToNormal)
-        }
+            DownloadSelectionTarget::ExistingTorrent { info_hash } => {
+                let file_priorities = if payload.has_preview_files {
+                    payload.file_priorities
+                } else {
+                    existing_torrent_priorities(app, &info_hash)
+                };
+                let existing = app.app_state.torrents.get(&info_hash).map(|torrent| {
+                    (
+                        torrent.latest_state.download_path.clone(),
+                        torrent.latest_state.container_name.clone(),
+                    )
+                });
+                let (download_path, container_name) = existing.unwrap_or_default();
+                let request = ControlRequest::SetTorrentConfig {
+                    info_hash_hex: hex::encode(info_hash),
+                    download_path,
+                    container_name,
+                    file_priorities: priority_overrides(file_priorities),
+                };
+                spawn_app_command_sender(
+                    app.app_command_tx.clone(),
+                    app.shutdown_tx.subscribe(),
+                    AppCommand::SubmitControlRequest(request),
+                );
+                Some(BrowserTransition::Close)
+            }
+        },
         ConfirmDecision::File(path) => {
             if path
                 .file_name()
@@ -2424,6 +2425,20 @@ mod tests {
         .await;
 
         assert!(matches!(app.app_state.mode, AppMode::Normal));
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn confirm_existing_torrent_browser_returns_to_torrent_management_origin() {
+        let mut app = app_with_existing_torrent(AppMode::TorrentManagement).await;
+
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::NONE)),
+            &mut app,
+        )
+        .await;
+
+        assert!(matches!(app.app_state.mode, AppMode::TorrentManagement));
         let _ = app.shutdown_tx.send(());
     }
 
