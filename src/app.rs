@@ -48,6 +48,7 @@ use crate::persistence::rss::{load_rss_state, save_rss_state, RssPersistedState}
 
 use crate::token_bucket::{rate_limit_bps_to_bucket_bytes_per_sec, TokenBucket};
 
+use crate::tui::app_command::spawn_app_command_sender;
 use crate::tui::effects::compute_effects_activity_speed_multiplier;
 use crate::tui::events;
 use crate::tui::layout::common::{ColumnId, PeerColumnId};
@@ -159,6 +160,7 @@ const WATCH_FOLDER_RESCAN_INTERVAL_SECS: u64 = 5;
 const SHARED_ROLE_RETRY_INTERVAL_SECS: u64 = 2;
 const STARTUP_ROLLING_BATCH_INTERVAL_SECS: u64 = 1;
 const STARTUP_ROLLING_LOADS_PER_INTERVAL: usize = 1;
+const REPEATED_HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 const SHUTDOWN_TIMEOUT_SECS: u64 = 20;
 const INCOMING_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
@@ -461,6 +463,15 @@ pub enum BrowserPane {
 }
 
 #[derive(Default, Debug, Clone, PartialEq)]
+pub enum DownloadSelectionTarget {
+    #[default]
+    PendingAdd,
+    ExistingTorrent {
+        info_hash: Vec<u8>,
+    },
+}
+
+#[derive(Default, Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum FileBrowserMode {
     #[default]
@@ -468,6 +479,7 @@ pub enum FileBrowserMode {
     File(Vec<String>), // User must pick a file matching these extensions (e.g. vec!["torrent"])
     // Future proofing: You could add 'AnyFile' or 'FileOrFolder' here later
     DownloadLocSelection {
+        target: DownloadSelectionTarget,
         torrent_files: Vec<String>, // List of relative file paths in the torrent
         container_name: String,     // Name of the container folder (e.g. hash_name)
         use_container: bool,        // Toggle state
@@ -492,7 +504,7 @@ pub struct FileMetadata {
     pub modified: std::time::SystemTime,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DataRate {
     RateQuarter,
     RateHalf,
@@ -787,11 +799,14 @@ pub enum AppCommand {
     ClientShutdown(PathBuf),
     PortFileChanged(PathBuf),
     FetchFileTree {
+        browser_generation: u64,
         path: PathBuf,
         browser_mode: FileBrowserMode,
         highlight_path: Option<PathBuf>,
     },
     UpdateFileBrowserData {
+        request_id: u64,
+        path: PathBuf,
         data: Vec<tree::RawNode<FileMetadata>>,
         highlight_path: Option<PathBuf>,
     },
@@ -918,6 +933,7 @@ pub enum ConfigItem {
     ClientPort,
     DefaultDownloadFolder,
     WatchFolder,
+    AlwaysShowAddLocationPrompt,
     GlobalDownloadLimit,
     GlobalUploadLimit,
 }
@@ -930,6 +946,7 @@ pub enum AppMode {
     Normal,
     Help,
     Journal,
+    TorrentManagement,
     PowerSaving,
     DeleteConfirm,
     Config,
@@ -1019,7 +1036,7 @@ pub enum RssSectionFocus {
     Explorer,
 }
 
-#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum TorrentControlState {
     #[default]
     Running,
@@ -1158,6 +1175,7 @@ impl Default for TorrentMetrics {
 #[derive(Default, Debug)]
 pub struct TorrentDisplayState {
     pub latest_state: TorrentMetrics,
+    pub added_at_unix_secs: Option<u64>,
     pub file_preview_tree: Vec<RawNode<TorrentPreviewPayload>>,
     pub recent_file_activity: HashMap<String, RecentFileActivity>,
     pub latest_file_probe_status: Option<TorrentFileProbeStatus>,
@@ -1480,13 +1498,14 @@ pub struct UiState {
     pub selected_header: SelectedHeader,
     pub selected_torrent_index: usize,
     pub selected_peer_index: usize,
-    pub show_torrent_files: bool,
     pub is_searching: bool,
     pub search_query: String,
     pub config: ConfigUiState,
     pub delete_confirm: DeleteConfirmUiState,
     pub file_browser: FileBrowserUiState,
+    pub help: HelpUiState,
     pub journal: JournalUiState,
+    pub torrent_management: TorrentManagementUiState,
     pub normal_paste_burst: PasteBurst,
     #[allow(dead_code)]
     pub rss: RssUiState,
@@ -1566,13 +1585,75 @@ pub struct DeleteConfirmUiState {
     pub with_files: bool,
 }
 
-#[derive(Default)]
 pub struct FileBrowserUiState {
     pub state: TreeViewState,
     pub data: Vec<RawNode<FileMetadata>>,
     pub browser_mode: FileBrowserMode,
+    pub search_state: BrowserSearchState,
+    pub search_query: String,
+    pub search_mode: SearchMode,
+    pub fetch_request_id: u64,
+    pub browser_generation: u64,
+    pub return_to_torrent_management_on_close: bool,
+}
+
+impl Default for FileBrowserUiState {
+    fn default() -> Self {
+        Self {
+            state: TreeViewState::default(),
+            data: Vec::new(),
+            browser_mode: FileBrowserMode::default(),
+            search_state: BrowserSearchState::default(),
+            search_query: String::new(),
+            search_mode: SearchMode::Regex,
+            fetch_request_id: 0,
+            browser_generation: 0,
+            return_to_torrent_management_on_close: false,
+        }
+    }
+}
+
+impl FileBrowserUiState {
+    pub fn next_browser_generation(&mut self) -> u64 {
+        self.browser_generation = self.browser_generation.wrapping_add(1);
+        self.browser_generation
+    }
+
+    pub fn invalidate_browser_generation(&mut self) {
+        let _ = self.next_browser_generation();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HelpSection {
+    #[default]
+    General,
+    Torrents,
+    Graphs,
+    Legends,
+    Screens,
+    Paths,
+    Build,
+}
+
+pub struct HelpUiState {
+    pub active_section: HelpSection,
+    pub scroll_offset: usize,
     pub is_searching: bool,
     pub search_query: String,
+    pub search_mode: SearchMode,
+}
+
+impl Default for HelpUiState {
+    fn default() -> Self {
+        Self {
+            active_section: HelpSection::default(),
+            scroll_offset: 0,
+            is_searching: false,
+            search_query: String::new(),
+            search_mode: SearchMode::Regex,
+        }
+    }
 }
 
 pub fn build_torrent_preview_tree(
@@ -1614,7 +1695,8 @@ fn build_torrent_preview_tree_from_entries(
         })
         .collect();
 
-    let tree = RawNode::from_path_list(None, preview_payloads);
+    let mut tree = RawNode::from_path_list(None, preview_payloads);
+    refresh_torrent_preview_directory_priorities(&mut tree);
     tracing::debug!(
         target: "superseedr",
         file_count,
@@ -1622,6 +1704,38 @@ fn build_torrent_preview_tree_from_entries(
         "Built torrent preview tree"
     );
     tree
+}
+
+pub fn refresh_torrent_preview_directory_priorities(nodes: &mut [RawNode<TorrentPreviewPayload>]) {
+    for node in nodes {
+        refresh_torrent_preview_node_priority(node);
+    }
+}
+
+fn refresh_torrent_preview_node_priority(
+    node: &mut RawNode<TorrentPreviewPayload>,
+) -> FilePriority {
+    if !node.is_dir {
+        return node.payload.priority;
+    }
+
+    let mut common = None;
+    let mut mixed = false;
+    for child in &mut node.children {
+        let child_priority = refresh_torrent_preview_node_priority(child);
+        match common {
+            Some(priority) if priority != child_priority => mixed = true,
+            Some(_) => {}
+            None => common = Some(child_priority),
+        }
+    }
+
+    node.payload.priority = if mixed {
+        FilePriority::Mixed
+    } else {
+        common.unwrap_or(node.payload.priority)
+    };
+    node.payload.priority
 }
 
 fn collect_torrent_preview_files(
@@ -1699,6 +1813,71 @@ pub struct JournalUiState {
     pub filter: JournalFilter,
     pub selected_index: usize,
     pub status_message: Option<String>,
+}
+
+pub struct TorrentManagementUiState {
+    pub selected_index: usize,
+    pub selected_hashes: HashSet<Vec<u8>>,
+    pub pending_commands: Vec<TorrentManagementPendingCommand>,
+    pub is_searching: bool,
+    pub search_query: String,
+    pub search_mode: SearchMode,
+    pub selected_column_index: usize,
+    pub sort_column_index: Option<usize>,
+    pub sort_direction: SortDirection,
+    pub status_message: Option<String>,
+    pub confirm_submit: bool,
+}
+
+impl Default for TorrentManagementUiState {
+    fn default() -> Self {
+        Self {
+            selected_index: 0,
+            selected_hashes: HashSet::new(),
+            pending_commands: Vec::new(),
+            is_searching: false,
+            search_query: String::new(),
+            search_mode: SearchMode::Regex,
+            selected_column_index: 1,
+            sort_column_index: Some(1),
+            sort_direction: SortDirection::Ascending,
+            status_message: None,
+            confirm_submit: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SearchMode {
+    #[default]
+    Fuzzy,
+    Regex,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BrowserSearchState {
+    #[default]
+    Closed,
+    Editing,
+    Applied,
+}
+
+impl BrowserSearchState {
+    pub fn is_editing(self) -> bool {
+        matches!(self, Self::Editing)
+    }
+
+    pub fn is_visible(self) -> bool {
+        !matches!(self, Self::Closed)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TorrentManagementPendingCommand {
+    pub info_hash: Vec<u8>,
+    pub request: ControlRequest,
+    pub state: TorrentControlState,
+    pub delete_files: bool,
 }
 
 #[derive(Default)]
@@ -2260,6 +2439,8 @@ pub struct App {
     pub next_startup_load_at: Option<time::Instant>,
     pub last_dht_peer_slot_usage: Option<(usize, usize)>,
     persisted_torrent_metadata_cache: HashMap<Vec<u8>, TorrentMetadataEntry>,
+    data_availability_fault_log_cooldowns: HashMap<Vec<u8>, LogCooldown>,
+    probe_available_log_cooldowns: HashMap<Vec<u8>, LogCooldown>,
 }
 
 #[derive(Clone)]
@@ -2281,6 +2462,25 @@ pub struct PersistPayload {
     pub network_history: Option<NetworkHistoryPersistRequest>,
     pub activity_history: Option<ActivityHistoryPersistRequest>,
     pub event_journal_state: EventJournalState,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LogCooldown {
+    last_logged_at: Option<Instant>,
+}
+
+impl LogCooldown {
+    fn should_log(&mut self, now: Instant, interval: Duration) -> bool {
+        if self
+            .last_logged_at
+            .is_some_and(|last_logged_at| now.duration_since(last_logged_at) < interval)
+        {
+            return false;
+        }
+
+        self.last_logged_at = Some(now);
+        true
+    }
 }
 
 fn initial_cluster_role_for_runtime_mode(runtime_mode: AppRuntimeMode) -> Option<AppClusterRole> {
@@ -2473,6 +2673,7 @@ fn spawn_persistence_writer(
     let (persistence_tx, mut persistence_rx) = watch::channel::<Option<PersistPayload>>(None);
     let persistence_app_command_tx = app_command_tx.clone();
     let persistence_task = tokio::spawn(async move {
+        let mut persistence_error_log_cooldowns: HashMap<String, LogCooldown> = HashMap::new();
         while persistence_rx.changed().await.is_ok() {
             let Some(payload) = persistence_rx.borrow().clone() else {
                 continue;
@@ -2526,7 +2727,13 @@ fn spawn_persistence_writer(
                     }
                 }
                 Ok(Err(e)) => {
-                    tracing_event!(Level::ERROR, "{}", e);
+                    if persistence_error_log_cooldowns
+                        .entry(e.clone())
+                        .or_default()
+                        .should_log(Instant::now(), REPEATED_HEALTH_LOG_INTERVAL)
+                    {
+                        tracing_event!(Level::ERROR, "{}", e);
+                    }
                     if let Some(request_id) = network_history_request_id {
                         let _ = persistence_app_command_tx
                             .send(AppCommand::NetworkHistoryPersisted {
@@ -2701,6 +2908,7 @@ impl App {
             peer_sort: (client_configs.peer_sort_column, peer_sort_direction),
             torrent_sort_pinned: client_configs.torrent_sort_pinned,
             peer_sort_pinned: client_configs.peer_sort_pinned,
+            data_rate: client_configs.ui_refresh_rate,
             rss_runtime: RssRuntimeState {
                 history: persisted_rss_state.history,
                 preview_items: Vec::new(),
@@ -2807,6 +3015,8 @@ impl App {
             next_startup_load_at: None,
             last_dht_peer_slot_usage: None,
             persisted_torrent_metadata_cache,
+            data_availability_fault_log_cooldowns: HashMap::new(),
+            probe_available_log_cooldowns: HashMap::new(),
         };
         app.sync_cluster_role_label();
         app.refresh_system_warning();
@@ -2815,12 +3025,16 @@ impl App {
 
         let mut torrents_to_load = app.client_configs.torrents.clone();
         torrents_to_load.sort_by_key(|t| !t.validation_status);
+        let mut running_torrents_started = 0usize;
         for torrent_config in torrents_to_load {
-            let should_defer_running_torrent = matches!(
+            let is_running = matches!(
                 torrent_config.torrent_control_state,
                 TorrentControlState::Running
-            ) && !app
-                .should_suppress_follower_runtime_for_torrent(&torrent_config);
+            );
+            let should_roll_running_torrent =
+                is_running && !app.should_suppress_follower_runtime_for_torrent(&torrent_config);
+            let should_defer_running_torrent = should_roll_running_torrent
+                && running_torrents_started >= STARTUP_ROLLING_LOADS_PER_INTERVAL;
 
             if should_defer_running_torrent {
                 if let Some(info_hash) =
@@ -2840,6 +3054,9 @@ impl App {
                 }
             } else {
                 if app.load_runtime_torrent_from_settings(torrent_config).await {
+                    if should_roll_running_torrent {
+                        running_torrents_started = running_torrents_started.saturating_add(1);
+                    }
                     app.startup_loaded_torrent_count =
                         app.startup_loaded_torrent_count.saturating_add(1);
                 }
@@ -2914,6 +3131,7 @@ impl App {
                 activity_message: "Reader mode waiting for leader status".to_string(),
                 ..Default::default()
             },
+            added_at_unix_secs: torrent.added_at_unix_secs,
             ..Default::default()
         })
     }
@@ -2997,6 +3215,9 @@ impl App {
     }
 
     async fn start_missing_runtime_torrents_for_current_role(&mut self) {
+        let mut running_torrents_started = 0usize;
+        let mut deferred_torrent_added = false;
+
         for torrent in self.client_configs.torrents.clone() {
             let Some(info_hash) = info_hash_from_torrent_source(&torrent.torrent_or_magnet) else {
                 continue;
@@ -3004,12 +3225,40 @@ impl App {
             if self.has_live_runtime_for_torrent(&info_hash) {
                 continue;
             }
+            if self
+                .startup_deferred_load_queue
+                .iter()
+                .any(|queued_hash| queued_hash == &info_hash)
+            {
+                continue;
+            }
             if self.should_suppress_follower_runtime_for_torrent(&torrent) {
                 self.ensure_display_only_torrent_from_settings(&torrent);
                 continue;
             }
-            self.load_runtime_torrent_from_settings(torrent).await;
+            let is_running = matches!(torrent.torrent_control_state, TorrentControlState::Running);
+            if is_running
+                && (running_torrents_started >= STARTUP_ROLLING_LOADS_PER_INTERVAL
+                    || !self.startup_deferred_load_queue.is_empty())
+            {
+                self.startup_deferred_load_queue.push_back(info_hash);
+                deferred_torrent_added = true;
+                continue;
+            }
+
+            if self.load_runtime_torrent_from_settings(torrent).await {
+                if is_running {
+                    running_torrents_started = running_torrents_started.saturating_add(1);
+                }
+                self.startup_loaded_torrent_count =
+                    self.startup_loaded_torrent_count.saturating_add(1);
+            }
         }
+
+        if deferred_torrent_added {
+            self.reschedule_startup_load_deadline();
+        }
+        self.maybe_log_startup_load_summary();
     }
 
     pub fn is_shared_mode_enabled(&self) -> bool {
@@ -3340,6 +3589,13 @@ impl App {
             }
         };
 
+        if self.client_configs.always_show_add_location_prompt
+            && !is_host_watch_path
+            && !is_shared_inbox_path
+        {
+            return AddIngressAction::OpenManualBrowser { payload };
+        }
+
         if self.is_current_shared_follower()
             && !is_shared_inbox_path
             && self.client_configs.default_download_folder.is_some()
@@ -3490,10 +3746,13 @@ impl App {
 
         self.app_state.pending_torrent_path = Some(final_path);
         let initial_path = self.get_initial_destination_path();
+        let browser_generation = self.app_state.ui.file_browser.next_browser_generation();
 
-        let _ = self.app_command_tx.try_send(AppCommand::FetchFileTree {
+        self.queue_app_command(AppCommand::FetchFileTree {
+            browser_generation,
             path: initial_path,
             browser_mode: FileBrowserMode::DownloadLocSelection {
+                target: DownloadSelectionTarget::PendingAdd,
                 torrent_files: vec![],
                 container_name: default_container_name.clone(),
                 use_container: should_enclose,
@@ -3521,9 +3780,13 @@ impl App {
                 } else {
                     self.app_state.pending_torrent_path = Some(source_path);
                     let initial_path = self.get_initial_destination_path();
-                    let _ = self.app_command_tx.try_send(AppCommand::FetchFileTree {
+                    let browser_generation =
+                        self.app_state.ui.file_browser.next_browser_generation();
+                    self.queue_app_command(AppCommand::FetchFileTree {
+                        browser_generation,
                         path: initial_path,
                         browser_mode: FileBrowserMode::DownloadLocSelection {
+                            target: DownloadSelectionTarget::PendingAdd,
                             torrent_files: vec![],
                             container_name: "New Torrent".to_string(),
                             use_container: true,
@@ -3542,9 +3805,12 @@ impl App {
             ResolvedAddPayload::MagnetLink { magnet_link } => {
                 self.app_state.pending_torrent_link = magnet_link;
                 let initial_path = self.get_initial_destination_path();
-                let _ = self.app_command_tx.try_send(AppCommand::FetchFileTree {
+                let browser_generation = self.app_state.ui.file_browser.next_browser_generation();
+                self.queue_app_command(AppCommand::FetchFileTree {
+                    browser_generation,
                     path: initial_path,
                     browser_mode: FileBrowserMode::DownloadLocSelection {
+                        target: DownloadSelectionTarget::PendingAdd,
                         torrent_files: vec![],
                         container_name: "Magnet Download".to_string(),
                         use_container: true,
@@ -3558,6 +3824,97 @@ impl App {
                     highlight_path: None,
                 });
                 Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn open_existing_torrent_file_browser(&mut self, info_hash: Vec<u8>) {
+        let Some(display) = self.app_state.torrents.get(&info_hash) else {
+            return;
+        };
+        let return_to_torrent_management_on_close =
+            matches!(self.app_state.mode, AppMode::TorrentManagement);
+        let metrics = display.latest_state.clone();
+        let mut preview_tree = display.file_preview_tree.clone();
+        if preview_tree.is_empty() {
+            if let Some(metadata) = self.persisted_torrent_metadata_cache.get(&info_hash) {
+                let files = metadata
+                    .files
+                    .iter()
+                    .map(|file| {
+                        (
+                            file.relative_path
+                                .split('/')
+                                .filter(|segment| !segment.is_empty())
+                                .map(|segment| segment.to_string())
+                                .collect::<Vec<_>>(),
+                            file.length,
+                        )
+                    })
+                    .collect();
+                preview_tree = build_torrent_preview_tree(files, &metrics.file_priorities);
+            }
+        }
+
+        let mut preview_state = TreeViewState::new();
+        for node in &preview_tree {
+            node.expand_all(&mut preview_state);
+        }
+        preview_state.cursor_path = preview_tree.first().map(|node| node.full_path.clone());
+
+        let initial_path = metrics
+            .download_path
+            .clone()
+            .or_else(|| self.client_configs.default_download_folder.clone())
+            .unwrap_or_else(|| self.get_initial_destination_path());
+
+        self.app_state.pending_torrent_path = None;
+        self.app_state.pending_torrent_link.clear();
+        self.app_state
+            .ui
+            .file_browser
+            .invalidate_browser_generation();
+        self.app_state.ui.file_browser.state = TreeViewState {
+            current_path: initial_path,
+            ..TreeViewState::default()
+        };
+        self.app_state.ui.file_browser.data.clear();
+        self.app_state.ui.file_browser.search_state = BrowserSearchState::Closed;
+        self.app_state.ui.file_browser.search_query.clear();
+        self.app_state
+            .ui
+            .file_browser
+            .return_to_torrent_management_on_close = return_to_torrent_management_on_close;
+        self.app_state.ui.file_browser.browser_mode = FileBrowserMode::DownloadLocSelection {
+            target: DownloadSelectionTarget::ExistingTorrent { info_hash },
+            torrent_files: vec![],
+            container_name: String::new(),
+            use_container: false,
+            is_editing_name: false,
+            preview_tree,
+            preview_state,
+            focused_pane: BrowserPane::TorrentPreview,
+            cursor_pos: 0,
+            original_name_backup: String::new(),
+        };
+        self.app_state.mode = AppMode::FileBrowser;
+    }
+
+    fn queue_app_command(&self, command: AppCommand) {
+        match self.app_command_tx.try_send(command) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(command)) => {
+                spawn_app_command_sender(
+                    self.app_command_tx.clone(),
+                    self.shutdown_tx.subscribe(),
+                    command,
+                );
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_command)) => {
+                tracing_event!(
+                    Level::WARN,
+                    "App command channel closed while queuing app command"
+                );
             }
         }
     }
@@ -4749,9 +5106,9 @@ impl App {
                 torrent_config.torrent_or_magnet.clone(),
                 torrent_config.download_path.clone(),
                 torrent_config.validation_status,
-                torrent_config.torrent_control_state,
-                torrent_config.file_priorities,
-                torrent_config.container_name,
+                torrent_config.torrent_control_state.clone(),
+                torrent_config.file_priorities.clone(),
+                torrent_config.container_name.clone(),
             )
             .await
         } else {
@@ -4759,17 +5116,21 @@ impl App {
                 PathBuf::from(&torrent_config.torrent_or_magnet),
                 torrent_config.download_path.clone(),
                 torrent_config.validation_status,
-                torrent_config.torrent_control_state,
+                torrent_config.torrent_control_state.clone(),
                 torrent_config.file_priorities.clone(),
-                torrent_config.container_name,
+                torrent_config.container_name.clone(),
             )
             .await
         };
 
-        matches!(
+        let restored = matches!(
             ingest_result,
             CommandIngestResult::Added { .. } | CommandIngestResult::Duplicate { .. }
-        )
+        );
+        if restored {
+            preserve_restored_added_at(&mut self.app_state, &torrent_config);
+        }
+        restored
     }
 
     async fn sync_runtime_torrents_from_settings(
@@ -4809,6 +5170,7 @@ impl App {
                     .clone()
                     .or_else(|| new_settings.default_download_folder.clone());
                 runtime.latest_state.container_name = torrent.container_name.clone();
+                runtime.added_at_unix_secs = torrent.added_at_unix_secs;
                 let updated_file_priorities = torrent.file_priorities.clone();
                 runtime.latest_state.file_priorities = updated_file_priorities.clone();
                 if !runtime.file_preview_tree.is_empty() {
@@ -4823,7 +5185,8 @@ impl App {
 
             if self.should_suppress_follower_runtime_for_torrent(torrent) {
                 if let Some(manager_tx) = self.torrent_manager_command_txs.get(info_hash) {
-                    let _ = manager_tx.try_send(ManagerCommand::Shutdown);
+                    self.send_manager_command_until_shutdown(manager_tx, ManagerCommand::Shutdown)
+                        .await;
                 }
                 self.ensure_display_only_torrent_from_settings(torrent);
                 continue;
@@ -4847,7 +5210,8 @@ impl App {
                         }
                     };
                     if let Some(command) = command {
-                        let _ = manager_tx.try_send(command);
+                        self.send_manager_command_until_shutdown(manager_tx, command)
+                            .await;
                     }
                 }
             }
@@ -4863,11 +5227,15 @@ impl App {
                     .or_else(|| new_settings.default_download_folder.clone())
                 {
                     if let Some(manager_tx) = self.torrent_manager_command_txs.get(info_hash) {
-                        let _ = manager_tx.try_send(ManagerCommand::SetUserTorrentConfig {
-                            torrent_data_path,
-                            file_priorities: torrent.file_priorities.clone(),
-                            container_name: torrent.container_name.clone(),
-                        });
+                        self.send_manager_command_until_shutdown(
+                            manager_tx,
+                            ManagerCommand::SetUserTorrentConfig {
+                                torrent_data_path,
+                                file_priorities: torrent.file_priorities.clone(),
+                                container_name: torrent.container_name.clone(),
+                            },
+                        )
+                        .await;
                     }
                 }
             }
@@ -4879,7 +5247,8 @@ impl App {
             }
 
             if let Some(manager_tx) = self.torrent_manager_command_txs.get(info_hash) {
-                let _ = manager_tx.try_send(ManagerCommand::Shutdown);
+                self.send_manager_command_until_shutdown(manager_tx, ManagerCommand::Shutdown)
+                    .await;
                 if let Some(runtime) = self.app_state.torrents.get_mut(info_hash) {
                     runtime.latest_state.torrent_control_state = TorrentControlState::Deleting;
                     runtime.latest_state.delete_files = false;
@@ -4895,6 +5264,28 @@ impl App {
 
         if self.is_current_shared_follower() {
             self.refresh_follower_read_model();
+        }
+    }
+
+    async fn send_manager_command_until_shutdown(
+        &self,
+        manager_tx: &mpsc::Sender<ManagerCommand>,
+        command: ManagerCommand,
+    ) {
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        tokio::select! {
+            result = manager_tx.send(command) => {
+                if result.is_err() {
+                    tracing_event!(Level::WARN, "Torrent manager command channel closed");
+                }
+            }
+            shutdown = shutdown_rx.recv() => {
+                match shutdown {
+                    Ok(())
+                    | Err(tokio::sync::broadcast::error::RecvError::Closed)
+                    | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                }
+            }
         }
     }
 
@@ -4916,6 +5307,14 @@ impl App {
 
         if new_settings.ui_theme != old_settings.ui_theme {
             self.app_state.theme = Theme::builtin(new_settings.ui_theme);
+        }
+        if new_settings.ui_refresh_rate != old_settings.ui_refresh_rate {
+            self.app_state.data_rate = new_settings.ui_refresh_rate;
+            for manager_tx in self.torrent_manager_command_txs.values() {
+                let _ = manager_tx.try_send(ManagerCommand::SetDataRate(
+                    new_settings.ui_refresh_rate.as_ms(),
+                ));
+            }
         }
 
         let port_changed = new_settings.client_port != old_settings.client_port;
@@ -5070,14 +5469,34 @@ impl App {
             }
 
             AppCommand::FetchFileTree {
+                browser_generation,
                 path,
                 browser_mode,
                 highlight_path,
             } => {
+                if browser_generation != self.app_state.ui.file_browser.browser_generation {
+                    tracing::debug!(
+                        target: "superseedr",
+                        browser_generation,
+                        current_browser_generation =
+                            self.app_state.ui.file_browser.browser_generation,
+                        ?path,
+                        "Ignoring stale file browser fetch"
+                    );
+                    return;
+                }
+
                 let tx = self.app_command_tx.clone();
                 let mut shutdown_rx = self.shutdown_tx.subscribe();
                 let path_clone = path.clone();
                 let highlight_clone = highlight_path.clone();
+                let request_id = self
+                    .app_state
+                    .ui
+                    .file_browser
+                    .fetch_request_id
+                    .wrapping_add(1);
+                self.app_state.ui.file_browser.fetch_request_id = request_id;
 
                 // 1. Update or Initialize the UI state immediately
                 if matches!(self.app_state.mode, AppMode::FileBrowser) {
@@ -5101,6 +5520,8 @@ impl App {
                             if let Ok(nodes) = result {
                                 // Pass the highlight_path back so the Update arm can find it
                                 let _ = tx.send(AppCommand::UpdateFileBrowserData {
+                                    request_id,
+                                    path: path_clone,
                                     data: nodes,
                                     highlight_path: highlight_clone
                                 }).await;
@@ -5114,10 +5535,26 @@ impl App {
             }
 
             AppCommand::UpdateFileBrowserData {
+                request_id,
+                path,
                 mut data,
                 highlight_path,
             } => {
                 if matches!(self.app_state.mode, AppMode::FileBrowser) {
+                    if request_id != self.app_state.ui.file_browser.fetch_request_id
+                        || path != self.app_state.ui.file_browser.state.current_path
+                    {
+                        tracing::debug!(
+                            target: "superseedr",
+                            request_id,
+                            ?path,
+                            current_request_id = self.app_state.ui.file_browser.fetch_request_id,
+                            current_path = ?self.app_state.ui.file_browser.state.current_path,
+                            "Ignoring stale file browser data"
+                        );
+                        return;
+                    }
+
                     let state = &mut self.app_state.ui.file_browser.state;
                     let existing_data = &mut self.app_state.ui.file_browser.data;
                     let browser_mode = &mut self.app_state.ui.file_browser.browser_mode;
@@ -5404,17 +5841,24 @@ impl App {
                     torrent.latest_state.data_available = false;
                 }
 
-                if let Some(torrent) = self.app_state.torrents.get(&info_hash) {
-                    let saved_location = Self::torrent_saved_location(&torrent.latest_state);
-                    tracing_event!(
-                        Level::WARN,
-                        info_hash = %hex::encode(&info_hash),
-                        torrent = %torrent.latest_state.torrent_name,
-                        piece = piece_index as usize,
-                        saved_location = ?saved_location,
-                        error = %error,
-                        "Foreground disk read marked torrent data unavailable"
-                    );
+                let should_log_fault = self
+                    .data_availability_fault_log_cooldowns
+                    .entry(info_hash.clone())
+                    .or_default()
+                    .should_log(Instant::now(), REPEATED_HEALTH_LOG_INTERVAL);
+                if should_log_fault {
+                    if let Some(torrent) = self.app_state.torrents.get(&info_hash) {
+                        let saved_location = Self::torrent_saved_location(&torrent.latest_state);
+                        tracing_event!(
+                            Level::WARN,
+                            info_hash = %hex::encode(&info_hash),
+                            torrent = %torrent.latest_state.torrent_name,
+                            piece = piece_index as usize,
+                            saved_location = ?saved_location,
+                            error = %error,
+                            "Foreground disk read marked torrent data unavailable"
+                        );
+                    }
                 }
 
                 if availability_changed {
@@ -5522,13 +5966,20 @@ impl App {
                 )) = availability_transition_log
                 {
                     if is_available {
-                        tracing_event!(
-                            Level::INFO,
-                            info_hash = %hex::encode(&info_hash),
-                            torrent = %torrent_name,
-                            saved_location = ?saved_location,
-                            "Torrent probe found data available; awaiting manager metrics confirmation"
-                        );
+                        let should_log_available = self
+                            .probe_available_log_cooldowns
+                            .entry(info_hash.clone())
+                            .or_default()
+                            .should_log(Instant::now(), REPEATED_HEALTH_LOG_INTERVAL);
+                        if should_log_available {
+                            tracing_event!(
+                                Level::INFO,
+                                info_hash = %hex::encode(&info_hash),
+                                torrent = %torrent_name,
+                                saved_location = ?saved_location,
+                                "Torrent probe found data available; awaiting manager metrics confirmation"
+                            );
+                        }
                     } else {
                         tracing_event!(
                             Level::WARN,
@@ -5593,7 +6044,9 @@ impl App {
 
                 self.dispatch_integrity_probe_batches();
 
+                let pending_torrent_link = self.app_state.pending_torrent_link.clone();
                 if let FileBrowserMode::DownloadLocSelection {
+                    target,
                     preview_tree,
                     preview_state,
                     container_name,
@@ -5602,6 +6055,21 @@ impl App {
                     ..
                 } = &mut self.app_state.ui.file_browser.browser_mode
                 {
+                    let should_hydrate_active_browser = match target {
+                        DownloadSelectionTarget::PendingAdd => {
+                            let (v1_hash, v2_hash) = parse_hybrid_hashes(&pending_torrent_link);
+                            v1_hash.as_deref() == Some(info_hash.as_slice())
+                                || v2_hash.as_deref() == Some(info_hash.as_slice())
+                        }
+                        DownloadSelectionTarget::ExistingTorrent {
+                            info_hash: target_hash,
+                        } => target_hash.as_slice() == info_hash.as_slice(),
+                    };
+
+                    if !should_hydrate_active_browser {
+                        return;
+                    }
+
                     // 1. REDUNDANCY GUARD: Check if metadata was already processed
                     // If the tree is already populated, ignore subsequent peer metadata arrivals
                     if !preview_tree.is_empty() {
@@ -5609,35 +6077,24 @@ impl App {
                         return;
                     }
 
-                    // 2. Build the tree payloads
+                    // 2. Hydrate the tree structure
                     let file_list = torrent.file_list();
-                    let payloads: Vec<(Vec<String>, TorrentPreviewPayload)> = file_list
-                        .into_iter()
-                        .enumerate()
-                        .map(|(idx, (parts, size))| {
-                            (
-                                parts,
-                                TorrentPreviewPayload {
-                                    file_index: Some(idx),
-                                    size,
-                                    priority: FilePriority::Normal,
-                                },
-                            )
-                        })
-                        .collect();
+                    let has_multiple_files = file_list.len() > 1;
+                    let hydrated_file_priorities = match target {
+                        DownloadSelectionTarget::ExistingTorrent { .. } => file_priorities.clone(),
+                        DownloadSelectionTarget::PendingAdd => HashMap::new(),
+                    };
+                    *preview_tree =
+                        build_torrent_preview_tree(file_list, &hydrated_file_priorities);
 
-                    // 3. Hydrate the tree structure
-                    let has_multiple_files = payloads.len() > 1;
-                    *preview_tree = RawNode::from_path_list(None, payloads);
-
-                    // 4. Update Display Name and State
+                    // 3. Update Display Name and State
                     let info_hash_hex = hex::encode(&info_hash);
                     let name = format!("{} [{}]", torrent.info.name, &info_hash_hex);
                     *container_name = name.clone();
                     *original_name_backup = name;
                     *use_container = has_multiple_files;
 
-                    // 5. INITIALIZE UI STATE: Set the initial cursor
+                    // 4. INITIALIZE UI STATE: Set the initial cursor
                     if let Some(first) = preview_tree.first() {
                         preview_state.cursor_path = Some(std::path::PathBuf::from(&first.name));
                     }
@@ -6216,7 +6673,10 @@ impl App {
     }
 
     pub fn get_initial_destination_path(&mut self) -> PathBuf {
-        self.find_most_common_download_path()
+        self.client_configs
+            .default_download_folder
+            .clone()
+            .or_else(|| self.find_most_common_download_path())
             .or_else(|| UserDirs::new().and_then(|ud| ud.download_dir().map(|p| p.to_path_buf())))
             .or_else(|| UserDirs::new().map(|ud| ud.home_dir().to_path_buf()))
             .unwrap_or_else(|| PathBuf::from("/"))
@@ -6411,6 +6871,7 @@ impl App {
 
         self.persist_torrent_metadata_snapshot(&info_hash, &torrent, &file_priorities);
         let number_of_pieces_total = torrent_piece_count(&torrent);
+        let added_at_unix_secs = current_unix_secs();
 
         let resolved_torrent_name = torrent.info.name.clone();
         let placeholder_state = TorrentDisplayState {
@@ -6433,6 +6894,7 @@ impl App {
                 file_priorities: file_priorities.clone(),
                 ..Default::default()
             },
+            added_at_unix_secs: Some(added_at_unix_secs),
             file_preview_tree: build_torrent_preview_tree(torrent.file_list(), &file_priorities),
             ..Default::default()
         };
@@ -6573,11 +7035,15 @@ impl App {
             } else {
                 if let Some(path) = download_path {
                     if let Some(manager_tx) = self.torrent_manager_command_txs.get(&info_hash) {
-                        let _ = manager_tx.try_send(ManagerCommand::SetUserTorrentConfig {
-                            torrent_data_path: path,
-                            file_priorities: file_priorities.clone(),
-                            container_name,
-                        });
+                        self.send_manager_command_until_shutdown(
+                            manager_tx,
+                            ManagerCommand::SetUserTorrentConfig {
+                                torrent_data_path: path,
+                                file_priorities: file_priorities.clone(),
+                                container_name,
+                            },
+                        )
+                        .await;
                     }
                 }
                 tracing_event!(Level::INFO, "Updated path for existing torrent from magnet");
@@ -6602,6 +7068,7 @@ impl App {
                 file_count: None,
                 ..Default::default()
             },
+            added_at_unix_secs: Some(current_unix_secs()),
             ..Default::default()
         };
         self.app_state
@@ -8250,6 +8717,25 @@ fn should_load_persisted_torrent(torrent_settings: &TorrentSettings) -> bool {
     torrent_settings.torrent_control_state != TorrentControlState::Deleting
 }
 
+fn current_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn preserve_restored_added_at(app_state: &mut AppState, torrent_config: &TorrentSettings) {
+    let Some(added_at_unix_secs) = torrent_config.added_at_unix_secs else {
+        return;
+    };
+    let Some(info_hash) = info_hash_from_torrent_source(&torrent_config.torrent_or_magnet) else {
+        return;
+    };
+    if let Some(runtime) = app_state.torrents.get_mut(&info_hash) {
+        runtime.added_at_unix_secs = Some(added_at_unix_secs);
+    }
+}
+
 fn build_persist_payload(
     client_configs: &mut Settings,
     app_state: &mut AppState,
@@ -8266,10 +8752,16 @@ fn build_persist_payload(
     client_configs.peer_sort_column = app_state.peer_sort.0;
     client_configs.peer_sort_direction = app_state.peer_sort.1;
     client_configs.peer_sort_pinned = app_state.peer_sort_pinned;
+    client_configs.ui_refresh_rate = app_state.data_rate;
     let old_validation_statuses: HashMap<String, bool> = client_configs
         .torrents
         .iter()
         .map(|cfg| (cfg.torrent_or_magnet.clone(), cfg.validation_status))
+        .collect();
+    let old_added_at_unix_secs: HashMap<String, Option<u64>> = client_configs
+        .torrents
+        .iter()
+        .map(|cfg| (cfg.torrent_or_magnet.clone(), cfg.added_at_unix_secs))
         .collect();
     let previous_torrents = client_configs.torrents.clone();
     let deferred_hashes: HashSet<Vec<u8>> = startup_deferred_load_queue.iter().cloned().collect();
@@ -8291,6 +8783,12 @@ fn build_persist_payload(
             TorrentSettings {
                 torrent_or_magnet: torrent_state.torrent_or_magnet.clone(),
                 name: torrent_state.torrent_name.clone(),
+                added_at_unix_secs: torrent.added_at_unix_secs.or_else(|| {
+                    old_added_at_unix_secs
+                        .get(&torrent_state.torrent_or_magnet)
+                        .copied()
+                        .flatten()
+                }),
                 validation_status: final_validation_status,
                 download_path: torrent_state.download_path.clone(),
                 container_name: torrent_state.container_name.clone(),
@@ -8459,15 +8957,17 @@ mod tests {
         effective_download_limit_bps, extract_magnet_display_name, flush_persistence_writer_parts,
         format_filesystem_path_error, initial_disk_throttle_rate,
         is_valid_incoming_bittorrent_handshake, move_file_with_fallback_impl, parse_hybrid_hashes,
-        persisted_validation_status_from_metrics, prune_rss_feed_errors, queue_persistence_payload,
-        refresh_autosort_after_stats, resolve_magnet_torrent_name, rss_settings_changed,
-        should_load_persisted_torrent, should_persist_network_history_on_interval,
-        sort_and_filter_torrent_list_state, swarm_availability_counts, tcp_peer_listener_enabled,
-        torrent_completion_percent, torrent_is_effectively_incomplete, App, AppClusterRole,
-        AppCommand, AppMode, AppRuntimeMode, AppState, ColumnId, CommandIngestResult, DataRate,
+        persisted_validation_status_from_metrics, preserve_restored_added_at,
+        prune_rss_feed_errors, queue_persistence_payload, refresh_autosort_after_stats,
+        resolve_magnet_torrent_name, rss_settings_changed, should_load_persisted_torrent,
+        should_persist_network_history_on_interval, sort_and_filter_torrent_list_state,
+        swarm_availability_counts, tcp_peer_listener_enabled, torrent_completion_percent,
+        torrent_is_effectively_incomplete, App, AppClusterRole, AppCommand, AppMode,
+        AppRuntimeMode, AppState, BrowserPane, ColumnId, CommandIngestResult, DataRate,
         DhtWaveTargets, DhtWaveUiState, DiskBackpressureDecision, DiskBackpressureDownloadThrottle,
-        DiskBackpressureSample, FilePriority, IngestSource, ListenerSet, PeerInfo,
-        PeerListenerTransportMode, PeerSortColumn, PersistPayload, SelectedHeader, SortDirection,
+        DiskBackpressureSample, DownloadSelectionTarget, FileBrowserMode, FileMetadata,
+        FilePriority, IngestSource, ListenerSet, LogCooldown, PeerInfo, PeerListenerTransportMode,
+        PeerSortColumn, PersistPayload, ResolvedAddPayload, SelectedHeader, SortDirection,
         SwarmAvailabilityFlashState, TorrentControlState, TorrentDisplayState, TorrentMetrics,
         TorrentPreviewPayload, TorrentSortColumn, UiState, WakeLagPeerThrottle,
         BITTORRENT_PROTOCOL_STR, DHT_WAVE_PHASE_WRAP_PERIOD, DISK_WRITE_THROTTLE_MIN_BYTES_PER_SEC,
@@ -8492,6 +8992,7 @@ mod tests {
     use crate::torrent_manager::{
         FileProbeBatchResult, FileProbeEntry, ManagerCommand, ManagerEvent, TorrentFileProbeStatus,
     };
+    use crate::tui::tree::RawNode;
     use std::collections::{HashMap, VecDeque};
     use std::env;
     use std::io;
@@ -8508,6 +9009,16 @@ mod tests {
         assert!(!tcp_peer_listener_enabled(PeerListenerTransportMode::Utp));
         assert!(tcp_peer_listener_enabled(PeerListenerTransportMode::Tcp));
         assert!(tcp_peer_listener_enabled(PeerListenerTransportMode::All));
+    }
+
+    #[test]
+    fn log_cooldown_allows_first_event_and_then_only_after_interval() {
+        let now = Instant::now();
+        let mut cooldown = LogCooldown::default();
+
+        assert!(cooldown.should_log(now, Duration::from_secs(60)));
+        assert!(!cooldown.should_log(now + Duration::from_secs(59), Duration::from_secs(60)));
+        assert!(cooldown.should_log(now + Duration::from_secs(60), Duration::from_secs(60)));
     }
 
     fn mock_display(name: &str, peer_count: usize) -> TorrentDisplayState {
@@ -9092,6 +9603,7 @@ mod tests {
                 TorrentSettings {
                     torrent_or_magnet: loaded_magnet.clone(),
                     name: "sample-loaded".to_string(),
+                    added_at_unix_secs: Some(1_700_000_000),
                     torrent_control_state: TorrentControlState::Running,
                     ..Default::default()
                 },
@@ -9104,7 +9616,7 @@ mod tests {
             TorrentDisplayState {
                 latest_state: TorrentMetrics {
                     info_hash: vec![0x66; 20],
-                    torrent_or_magnet: loaded_magnet,
+                    torrent_or_magnet: loaded_magnet.clone(),
                     torrent_name: "sample-loaded".to_string(),
                     torrent_control_state: TorrentControlState::Running,
                     ..Default::default()
@@ -9121,6 +9633,50 @@ mod tests {
             torrent.torrent_or_magnet == deferred_magnet
                 && torrent.torrent_control_state == TorrentControlState::Running
         }));
+        assert!(payload.settings.torrents.iter().any(|torrent| {
+            torrent.torrent_or_magnet == loaded_magnet
+                && torrent.added_at_unix_secs == Some(1_700_000_000)
+        }));
+    }
+
+    #[test]
+    fn preserve_restored_added_at_keeps_original_added_date() {
+        let original_added_at = 1_700_000_000;
+        let restored_runtime_added_at = 1_800_000_000;
+        let magnet = "magnet:?xt=urn:btih:7777777777777777777777777777777777777777".to_string();
+        let info_hash = vec![0x77; 20];
+        let torrent_config = TorrentSettings {
+            torrent_or_magnet: magnet.clone(),
+            name: "sample-restored".to_string(),
+            added_at_unix_secs: Some(original_added_at),
+            torrent_control_state: TorrentControlState::Running,
+            ..Default::default()
+        };
+        let mut app_state = AppState::default();
+        app_state.torrents.insert(
+            info_hash.clone(),
+            TorrentDisplayState {
+                latest_state: TorrentMetrics {
+                    info_hash: info_hash.clone(),
+                    torrent_or_magnet: magnet,
+                    torrent_name: "sample-restored".to_string(),
+                    torrent_control_state: TorrentControlState::Running,
+                    ..Default::default()
+                },
+                added_at_unix_secs: Some(restored_runtime_added_at),
+                ..Default::default()
+            },
+        );
+
+        preserve_restored_added_at(&mut app_state, &torrent_config);
+
+        assert_eq!(
+            app_state
+                .torrents
+                .get(&info_hash)
+                .and_then(|torrent| torrent.added_at_unix_secs),
+            Some(original_added_at)
+        );
     }
 
     #[test]
@@ -11088,35 +11644,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_restore_queues_running_torrents_before_first_main_loop_tick() {
-        let settings = crate::config::Settings {
+    async fn startup_restore_rolls_running_torrents_after_first() {
+        let mut settings = crate::config::Settings {
             client_port: 0,
-            torrents: vec![
-                TorrentSettings {
-                    torrent_or_magnet: format!("magnet:?xt=urn:btih:{}", "1".repeat(40)),
-                    name: "Synthetic Start One".to_string(),
-                    torrent_control_state: TorrentControlState::Running,
-                    ..Default::default()
-                },
-                TorrentSettings {
-                    torrent_or_magnet: format!("magnet:?xt=urn:btih:{}", "2".repeat(40)),
-                    name: "Synthetic Start Two".to_string(),
-                    torrent_control_state: TorrentControlState::Running,
-                    ..Default::default()
-                },
-            ],
             ..Default::default()
         };
+        for index in 0..4 {
+            let hash_digit = char::from_digit((index + 1) as u32, 16).expect("hex digit");
+            settings.torrents.push(TorrentSettings {
+                torrent_or_magnet: format!(
+                    "magnet:?xt=urn:btih:{}",
+                    hash_digit.to_string().repeat(40)
+                ),
+                name: format!("roll-start-{}", index),
+                torrent_control_state: TorrentControlState::Running,
+                ..Default::default()
+            });
+        }
 
         let app = App::new(settings, AppRuntimeMode::Normal)
             .await
             .expect("build app");
 
-        assert!(app.app_state.torrents.is_empty());
-        assert_eq!(app.startup_deferred_load_queue.len(), 2);
-        assert_eq!(app.startup_loaded_torrent_count, 0);
+        assert_eq!(app.torrent_manager_command_txs.len(), 1);
+        assert_eq!(app.startup_deferred_load_queue.len(), 3);
+        assert_eq!(app.startup_loaded_torrent_count, 1);
         assert!(app.next_startup_load_at.is_some());
-        assert!(!matches!(app.app_state.mode, AppMode::Welcome));
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn start_missing_runtime_torrents_preserves_startup_rollout() {
+        let mut app = App::new(
+            crate::config::Settings {
+                client_port: 0,
+                ..Default::default()
+            },
+            AppRuntimeMode::Normal,
+        )
+        .await
+        .expect("build app");
+
+        for index in 0..4 {
+            let hash_digit = char::from_digit((index + 1) as u32, 16).expect("hex digit");
+            app.client_configs.torrents.push(TorrentSettings {
+                torrent_or_magnet: format!(
+                    "magnet:?xt=urn:btih:{}",
+                    hash_digit.to_string().repeat(40)
+                ),
+                name: format!("missing-roll-{}", index),
+                torrent_control_state: TorrentControlState::Running,
+                ..Default::default()
+            });
+        }
+
+        app.start_missing_runtime_torrents_for_current_role().await;
+
+        assert_eq!(app.torrent_manager_command_txs.len(), 1);
+        assert_eq!(app.startup_deferred_load_queue.len(), 3);
+        assert_eq!(app.startup_loaded_torrent_count, 1);
+        assert!(app.next_startup_load_at.is_some());
+
+        app.load_next_startup_batch().await;
+
+        assert_eq!(app.torrent_manager_command_txs.len(), 2);
+        assert_eq!(app.startup_deferred_load_queue.len(), 2);
+        assert_eq!(app.startup_loaded_torrent_count, 2);
 
         let _ = app.shutdown_tx.send(());
     }
@@ -11822,6 +12416,361 @@ mod tests {
             env::remove_var("SUPERSEEDR_SHARED_HOST_ID");
         }
         clear_shared_config_state_for_tests();
+    }
+
+    #[tokio::test]
+    async fn interactive_add_prompt_setting_overrides_default_download_fast_path() {
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let settings = crate::config::Settings {
+            client_port: 0,
+            default_download_folder: Some(temp_dir.path().join("downloads")),
+            always_show_add_location_prompt: true,
+            ..Default::default()
+        };
+        let app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        let torrent_path = temp_dir.path().join("sample-input.torrent");
+
+        let action = app.resolve_add_ingress_action(IngestSource::TorrentFile, &torrent_path);
+
+        assert!(matches!(
+            action,
+            super::AddIngressAction::OpenManualBrowser { .. }
+        ));
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn interactive_add_prompt_starts_at_default_download_folder() {
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let default_download_folder = temp_dir.path().join("downloads");
+        std::fs::create_dir_all(&default_download_folder).expect("create default download folder");
+        let settings = crate::config::Settings {
+            client_port: 0,
+            default_download_folder: Some(default_download_folder.clone()),
+            always_show_add_location_prompt: true,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        while app.app_command_rx.try_recv().is_ok() {}
+
+        app.open_manual_browser_for_payload(
+            IngestSource::MagnetFile,
+            ResolvedAddPayload::MagnetLink {
+                magnet_link: "magnet:?xt=urn:btih:5555555555555555555555555555555555555555"
+                    .to_string(),
+            },
+        )
+        .expect("open manual browser");
+
+        let path = loop {
+            match app.app_command_rx.try_recv() {
+                Ok(AppCommand::FetchFileTree { path, .. }) => break path,
+                Ok(_) => continue,
+                Err(_) => panic!("expected file browser fetch command"),
+            }
+        };
+
+        assert_eq!(path, default_download_folder);
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[test]
+    fn torrent_preview_tree_marks_only_ancestor_folders_mixed() {
+        let priorities = HashMap::from([(0, FilePriority::Skip)]);
+        let tree = build_torrent_preview_tree(
+            vec![
+                (vec!["changed".to_string(), "one.bin".to_string()], 10),
+                (vec!["changed".to_string(), "two.bin".to_string()], 20),
+                (vec!["unchanged".to_string(), "three.bin".to_string()], 30),
+            ],
+            &priorities,
+        );
+
+        let changed = tree
+            .iter()
+            .find(|node| node.name == "changed")
+            .expect("changed folder");
+        let unchanged = tree
+            .iter()
+            .find(|node| node.name == "unchanged")
+            .expect("unchanged folder");
+
+        assert_eq!(changed.payload.priority, FilePriority::Mixed);
+        assert_eq!(unchanged.payload.priority, FilePriority::Normal);
+    }
+
+    #[test]
+    fn torrent_preview_tree_marks_uniform_priority_folder_as_that_priority() {
+        let priorities = HashMap::from([(0, FilePriority::Skip), (1, FilePriority::Skip)]);
+        let tree = build_torrent_preview_tree(
+            vec![
+                (vec!["season".to_string(), "one.bin".to_string()], 10),
+                (vec!["season".to_string(), "two.bin".to_string()], 20),
+            ],
+            &priorities,
+        );
+
+        assert_eq!(tree[0].payload.priority, FilePriority::Skip);
+    }
+
+    #[tokio::test]
+    async fn open_existing_torrent_file_browser_starts_on_priority_preview() {
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let settings = crate::config::Settings {
+            client_port: 0,
+            default_download_folder: Some(temp_dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        while app.app_command_rx.try_recv().is_ok() {}
+
+        let info_hash = vec![9; 20];
+        let file_priorities = HashMap::from([(0, FilePriority::High)]);
+        let preview_tree = build_torrent_preview_tree(
+            vec![(vec!["sample".to_string(), "segment.bin".to_string()], 42)],
+            &file_priorities,
+        );
+        app.app_state.torrents.insert(
+            info_hash.clone(),
+            TorrentDisplayState {
+                latest_state: TorrentMetrics {
+                    info_hash: info_hash.clone(),
+                    torrent_name: "Sample Selector".to_string(),
+                    download_path: Some(temp_dir.path().to_path_buf()),
+                    is_multi_file: true,
+                    file_priorities,
+                    ..Default::default()
+                },
+                file_preview_tree: preview_tree,
+                ..Default::default()
+            },
+        );
+
+        app.open_existing_torrent_file_browser(info_hash.clone());
+
+        assert!(app.app_command_rx.try_recv().is_err());
+        assert!(matches!(app.app_state.mode, AppMode::FileBrowser));
+        assert!(app.app_state.ui.file_browser.data.is_empty());
+        match &app.app_state.ui.file_browser.browser_mode {
+            FileBrowserMode::DownloadLocSelection {
+                target,
+                focused_pane,
+                preview_tree,
+                use_container,
+                container_name,
+                ..
+            } => {
+                assert_eq!(
+                    target,
+                    &DownloadSelectionTarget::ExistingTorrent { info_hash }
+                );
+                assert_eq!(*focused_pane, BrowserPane::TorrentPreview);
+                assert!(!preview_tree.is_empty());
+                assert!(!*use_container);
+                assert!(container_name.is_empty());
+            }
+            _ => panic!("expected priority-only existing torrent browser"),
+        }
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn metadata_loaded_preserves_existing_torrent_priority_overrides_in_empty_preview() {
+        fn record_leaf_priorities(
+            node: &RawNode<TorrentPreviewPayload>,
+            priorities_by_index: &mut HashMap<usize, FilePriority>,
+        ) {
+            if let Some(file_index) = node.payload.file_index {
+                priorities_by_index.insert(file_index, node.payload.priority);
+            }
+            for child in &node.children {
+                record_leaf_priorities(child, priorities_by_index);
+            }
+        }
+
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        let info_hash = vec![3; 20];
+        let file_priorities = HashMap::from([(0, FilePriority::Skip), (2, FilePriority::High)]);
+        app.app_state.torrents.insert(
+            info_hash.clone(),
+            TorrentDisplayState {
+                latest_state: TorrentMetrics {
+                    info_hash: info_hash.clone(),
+                    torrent_name: "Priority Hydration".to_string(),
+                    file_priorities,
+                    ..Default::default()
+                },
+                file_preview_tree: Vec::new(),
+                ..Default::default()
+            },
+        );
+        app.app_state.ui.file_browser.browser_mode = FileBrowserMode::DownloadLocSelection {
+            target: DownloadSelectionTarget::ExistingTorrent {
+                info_hash: info_hash.clone(),
+            },
+            torrent_files: Vec::new(),
+            container_name: String::new(),
+            use_container: false,
+            is_editing_name: false,
+            preview_tree: Vec::new(),
+            preview_state: Default::default(),
+            focused_pane: BrowserPane::TorrentPreview,
+            cursor_pos: 0,
+            original_name_backup: String::new(),
+        };
+
+        let torrent = crate::torrent_file::Torrent {
+            info: crate::torrent_file::Info {
+                name: "Priority Hydration".to_string(),
+                files: vec![
+                    crate::torrent_file::InfoFile {
+                        length: 10,
+                        path: vec!["group".to_string(), "skip.bin".to_string()],
+                        md5sum: None,
+                        attr: None,
+                    },
+                    crate::torrent_file::InfoFile {
+                        length: 20,
+                        path: vec!["group".to_string(), "normal.bin".to_string()],
+                        md5sum: None,
+                        attr: None,
+                    },
+                    crate::torrent_file::InfoFile {
+                        length: 30,
+                        path: vec!["group".to_string(), "high.bin".to_string()],
+                        md5sum: None,
+                        attr: None,
+                    },
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        app.handle_manager_event(ManagerEvent::MetadataLoaded {
+            info_hash: info_hash.clone(),
+            torrent: Box::new(torrent),
+        });
+
+        let FileBrowserMode::DownloadLocSelection { preview_tree, .. } =
+            &app.app_state.ui.file_browser.browser_mode
+        else {
+            panic!("expected download selection browser");
+        };
+        let mut priorities_by_index = HashMap::new();
+        for node in preview_tree {
+            record_leaf_priorities(node, &mut priorities_by_index);
+        }
+
+        assert_eq!(priorities_by_index.get(&0), Some(&FilePriority::Skip));
+        assert_eq!(priorities_by_index.get(&1), Some(&FilePriority::Normal));
+        assert_eq!(priorities_by_index.get(&2), Some(&FilePriority::High));
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn stale_file_browser_fetch_is_ignored() {
+        let stale_dir = tempfile::tempdir().expect("create stale dir");
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        app.app_state.mode = AppMode::Normal;
+        app.app_state.ui.file_browser.browser_generation = 2;
+        let initial_path = app.app_state.ui.file_browser.state.current_path.clone();
+        let initial_request_id = app.app_state.ui.file_browser.fetch_request_id;
+
+        app.handle_app_command(AppCommand::FetchFileTree {
+            browser_generation: 1,
+            path: stale_dir.path().to_path_buf(),
+            browser_mode: FileBrowserMode::Directory,
+            highlight_path: None,
+        })
+        .await;
+
+        assert!(matches!(app.app_state.mode, AppMode::Normal));
+        assert_eq!(
+            app.app_state.ui.file_browser.state.current_path,
+            initial_path
+        );
+        assert_eq!(
+            app.app_state.ui.file_browser.fetch_request_id,
+            initial_request_id
+        );
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn stale_file_browser_update_is_ignored() {
+        let current_dir = tempfile::tempdir().expect("create current dir");
+        let stale_dir = tempfile::tempdir().expect("create stale dir");
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        app.app_state.mode = AppMode::FileBrowser;
+        app.app_state.ui.file_browser.fetch_request_id = 2;
+        app.app_state.ui.file_browser.state.current_path = current_dir.path().to_path_buf();
+
+        app.handle_app_command(AppCommand::UpdateFileBrowserData {
+            request_id: 1,
+            path: stale_dir.path().to_path_buf(),
+            data: vec![RawNode {
+                name: "stale.bin".to_string(),
+                full_path: stale_dir.path().join("stale.bin"),
+                children: vec![],
+                payload: FileMetadata {
+                    size: 1,
+                    modified: std::time::UNIX_EPOCH,
+                },
+                is_dir: false,
+            }],
+            highlight_path: None,
+        })
+        .await;
+
+        assert!(app.app_state.ui.file_browser.data.is_empty());
+
+        app.handle_app_command(AppCommand::UpdateFileBrowserData {
+            request_id: 2,
+            path: current_dir.path().to_path_buf(),
+            data: vec![RawNode {
+                name: "current.bin".to_string(),
+                full_path: current_dir.path().join("current.bin"),
+                children: vec![],
+                payload: FileMetadata {
+                    size: 1,
+                    modified: std::time::UNIX_EPOCH,
+                },
+                is_dir: false,
+            }],
+            highlight_path: None,
+        })
+        .await;
+
+        assert_eq!(app.app_state.ui.file_browser.data.len(), 1);
+        assert_eq!(app.app_state.ui.file_browser.data[0].name, "current.bin");
+        let _ = app.shutdown_tx.send(());
     }
 
     #[tokio::test]

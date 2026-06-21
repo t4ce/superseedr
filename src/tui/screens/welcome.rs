@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::app::{AppMode, AppState};
 use crate::theme::{blend_colors, color_to_rgb, ThemeContext};
+use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::screen_context::ScreenContext;
 
 const WELCOME_LICENSE_LABEL: &str = "GNU General Public License v3.0";
@@ -135,10 +136,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
         Line::from(vec![
             Span::styled(" ★ ", ctx.apply(Style::default().fg(ctx.state_success()))),
             Span::raw("Press "),
-            Span::styled(
-                "[a]",
-                ctx.apply(Style::default().fg(ctx.state_selected()).bold()),
-            ),
+            Span::styled("[a]", footer_key_style(ctx, ActionTone::Add)),
             Span::raw(" to open the file picker and select a "),
             Span::styled(
                 "`.torrent`",
@@ -189,10 +187,11 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
         Line::from(vec![
             Span::raw("      - "),
             Span::styled(
-                "Change or remove in Config [c]",
+                "Change or remove in Config ",
                 ctx.apply(Style::default().fg(ctx.theme.semantic.surface2))
                     .italic(),
             ),
+            Span::styled("[c]", footer_key_style(ctx, ActionTone::Open).italic()),
         ]),
         Line::from(""),
         Line::from(vec![
@@ -212,7 +211,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     ];
 
     let footer_line = Line::from(vec![
-        Span::styled(" [m] ", ctx.apply(Style::default().fg(ctx.accent_teal()))),
+        Span::styled(" [m] ", footer_key_style(ctx, ActionTone::Open)),
         Span::styled(
             "Manual/Help",
             ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
@@ -221,10 +220,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
             " | ",
             ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
         ),
-        Span::styled(
-            " [c] ",
-            ctx.apply(Style::default().fg(ctx.state_selected())),
-        ),
+        Span::styled(" [c] ", footer_key_style(ctx, ActionTone::Open)),
         Span::styled(
             "Config",
             ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
@@ -233,7 +229,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
             " | ",
             ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
         ),
-        Span::styled(" [Q] ", ctx.apply(Style::default().fg(ctx.state_error()))),
+        Span::styled(" [Q] ", footer_key_style(ctx, ActionTone::Destructive)),
         Span::styled(
             "Quit",
             ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
@@ -242,7 +238,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
             " | ",
             ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
         ),
-        Span::styled(" [Esc] ", ctx.apply(Style::default().fg(ctx.state_error()))),
+        Span::styled(" [Esc] ", footer_key_style(ctx, ActionTone::Cancel)),
         Span::styled(
             "Dismiss",
             ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),

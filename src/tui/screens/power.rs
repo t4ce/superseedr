@@ -7,6 +7,7 @@ use ratatui::{prelude::*, widgets::*};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::app::{AppMode, AppState};
+use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::formatters::{
     auto_download_limit_applied, centered_rect, format_limit_bps, format_speed,
 };
@@ -210,10 +211,17 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
         ]),
     ];
     let main_paragraph = Paragraph::new(main_content_lines).alignment(Alignment::Center);
-    let footer_line = Line::from(Span::styled(
-        "Press [z] to resume",
-        ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
-    ));
+    let footer_line = Line::from(vec![
+        Span::styled(
+            "Press ",
+            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+        ),
+        Span::styled("[z]", footer_key_style(ctx, ActionTone::Toggle)),
+        Span::styled(
+            " to resume",
+            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+        ),
+    ]);
     let footer_paragraph = Paragraph::new(footer_line).alignment(Alignment::Center);
 
     f.render_widget(main_paragraph, content_area);

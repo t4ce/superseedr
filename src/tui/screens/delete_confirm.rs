@@ -3,11 +3,13 @@
 
 use crate::app::{App, AppCommand, AppMode, TorrentControlState};
 use crate::integrations::control::ControlRequest;
+use crate::tui::action_style::{footer_key_style, ActionTone};
+use crate::tui::app_command::spawn_app_command_sender;
 use crate::tui::formatters::{centered_rect, sanitize_text};
 use crate::tui::screen_context::ScreenContext;
 use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode};
 use ratatui::layout::{Alignment, Constraint, Layout};
-use ratatui::prelude::{Frame, Line, Span, Style, Stylize};
+use ratatui::prelude::{Frame, Line, Span, Style};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -153,10 +155,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
                     )),
                     Line::from(vec![
                         Span::raw("Use "),
-                        Span::styled(
-                            "[D]",
-                            ctx.apply(Style::default().fg(ctx.state_warning()).bold()),
-                        ),
+                        Span::styled("[D]", footer_key_style(ctx, ActionTone::Destructive)),
                         Span::raw(" to remove files..."),
                     ]),
                 ]
@@ -170,12 +169,9 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
         }
 
         let actions = Line::from(vec![
-            Span::styled(
-                "[Y]",
-                ctx.apply(Style::default().fg(ctx.state_success()).bold()),
-            ),
+            Span::styled("[Y]", footer_key_style(ctx, ActionTone::Destructive)),
             Span::raw(" Confirm  "),
-            Span::styled("[Esc]", ctx.apply(Style::default().fg(ctx.state_error()))),
+            Span::styled("[Esc]", footer_key_style(ctx, ActionTone::Cancel)),
             Span::raw(" Cancel"),
         ]);
 
@@ -196,12 +192,14 @@ pub fn handle_event(event: CrosstermEvent, app: &mut App) -> bool {
                         info_hash,
                         with_files,
                     } => {
-                        let _ = app
-                            .app_command_tx
-                            .try_send(AppCommand::SubmitControlRequest(ControlRequest::Delete {
+                        spawn_app_command_sender(
+                            app.app_command_tx.clone(),
+                            app.shutdown_tx.subscribe(),
+                            AppCommand::SubmitControlRequest(ControlRequest::Delete {
                                 info_hash_hex: hex::encode(info_hash),
                                 delete_files: with_files,
-                            }));
+                            }),
+                        );
                     }
                     DeleteConfirmEffect::MarkDeleting { info_hash } => {
                         if !app.is_current_shared_follower() {

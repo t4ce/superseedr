@@ -19,6 +19,12 @@ Use `--transport tcp`, `--transport utp`, or `--transport all` to force the
 synthetic peer transport mode. The default is `all`, matching the normal runtime
 behavior where TCP and uTP are both enabled.
 
+Use `--torrent-format v1`, `--torrent-format v2`, or
+`--torrent-format hybrid` to choose the generated metainfo format. The default
+is `v1` for compatibility with older benchmark runs. The v2 and hybrid formats
+generate synthetic file-tree metadata and piece layers so the normal v2
+verification and write paths are exercised without external torrent fixtures.
+
 ## Benchmark Mode
 
 `benchmark` is the high-level adaptive wrapper around the lower-level synthetic
@@ -56,6 +62,7 @@ cargo run --release --features synthetic-load -- benchmark \
   --max-torrents 1000 \
   --max-peers 100000 \
   --max-steps 12 \
+  --torrent-format hybrid \
   --duration-secs 30 \
   --disk-budget 8GiB \
   --size-per-torrent 8MiB \
@@ -211,6 +218,7 @@ tmp/synthetic-benchmark/benchmark_YYYYMMDD_HHMMSS/
 
 Useful summary fields:
 
+- `torrent_format`
 - `utp_chaos`
 - `report.runtime_secs`
 - `report.steps_run`
@@ -282,6 +290,7 @@ cargo run --release --features synthetic-load -- synthetic-load \
   --mode swarm \
   --torrents 100 \
   --peers 2000 \
+  --torrent-format v2 \
   --peer-add-mode staggered \
   --peer-add-burst-size 50 \
   --duration-secs 60 \

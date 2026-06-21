@@ -1,5 +1,22 @@
 # Changelog
 
+## Release v1.0.10
+### New Features
+- **Torrent Management Workspace**: Added a dedicated torrent-management screen for reviewing active torrents, searching/filtering the list, staging batch pause/resume/delete actions, and confirming changes before they are applied.
+- **Interactive Existing-Torrent Editing**: Existing torrents can now be opened into the file browser for priority review/editing, including per-file priority changes, bulk priority cycling, and clearer preview-only navigation.
+- **Browser Search and Preview Controls**: Added searchable torrent previews, pane-aware browser search, expand/collapse-all controls, and clearer footer hints for priority, expand, collapse, and confirmation actions.
+
+### Improvements
+- **File Browser Workflow Polish**: Improved add-torrent and existing-torrent browser flows with better starting locations, stale file-tree response protection, preview-focused existing-torrent handling, and safer generation tracking for asynchronous file-tree loads.
+- **Help and Action Styling Refresh**: Reworked the help menu and footer/action styling with clearer grouping, scroll clamping, themed action tones, and more consistent shortcut descriptions across screens.
+- **TUI Reliability and State Persistence**: Persisted UI refresh-rate settings, improved torrent search behavior, clarified rate-sort arrows, and queued TUI app commands until shutdown so late UI work is handled predictably.
+- **Runtime and Dependency Maintenance**: Upgraded Ratatui, refreshed lockfile dependencies, tightened synthetic-load/anonymized-label behavior, and removed obsolete peer-stream prototype code.
+
+### Bug Fixes
+- **Torrent File Priority Accuracy**: Fixed torrent-preview folder priority aggregation so only folders with genuinely mixed child priorities are marked mixed; unrelated folders now keep their correct priority state.
+- **Filesystem and Allocation Safety**: Hardened mounted-filesystem writes and avoided stale file metadata during allocation, reducing incorrect size/path handling on mounted or changing storage.
+- **Test and Shutdown Stability**: Removed flaky wall-clock token-bucket assertions, tamed transfer performance tests, and made public-tracker stop announces fire-and-forget so shutdown is less likely to block on tracker latency.
+
 ## Release v1.0.8
 ### New Features
 - **TCP + uTP Peer Transport**: Enabled production peer transport over both TCP and uTP by default, with TCP fallback when uTP is slow or unreachable.

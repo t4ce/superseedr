@@ -3,8 +3,11 @@
 
 use crate::app::{AppCommand, AppMode, AppState, RssScreen, RssSectionFocus};
 use crate::config::RssFilterMode;
+use crate::tui::action_style::{footer_key_style, ActionTone};
+use crate::tui::app_command::spawn_app_command_batch_sender;
 use crate::tui::formatters::centered_rect;
 use crate::tui::screen_context::ScreenContext;
+use crate::tui::screens::input_panel::draw_prompt_panel;
 use chrono::{DateTime, Local, Utc};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
@@ -14,7 +17,7 @@ use reqwest::Url;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RssAction {
@@ -337,6 +340,7 @@ fn execute_rss_effects(
     app_state: &mut AppState,
     settings: &crate::config::Settings,
     app_command_tx: &mpsc::Sender<AppCommand>,
+    shutdown_tx: Option<&broadcast::Sender<()>>,
     effects: Vec<RssAction>,
 ) {
     if app_state.rss_derived.explorer_items.is_empty()
@@ -349,17 +353,44 @@ fn execute_rss_effects(
     fn set_rss_status(app_state: &mut AppState, message: impl Into<String>) {
         app_state.ui.rss.status_message = Some(message.into());
     }
+    fn try_send_app_commands_ordered(
+        app_state: &mut AppState,
+        app_command_tx: &mpsc::Sender<AppCommand>,
+        shutdown_tx: Option<&broadcast::Sender<()>>,
+        commands: Vec<AppCommand>,
+        failure_message: &str,
+    ) -> bool {
+        if let Some(shutdown_tx) = shutdown_tx {
+            spawn_app_command_batch_sender(
+                app_command_tx.clone(),
+                shutdown_tx.subscribe(),
+                commands,
+            );
+            true
+        } else {
+            for command in commands {
+                if app_command_tx.try_send(command).is_err() {
+                    set_rss_status(app_state, failure_message);
+                    return false;
+                }
+            }
+            true
+        }
+    }
     fn try_update_config(
         app_state: &mut AppState,
         app_command_tx: &mpsc::Sender<AppCommand>,
+        shutdown_tx: Option<&broadcast::Sender<()>>,
         new_settings: crate::config::Settings,
         success_message: Option<&str>,
     ) -> bool {
-        if app_command_tx
-            .try_send(AppCommand::UpdateConfig(new_settings))
-            .is_err()
-        {
-            set_rss_status(app_state, "RSS settings enqueue failed");
+        if !try_send_app_commands_ordered(
+            app_state,
+            app_command_tx,
+            shutdown_tx,
+            vec![AppCommand::UpdateConfig(new_settings)],
+            "RSS settings enqueue failed",
+        ) {
             return false;
         }
         if let Some(message) = success_message {
@@ -427,14 +458,28 @@ fn execute_rss_effects(
                 if !settings.rss.enabled {
                     let mut new_settings = settings.clone();
                     new_settings.rss.enabled = true;
-                    if !try_update_config(app_state, app_command_tx, new_settings, None) {
-                        continue;
+                    if try_send_app_commands_ordered(
+                        app_state,
+                        app_command_tx,
+                        shutdown_tx,
+                        vec![
+                            AppCommand::UpdateConfig(new_settings),
+                            AppCommand::RssSyncNow,
+                        ],
+                        "RSS sync enqueue failed",
+                    ) {
+                        set_rss_status(app_state, "RSS sync requested");
                     }
-                }
-                if app_command_tx.try_send(AppCommand::RssSyncNow).is_err() {
-                    set_rss_status(app_state, "RSS sync enqueue failed");
-                } else {
+                } else if try_send_app_commands_ordered(
+                    app_state,
+                    app_command_tx,
+                    shutdown_tx,
+                    vec![AppCommand::RssSyncNow],
+                    "RSS sync enqueue failed",
+                ) {
                     set_rss_status(app_state, "RSS sync requested");
+                } else {
+                    continue;
                 }
             }
             RssAction::InsertChar(c) => {
@@ -512,6 +557,7 @@ fn execute_rss_effects(
                         let _ = try_update_config(
                             app_state,
                             app_command_tx,
+                            shutdown_tx,
                             new_settings,
                             success_message,
                         );
@@ -610,6 +656,7 @@ fn execute_rss_effects(
                             let _ = try_update_config(
                                 app_state,
                                 app_command_tx,
+                                shutdown_tx,
                                 new_settings,
                                 Some("Link deleted"),
                             );
@@ -627,6 +674,7 @@ fn execute_rss_effects(
                             let _ = try_update_config(
                                 app_state,
                                 app_command_tx,
+                                shutdown_tx,
                                 new_settings,
                                 Some("Filter deleted"),
                             );
@@ -660,6 +708,7 @@ fn execute_rss_effects(
                             let _ = try_update_config(
                                 app_state,
                                 app_command_tx,
+                                shutdown_tx,
                                 new_settings,
                                 Some(if enabled {
                                     "Link enabled"
@@ -681,6 +730,7 @@ fn execute_rss_effects(
                             let _ = try_update_config(
                                 app_state,
                                 app_command_tx,
+                                shutdown_tx,
                                 new_settings,
                                 Some(if enabled {
                                     "Filter enabled"
@@ -751,11 +801,28 @@ fn apply_pasted_text(app_state: &mut AppState, pasted_text: &str) {
     }
 }
 
-pub fn handle_event(
+pub fn handle_event_with_shutdown(
     event: CrosstermEvent,
     app_state: &mut AppState,
     settings: &crate::config::Settings,
     app_command_tx: &mpsc::Sender<AppCommand>,
+    shutdown_tx: &broadcast::Sender<()>,
+) {
+    handle_event_inner(
+        event,
+        app_state,
+        settings,
+        app_command_tx,
+        Some(shutdown_tx),
+    );
+}
+
+fn handle_event_inner(
+    event: CrosstermEvent,
+    app_state: &mut AppState,
+    settings: &crate::config::Settings,
+    app_command_tx: &mpsc::Sender<AppCommand>,
+    shutdown_tx: Option<&broadcast::Sender<()>>,
 ) {
     if !matches!(app_state.mode, AppMode::Rss) {
         return;
@@ -765,7 +832,13 @@ pub fn handle_event(
         CrosstermEvent::Key(key) => {
             if let Some(action) = map_key_to_rss_action(key.code, key.kind, app_state) {
                 let result = reduce_rss_action(action);
-                execute_rss_effects(app_state, settings, app_command_tx, result.effects);
+                execute_rss_effects(
+                    app_state,
+                    settings,
+                    app_command_tx,
+                    shutdown_tx,
+                    result.effects,
+                );
                 app_state.ui.needs_redraw = true;
             }
         }
@@ -799,14 +872,7 @@ fn draw_input_panel(f: &mut Frame, area: Rect, screen: &ScreenContext<'_>) {
         )
     };
 
-    let mut line_spans = vec![
-        Span::styled(
-            "> ",
-            ctx.apply(Style::default().fg(ctx.state_selected()).bold()),
-        ),
-        Span::raw(value),
-        Span::styled("_", ctx.apply(Style::default().fg(ctx.state_warning()))),
-    ];
+    let mut trailing_spans = Vec::new();
     if app_state.ui.rss.is_editing
         && matches!(app_state.ui.rss.focused_section, RssSectionFocus::Filters)
     {
@@ -820,29 +886,22 @@ fn draw_input_panel(f: &mut Frame, area: Rect, screen: &ScreenContext<'_>) {
                 ctx.apply(Style::default().fg(ctx.state_selected()).bold()),
             ),
         };
-        line_spans.push(Span::raw("  "));
-        line_spans.push(Span::styled("Fuzzy", fuzzy_style));
-        line_spans.push(Span::raw(" / "));
-        line_spans.push(Span::styled("Regex", regex_style));
+        trailing_spans.push(Span::raw("  "));
+        trailing_spans.push(Span::styled("Fuzzy", fuzzy_style));
+        trailing_spans.push(Span::raw(" / "));
+        trailing_spans.push(Span::styled("Regex", regex_style));
     }
-    let line = Line::from(line_spans);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .padding(Padding::horizontal(1))
-        .border_style(ctx.apply(Style::default().fg(ctx.state_selected())));
-    f.render_widget(Paragraph::new(line).block(block), area);
+    draw_prompt_panel(f, area, title, value, trailing_spans, ctx);
 }
 
 fn draw_shared_footer(f: &mut Frame, area: Rect, screen: &ScreenContext<'_>) {
     let ctx = screen.theme;
     let app_state = screen.app.state;
     let mut footer_spans = vec![];
-    let mut push_action = |key: &str, action: &str, key_color: Color| {
+    let mut push_action = |key: &str, action: &str, tone: ActionTone| {
         footer_spans.push(Span::styled(
             format!("[{}]", key),
-            ctx.apply(Style::default().fg(key_color).bold()),
+            footer_key_style(ctx, tone),
         ));
         footer_spans.push(Span::styled(
             action.to_string(),
@@ -855,41 +914,41 @@ fn draw_shared_footer(f: &mut Frame, area: Rect, screen: &ScreenContext<'_>) {
     };
 
     if app_state.ui.rss.delete_confirm_armed {
-        push_action("Y", "confirm-delete", ctx.state_error());
-        push_action("Esc", "cancel", ctx.state_selected());
+        push_action("Y", "confirm-delete", ActionTone::Destructive);
+        push_action("Esc", "cancel", ActionTone::Cancel);
     } else if app_state.ui.rss.is_editing {
-        push_action("Enter", "save", ctx.state_success());
-        push_action("Esc", "cancel", ctx.state_error());
+        push_action("Enter", "save", ActionTone::Confirm);
+        push_action("Esc", "cancel", ActionTone::Cancel);
         if matches!(app_state.ui.rss.focused_section, RssSectionFocus::Filters) {
-            push_action("Tab", "mode", ctx.state_selected());
+            push_action("Tab", "mode", ActionTone::Mode);
         }
     } else if app_state.ui.rss.is_searching {
-        push_action("Enter", "apply", ctx.state_success());
-        push_action("Esc", "clear", ctx.state_error());
+        push_action("Enter", "apply", ActionTone::Confirm);
+        push_action("Esc", "clear", ActionTone::Cancel);
     } else {
-        push_action("Tab", "next-pane", ctx.state_selected());
-        push_action("h", "history", ctx.accent_sapphire());
-        push_action("s", "ync", ctx.state_warning());
+        push_action("Tab", "next-pane", ActionTone::Mode);
+        push_action("h", "history", ActionTone::Toggle);
+        push_action("s", "ync", ActionTone::Rate);
         match app_state.ui.rss.active_screen {
             RssScreen::Unified => match app_state.ui.rss.focused_section {
                 RssSectionFocus::Links => {
-                    push_action("a", "dd", ctx.state_success());
-                    push_action("D", "elete", ctx.state_error());
-                    push_action("Space", "toggle", ctx.state_info());
+                    push_action("a", "dd", ActionTone::Add);
+                    push_action("D", "elete", ActionTone::Destructive);
+                    push_action("Space", "toggle", ActionTone::Toggle);
                 }
                 RssSectionFocus::Filters => {
-                    push_action("a", "dd", ctx.state_success());
-                    push_action("D", "elete", ctx.state_error());
-                    push_action("Space", "toggle", ctx.state_info());
+                    push_action("a", "dd", ActionTone::Add);
+                    push_action("D", "elete", ActionTone::Destructive);
+                    push_action("Space", "toggle", ActionTone::Toggle);
                 }
                 RssSectionFocus::Explorer => {
-                    push_action("/", "search", ctx.accent_sapphire());
-                    push_action("Y", "download", ctx.state_success());
+                    push_action("/", "search", ActionTone::Search);
+                    push_action("Y", "download", ActionTone::Confirm);
                 }
             },
             RssScreen::History => {}
         }
-        push_action("Esc", "back", ctx.state_error());
+        push_action("Esc", "back", ActionTone::Cancel);
     }
 
     if !footer_spans.is_empty() {
@@ -987,15 +1046,9 @@ fn draw_delete_confirm_dialog(f: &mut Frame, area: Rect, screen: &ScreenContext<
     }
 
     let actions = Line::from(vec![
-        Span::styled(
-            "[Y]",
-            ctx.apply(Style::default().fg(ctx.state_success()).bold()),
-        ),
+        Span::styled("[Y]", footer_key_style(ctx, ActionTone::Destructive)),
         Span::raw(" Confirm  "),
-        Span::styled(
-            "[Esc]",
-            ctx.apply(Style::default().fg(ctx.state_error()).bold()),
-        ),
+        Span::styled("[Esc]", footer_key_style(ctx, ActionTone::Cancel)),
         Span::raw(" Cancel"),
     ]);
     f.render_widget(
@@ -2207,6 +2260,15 @@ mod tests {
         }
     }
 
+    fn handle_event(
+        event: CrosstermEvent,
+        app_state: &mut AppState,
+        settings: &crate::config::Settings,
+        app_command_tx: &mpsc::Sender<AppCommand>,
+    ) {
+        handle_event_inner(event, app_state, settings, app_command_tx, None);
+    }
+
     #[test]
     fn esc_returns_to_normal_mode() {
         let mut app_state = base_state();
@@ -2419,6 +2481,35 @@ mod tests {
         }
 
         let second = rx.try_recv().expect("expected second command");
+        assert!(matches!(second, AppCommand::RssSyncNow));
+    }
+
+    #[tokio::test]
+    async fn sync_key_with_shutdown_batches_enable_before_sync() {
+        let mut app_state = base_state();
+        let mut settings = crate::config::Settings::default();
+        settings.rss.enabled = false;
+        let (tx, mut rx) = mpsc::channel(4);
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        handle_event_inner(
+            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+                KeyCode::Char('s'),
+                ratatui::crossterm::event::KeyModifiers::NONE,
+            )),
+            &mut app_state,
+            &settings,
+            &tx,
+            Some(&shutdown_tx),
+        );
+
+        let first = rx.recv().await.expect("expected first command");
+        match first {
+            AppCommand::UpdateConfig(s) => assert!(s.rss.enabled),
+            _ => panic!("expected enable config update before sync"),
+        }
+
+        let second = rx.recv().await.expect("expected second command");
         assert!(matches!(second, AppCommand::RssSyncNow));
     }
 

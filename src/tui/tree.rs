@@ -162,6 +162,8 @@ type FilterRule<T> = Rc<dyn Fn(&RawNode<T>) -> bool>;
 pub struct TreeFilter<T> {
     pub queries: Vec<String>,
     pub node_rule: Option<FilterRule<T>>,
+    pub match_name: bool,
+    pub auto_expand: bool,
 }
 
 impl<T> Default for TreeFilter<T> {
@@ -169,25 +171,37 @@ impl<T> Default for TreeFilter<T> {
         Self {
             queries: Vec::new(),
             node_rule: None,
+            match_name: true,
+            auto_expand: false,
         }
     }
 }
 
 impl<T> TreeFilter<T> {
     pub fn from_text(input: &str) -> Self {
-        let queries = input
+        let queries: Vec<String> = input
             .split_whitespace()
             .filter(|s| !s.is_empty())
             .map(|s| s.to_lowercase())
             .collect();
+        let auto_expand = !queries.is_empty();
         Self {
             queries,
             node_rule: None,
+            match_name: true,
+            auto_expand,
         }
     }
 
     pub fn new(input: &str, rule: impl Fn(&RawNode<T>) -> bool + 'static) -> Self {
         let mut filter = Self::from_text(input);
+        filter.node_rule = Some(Rc::new(rule));
+        filter
+    }
+
+    pub fn rule_only(input: &str, rule: impl Fn(&RawNode<T>) -> bool + 'static) -> Self {
+        let mut filter = Self::from_text(input);
+        filter.match_name = false;
         filter.node_rule = Some(Rc::new(rule));
         filter
     }
@@ -198,7 +212,7 @@ impl<T> TreeFilter<T> {
                 return false;
             }
         }
-        if self.queries.is_empty() {
+        if self.queries.is_empty() || !self.match_name {
             return true;
         }
         let name_lower = node.name.to_lowercase();
@@ -270,17 +284,9 @@ impl TreeMathHelper {
         filter: TreeFilter<T>,
         max_height: usize,
     ) -> Vec<RenderItem<'a, T>> {
-        let mut full_list = Vec::new();
-        Self::project_recursive(nodes, state, &filter, 0, &mut full_list);
-
-        let start = state.top_most_offset.min(full_list.len());
-        let end = (start + max_height).min(full_list.len());
-
-        if start < end {
-            full_list[start..end].to_vec()
-        } else {
-            Vec::new()
-        }
+        TreeProjection::new(nodes, state, filter, max_height)
+            .visible_window()
+            .to_vec()
     }
 
     pub fn apply_action<T>(
@@ -290,19 +296,71 @@ impl TreeMathHelper {
         filter: TreeFilter<T>,
         max_height: usize,
     ) -> bool {
+        TreeProjection::new(nodes, state, filter, max_height).apply_action(state, action)
+    }
+}
+
+pub struct TreeProjection<'a, T> {
+    rows: Vec<RenderItem<'a, T>>,
+    window_start: usize,
+    window_end: usize,
+    max_height: usize,
+}
+
+impl<'a, T> TreeProjection<'a, T> {
+    pub fn new(
+        nodes: &'a [RawNode<T>],
+        state: &TreeViewState,
+        filter: TreeFilter<T>,
+        max_height: usize,
+    ) -> Self {
         let mut full_list = Vec::new();
         Self::project_recursive(nodes, state, &filter, 0, &mut full_list);
-        Self::handle_action(state, &full_list, action, max_height)
+
+        let effective_height = max_height.max(1);
+        let max_start = full_list.len().saturating_sub(effective_height);
+        let window_start = state.top_most_offset.min(max_start);
+        let window_end = (window_start + max_height).min(full_list.len());
+
+        Self {
+            rows: full_list,
+            window_start,
+            window_end,
+            max_height,
+        }
     }
 
-    fn project_recursive<'a, T>(
+    #[cfg(test)]
+    pub fn rows(&self) -> &[RenderItem<'a, T>] {
+        &self.rows
+    }
+
+    pub fn visible_window(&self) -> &[RenderItem<'a, T>] {
+        if self.window_start < self.window_end {
+            &self.rows[self.window_start..self.window_end]
+        } else {
+            &[]
+        }
+    }
+
+    pub fn cursor_index(&self, state: &TreeViewState) -> Option<usize> {
+        state
+            .cursor_path
+            .as_ref()
+            .and_then(|path| self.rows.iter().position(|item| &item.path == path))
+    }
+
+    pub fn apply_action(&self, state: &mut TreeViewState, action: TreeAction) -> bool {
+        self.handle_action(state, action)
+    }
+
+    fn project_recursive(
         nodes: &'a [RawNode<T>],
         state: &TreeViewState,
         filter: &TreeFilter<T>,
         depth: usize,
         output: &mut Vec<RenderItem<'a, T>>,
     ) {
-        let is_searching = !filter.queries.is_empty();
         let visible_nodes: Vec<_> = nodes
             .iter()
             .filter(|node| filter.any_matches(node))
@@ -311,7 +369,7 @@ impl TreeMathHelper {
         let len = visible_nodes.len();
         for (i, node) in visible_nodes.into_iter().enumerate() {
             let path = node.full_path.clone();
-            let expanded = if is_searching {
+            let expanded = if filter.auto_expand {
                 true
             } else {
                 state.expanded_paths.contains(&path)
@@ -333,38 +391,33 @@ impl TreeMathHelper {
         }
     }
 
-    fn handle_action<T>(
-        state: &mut TreeViewState,
-        full_list: &[RenderItem<'_, T>],
-        action: TreeAction,
-        max_height: usize,
-    ) -> bool {
-        if full_list.is_empty() {
+    fn handle_action(&self, state: &mut TreeViewState, action: TreeAction) -> bool {
+        if self.rows.is_empty() {
             return false;
         }
 
-        let current_idx = state
-            .cursor_path
-            .as_ref()
-            .and_then(|path| full_list.iter().position(|item| &item.path == path))
-            .unwrap_or(0);
+        let Some(current_idx) = self.cursor_index(state) else {
+            state.cursor_path = Some(self.rows[0].path.clone());
+            self.keep_cursor_visible(state, 0);
+            return true;
+        };
 
         let mut new_idx = current_idx;
 
         match action {
             TreeAction::Up => new_idx = current_idx.saturating_sub(1),
             TreeAction::Down => {
-                if current_idx < full_list.len() - 1 {
+                if current_idx < self.rows.len() - 1 {
                     new_idx = current_idx + 1;
                 }
             }
             TreeAction::Right => {
-                let item = &full_list[current_idx];
+                let item = &self.rows[current_idx];
                 if item.node.is_dir {
                     if !state.expanded_paths.contains(&item.path) {
                         state.expanded_paths.insert(item.path.clone());
-                    } else if current_idx < full_list.len() - 1 {
-                        let next_item = &full_list[current_idx + 1];
+                    } else if current_idx < self.rows.len() - 1 {
+                        let next_item = &self.rows[current_idx + 1];
                         if next_item.depth > item.depth {
                             new_idx = current_idx + 1;
                         }
@@ -372,15 +425,16 @@ impl TreeMathHelper {
                 }
             }
             TreeAction::Left => {
-                let item = &full_list[current_idx];
+                let item = &self.rows[current_idx];
                 if item.node.is_dir && state.expanded_paths.contains(&item.path) {
                     state.expanded_paths.remove(&item.path);
                 } else if item.depth > 0 {
-                    let parent = full_list[0..current_idx]
+                    let parent = self.rows[0..current_idx]
                         .iter()
                         .rfind(|x| x.depth == item.depth - 1);
                     if let Some(p) = parent {
-                        new_idx = full_list
+                        new_idx = self
+                            .rows
                             .iter()
                             .position(|i| i.path == p.path)
                             .unwrap_or(current_idx);
@@ -389,14 +443,18 @@ impl TreeMathHelper {
             }
         }
 
-        state.cursor_path = Some(full_list[new_idx].path.clone());
-        let effective_height = max_height.max(1);
+        state.cursor_path = Some(self.rows[new_idx].path.clone());
+        self.keep_cursor_visible(state, new_idx);
+        true
+    }
+
+    fn keep_cursor_visible(&self, state: &mut TreeViewState, new_idx: usize) {
+        let effective_height = self.max_height.max(1);
         if new_idx < state.top_most_offset {
             state.top_most_offset = new_idx;
         } else if new_idx >= state.top_most_offset + effective_height {
             state.top_most_offset = (new_idx + 1).saturating_sub(effective_height);
         }
-        true
     }
 }
 
@@ -540,6 +598,56 @@ mod tests {
         assert_eq!(list.len(), 3);
         assert!(list[0].is_expanded);
         assert!(list[1].is_expanded);
+        assert_eq!(list[2].node.name, "leaf1");
+    }
+
+    #[test]
+    fn test_projection_exposes_full_rows_and_visible_window() {
+        let tree = mock_complex_tree();
+        let state = TreeViewState {
+            top_most_offset: 1,
+            ..Default::default()
+        };
+
+        let projection = TreeProjection::new(&tree, &state, TreeFilter::from_text("leaf1"), 2);
+
+        assert_eq!(projection.rows().len(), 3);
+        assert_eq!(projection.visible_window().len(), 2);
+        assert_eq!(projection.visible_window()[0].node.name, "sub1");
+        assert_eq!(projection.visible_window()[1].node.name, "leaf1");
+    }
+
+    #[test]
+    fn test_navigation_with_stale_cursor_selects_first_visible_row() {
+        let tree = mock_complex_tree();
+        let mut state = TreeViewState {
+            cursor_path: Some(PathBuf::from("missing")),
+            ..Default::default()
+        };
+
+        TreeMathHelper::apply_action(
+            &mut state,
+            &tree,
+            TreeAction::Down,
+            TreeFilter::from_text(""),
+            10,
+        );
+
+        assert_eq!(state.cursor_path, Some(PathBuf::from("root1")));
+    }
+
+    #[test]
+    fn test_search_clamps_stale_scroll_offset() {
+        let tree = mock_complex_tree();
+        let state = TreeViewState {
+            top_most_offset: 20,
+            ..Default::default()
+        };
+
+        let list =
+            TreeMathHelper::get_visible_slice(&tree, &state, TreeFilter::from_text("leaf1"), 10);
+
+        assert_eq!(list.len(), 3);
         assert_eq!(list[2].node.name, "leaf1");
     }
 

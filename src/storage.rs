@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::errors::StorageError;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use tokio::fs::{self, try_exists, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
@@ -102,18 +103,35 @@ pub async fn create_and_allocate_files(
     let mut is_fresh_download = true;
 
     for file_info in &multi_file_info.files {
-        // Optimization: Don't allocate padding or skipped files
         if file_info.is_padding {
             continue;
         }
 
         let exists = try_exists(&file_info.path).await?;
-        if exists {
+        let existing_metadata = if exists {
+            Some(fs::metadata(&file_info.path).await?)
+        } else {
+            None
+        };
+        if existing_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.is_file() && metadata.len() > 0)
+        {
             is_fresh_download = false;
         }
-        if file_info.is_skipped {
+    }
+
+    for file_info in &multi_file_info.files {
+        // Optimization: Don't allocate padding or skipped files
+        if file_info.is_padding || file_info.is_skipped {
             continue;
         }
+
+        let should_resize = |metadata: &std::fs::Metadata| {
+            metadata.is_file()
+                && metadata.len() != file_info.length
+                && (!is_fresh_download || metadata.len() > 0)
+        };
 
         // Ensure the parent directory for the file exists.
         if let Some(parent_dir) = file_info.path.parent() {
@@ -122,20 +140,13 @@ pub async fn create_and_allocate_files(
             }
         }
 
-        // Create and size the file if it doesn't exist. If it already exists
-        // at the wrong size, resize it so validation reads cannot loop forever
-        // on repeated short reads.
-        if !try_exists(&file_info.path).await? {
-            let file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&file_info.path)
-                .await?;
-            file.set_len(file_info.length).await?;
-        } else {
-            let metadata = fs::metadata(&file_info.path).await?;
-            if metadata.is_file() && metadata.len() != file_info.length {
+        // Create fresh files without preallocating; some mounted filesystems can
+        // block indefinitely when resizing sparse placeholders up front. Once a
+        // download is known to be partial, however, zero-byte placeholders must
+        // be sized before validation/uploads can read their sparse zeroes as
+        // real in-span data.
+        match fs::metadata(&file_info.path).await {
+            Ok(metadata) if should_resize(&metadata) => {
                 let file = OpenOptions::new()
                     .write(true)
                     .truncate(false)
@@ -143,6 +154,20 @@ pub async fn create_and_allocate_files(
                     .await?;
                 file.set_len(file_info.length).await?;
             }
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                let file = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&file_info.path)
+                    .await?;
+                let metadata = file.metadata().await?;
+                if should_resize(&metadata) {
+                    file.set_len(file_info.length).await?;
+                }
+            }
+            Err(error) => return Err(error.into()),
         }
     }
     Ok(is_fresh_download)
@@ -153,6 +178,8 @@ pub async fn read_data_from_disk(
     global_offset: u64,
     bytes_to_read: usize,
 ) -> Result<Vec<u8>, StorageError> {
+    validate_io_span(multi_file_info, global_offset, bytes_to_read as u64, "read")?;
+
     let mut buffer = Vec::with_capacity(bytes_to_read);
     let mut bytes_read = 0;
 
@@ -187,12 +214,21 @@ pub async fn read_data_from_disk(
                         let zeros = vec![0u8; bytes_to_read_in_this_file];
                         buffer.extend_from_slice(&zeros);
                     } else {
-                        // Normal Read (Existing Skipped Files or Normal Files)
+                        // Normal read from existing skipped files or normal files.
+                        // Fresh downloads use zero-length placeholders instead of
+                        // preallocating, so in-span reads past the physical EOF are
+                        // treated as sparse zeroes.
                         let mut file = File::open(&file_info.path).await?;
-                        file.seek(SeekFrom::Start(local_offset)).await?;
-
+                        let physical_len = file.metadata().await?.len();
+                        let readable_bytes = physical_len
+                            .saturating_sub(local_offset)
+                            .min(bytes_to_read_in_this_file as u64)
+                            as usize;
                         let mut temp_buf = vec![0; bytes_to_read_in_this_file];
-                        file.read_exact(&mut temp_buf).await?;
+                        if readable_bytes > 0 {
+                            file.seek(SeekFrom::Start(local_offset)).await?;
+                            file.read_exact(&mut temp_buf[..readable_bytes]).await?;
+                        }
                         buffer.extend_from_slice(&temp_buf);
                     }
                 }
@@ -217,6 +253,13 @@ pub async fn write_data_to_disk(
     global_offset: u64,
     data_to_write: &[u8],
 ) -> Result<(), StorageError> {
+    validate_io_span(
+        multi_file_info,
+        global_offset,
+        data_to_write.len() as u64,
+        "write",
+    )?;
+
     let mut bytes_written = 0;
     let data_len = data_to_write.len();
 
@@ -279,6 +322,29 @@ pub async fn write_data_to_disk(
         std::io::ErrorKind::InvalidInput,
         "Failed to write all data, offset likely out of bounds",
     )))
+}
+
+fn validate_io_span(
+    multi_file_info: &MultiFileInfo,
+    global_offset: u64,
+    byte_count: u64,
+    operation: &str,
+) -> Result<(), StorageError> {
+    let Some(end_offset) = global_offset.checked_add(byte_count) else {
+        return Err(StorageError::from(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{operation} offset overflows torrent data span"),
+        )));
+    };
+
+    if end_offset > multi_file_info.total_size {
+        return Err(StorageError::from(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{operation} extends past torrent data span"),
+        )));
+    }
+
+    Ok(())
 }
 
 pub async fn build_fs_tree(
@@ -454,20 +520,53 @@ mod tests {
         let file_path = &mfi.files[0].path;
         assert!(tokio::fs::try_exists(file_path).await.unwrap());
         let metadata = tokio::fs::metadata(file_path).await.unwrap();
-        assert_eq!(metadata.len(), 100);
+        assert_eq!(metadata.len(), 0);
     }
 
     #[tokio::test]
     async fn test_create_and_allocate_files_resizes_existing_short_file() {
         let (_dir, mfi) = setup_single_file();
         let file_path = &mfi.files[0].path;
-        tokio::fs::write(file_path, []).await.unwrap();
+        tokio::fs::write(file_path, b"partial").await.unwrap();
 
         let is_fresh = create_and_allocate_files(&mfi).await.unwrap();
 
         assert!(!is_fresh);
         let metadata = tokio::fs::metadata(file_path).await.unwrap();
         assert_eq!(metadata.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn test_create_and_allocate_treats_zero_byte_placeholder_as_fresh() {
+        let (_dir, mfi) = setup_single_file();
+        let file_path = &mfi.files[0].path;
+        File::create(file_path).await.unwrap();
+
+        let is_fresh = create_and_allocate_files(&mfi).await.unwrap();
+
+        assert!(is_fresh);
+        let metadata = tokio::fs::metadata(file_path).await.unwrap();
+        assert_eq!(metadata.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_create_and_allocate_sizes_zero_placeholders_for_partial_download() {
+        let (_dir, mfi) = setup_multi_file();
+        tokio::fs::write(&mfi.files[0].path, b"partial")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(mfi.files[1].path.parent().unwrap())
+            .await
+            .unwrap();
+        File::create(&mfi.files[1].path).await.unwrap();
+
+        let is_fresh = create_and_allocate_files(&mfi).await.unwrap();
+
+        assert!(!is_fresh);
+        let metadata_a = tokio::fs::metadata(&mfi.files[0].path).await.unwrap();
+        assert_eq!(metadata_a.len(), mfi.files[0].length);
+        let metadata_b = tokio::fs::metadata(&mfi.files[1].path).await.unwrap();
+        assert_eq!(metadata_b.len(), mfi.files[1].length);
     }
 
     #[tokio::test]
@@ -482,11 +581,11 @@ mod tests {
         assert!(tokio::fs::try_exists(subdir_path).await.unwrap());
         assert!(tokio::fs::try_exists(file_a_path).await.unwrap());
         let metadata_a = tokio::fs::metadata(file_a_path).await.unwrap();
-        assert_eq!(metadata_a.len(), 50);
+        assert_eq!(metadata_a.len(), 0);
 
         assert!(tokio::fs::try_exists(file_b_path).await.unwrap());
         let metadata_b = tokio::fs::metadata(file_b_path).await.unwrap();
-        assert_eq!(metadata_b.len(), 70);
+        assert_eq!(metadata_b.len(), 0);
     }
 
     #[tokio::test]

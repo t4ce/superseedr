@@ -15,8 +15,8 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-use crate::app::FilePriority;
 use crate::app::TorrentControlState;
+use crate::app::{DataRate, FilePriority};
 use crate::fs_atomic::{
     deserialize_versioned_toml, serialize_versioned_toml, write_string_atomically,
     write_toml_atomically,
@@ -189,8 +189,10 @@ pub struct Settings {
     pub peer_sort_direction: SortDirection,
     pub peer_sort_pinned: bool,
     pub ui_theme: ThemeName,
+    pub ui_refresh_rate: DataRate,
     pub watch_folder: Option<PathBuf>,
     pub default_download_folder: Option<PathBuf>,
+    pub always_show_add_location_prompt: bool,
     pub max_connected_peers: usize,
     pub bootstrap_nodes: Vec<String>,
     pub global_download_limit_bps: u64,
@@ -226,6 +228,8 @@ impl Default for Settings {
             peer_sort_direction: PeerSortColumn::default().default_direction(),
             peer_sort_pinned: false,
             ui_theme: ThemeName::default(),
+            ui_refresh_rate: DataRate::default(),
+            always_show_add_location_prompt: false,
             max_connected_peers: 2000,
             bootstrap_nodes: vec![
                 "router.utorrent.com:6881".to_string(),
@@ -252,6 +256,7 @@ impl Default for Settings {
 pub struct TorrentSettings {
     pub torrent_or_magnet: String,
     pub name: String,
+    pub added_at_unix_secs: Option<u64>,
     pub validation_status: bool,
     pub download_path: Option<PathBuf>,
     pub container_name: Option<String>,
@@ -377,6 +382,7 @@ pub struct SharedConfigSelection {
 struct CatalogTorrentSettings {
     pub torrent_or_magnet: String,
     pub name: String,
+    pub added_at_unix_secs: Option<u64>,
     pub validation_status: bool,
     pub download_path: Option<PathBuf>,
     pub container_name: Option<String>,
@@ -400,6 +406,7 @@ struct SharedSettingsConfig {
     pub peer_sort_direction: SortDirection,
     pub peer_sort_pinned: bool,
     pub ui_theme: ThemeName,
+    pub ui_refresh_rate: DataRate,
     pub default_download_folder: Option<PathBuf>,
     pub max_connected_peers: usize,
     pub bootstrap_nodes: Vec<String>,
@@ -431,6 +438,7 @@ impl Default for SharedSettingsConfig {
             peer_sort_direction: settings.peer_sort_direction,
             peer_sort_pinned: settings.peer_sort_pinned,
             ui_theme: settings.ui_theme,
+            ui_refresh_rate: settings.ui_refresh_rate,
             default_download_folder: None,
             max_connected_peers: settings.max_connected_peers,
             bootstrap_nodes: settings.bootstrap_nodes,
@@ -468,6 +476,7 @@ struct HostConfig {
     pub client_id: Option<String>,
     pub client_port: u16,
     pub watch_folder: Option<PathBuf>,
+    pub always_show_add_location_prompt: bool,
 }
 
 impl Default for HostConfig {
@@ -477,6 +486,7 @@ impl Default for HostConfig {
             client_id: None,
             client_port: settings.client_port,
             watch_folder: settings.watch_folder,
+            always_show_add_location_prompt: settings.always_show_add_location_prompt,
         }
     }
 }
@@ -640,6 +650,7 @@ impl CatalogTorrentSettings {
                 shared_config_root,
             ),
             name: settings.name.clone(),
+            added_at_unix_secs: settings.added_at_unix_secs,
             validation_status: settings.validation_status,
             download_path: settings
                 .download_path
@@ -670,6 +681,7 @@ impl CatalogTorrentSettings {
                 shared_config_root,
             ),
             name: self.name.clone(),
+            added_at_unix_secs: self.added_at_unix_secs,
             validation_status: self.validation_status,
             download_path: self
                 .download_path
@@ -852,6 +864,7 @@ impl SharedSettingsConfig {
             peer_sort_direction: settings.peer_sort_direction,
             peer_sort_pinned: settings.peer_sort_pinned,
             ui_theme: settings.ui_theme,
+            ui_refresh_rate: settings.ui_refresh_rate,
             default_download_folder: settings
                 .default_download_folder
                 .as_deref()
@@ -889,6 +902,7 @@ impl SharedSettingsConfig {
         settings.peer_sort_direction = self.peer_sort_direction;
         settings.peer_sort_pinned = self.peer_sort_pinned;
         settings.ui_theme = self.ui_theme;
+        settings.ui_refresh_rate = self.ui_refresh_rate;
         settings.default_download_folder = self
             .default_download_folder
             .as_ref()
@@ -959,6 +973,7 @@ impl HostConfig {
             client_id: None,
             client_port: settings.client_port,
             watch_folder: settings.watch_folder.clone(),
+            always_show_add_location_prompt: settings.always_show_add_location_prompt,
         }
     }
 
@@ -967,6 +982,7 @@ impl HostConfig {
             client_id: (settings.client_id != shared_client_id).then(|| settings.client_id.clone()),
             client_port: settings.client_port,
             watch_folder: settings.watch_folder.clone(),
+            always_show_add_location_prompt: settings.always_show_add_location_prompt,
         }
     }
 
@@ -976,6 +992,7 @@ impl HostConfig {
         }
         settings.client_port = self.client_port;
         settings.watch_folder = self.watch_folder.clone();
+        settings.always_show_add_location_prompt = self.always_show_add_location_prompt;
     }
 }
 fn sanitize_host_id(raw: &str) -> String {
@@ -3109,6 +3126,7 @@ mod tests {
             torrent_sort_direction = "Descending"
             peer_sort_column = "Address"
             peer_sort_direction = "Ascending"
+            ui_refresh_rate = "Rate20s"
 
             watch_folder = "/path/to/watch"
             default_download_folder = "/path/to/download"
@@ -3156,6 +3174,7 @@ mod tests {
         assert_eq!(settings.torrent_sort_column, TorrentSortColumn::Name);
         assert_eq!(settings.torrent_sort_direction, SortDirection::Descending);
         assert_eq!(settings.peer_sort_column, PeerSortColumn::Address);
+        assert_eq!(settings.ui_refresh_rate, DataRate::Rate20s);
         assert_eq!(settings.watch_folder, Some(PathBuf::from("/path/to/watch")));
         assert_eq!(settings.resource_limit_override, Some(1024));
         assert_eq!(
@@ -3232,6 +3251,7 @@ mod tests {
         assert_eq!(settings.global_upload_limit_bps, UNLIMITED_RATE_LIMIT_BPS);
         assert_eq!(settings.torrent_sort_column, TorrentSortColumn::Up);
         assert_eq!(settings.peer_sort_direction, SortDirection::Descending);
+        assert_eq!(settings.ui_refresh_rate, DataRate::Rate1s);
         assert!(settings.watch_folder.is_none());
         assert_eq!(settings.max_connected_peers, 2000);
         assert_eq!(settings.bootstrap_nodes, default_settings.bootstrap_nodes);
@@ -3775,6 +3795,7 @@ mod tests {
             client_id: Some("host-a".to_string()),
             client_port: 7777,
             watch_folder: Some(PathBuf::from("/watch")),
+            always_show_add_location_prompt: true,
         };
 
         let mut settings = Settings::default();
@@ -5732,6 +5753,7 @@ mod tests {
         let mut host_only = current.clone();
         host_only.client_port = 4200;
         host_only.watch_folder = Some(PathBuf::from("/watch-b"));
+        host_only.always_show_add_location_prompt = true;
         assert_eq!(
             classify_shared_mode_settings_change(&current, &host_only),
             SettingsChangeScope::HostOnly

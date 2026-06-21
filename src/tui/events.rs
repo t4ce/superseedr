@@ -4,7 +4,7 @@
 use crate::app::{App, AppMode};
 use crate::tui::paste_burst::FlushResult as PasteBurstFlushResult;
 use crate::tui::screens::{
-    browser, config, delete_confirm, help, journal, normal, power, rss, welcome,
+    browser, config, delete_confirm, help, journal, normal, power, rss, torrents, welcome,
 };
 
 use ratatui::crossterm::event::{
@@ -181,10 +181,18 @@ fn should_debounce_escape(event: &CrosstermEvent) -> bool {
 async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
     match app.app_state.mode {
         AppMode::Help => {
-            help::handle_event(event, &mut app.app_state);
+            help::handle_event_with_settings(event, &mut app.app_state, &app.client_configs);
         }
         AppMode::Journal => {
-            journal::handle_event(event, &mut app.app_state, &app.app_command_tx);
+            journal::handle_event_with_shutdown(
+                event,
+                &mut app.app_state,
+                &app.app_command_tx,
+                &app.shutdown_tx,
+            );
+        }
+        AppMode::TorrentManagement => {
+            torrents::handle_event(event, app);
         }
         AppMode::Welcome => {
             welcome::handle_event(event, &mut app.app_state);
@@ -201,6 +209,8 @@ async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
                     items: app.app_state.ui.config.items.as_mut_slice(),
                     editing: &mut app.app_state.ui.config.editing,
                     app_command_tx: &app.app_command_tx,
+                    shutdown_tx: &app.shutdown_tx,
+                    file_browser_generation: &mut app.app_state.ui.file_browser.browser_generation,
                     global_dl_bucket: &app.global_dl_bucket,
                     global_ul_bucket: &app.global_ul_bucket,
                 },
@@ -210,11 +220,12 @@ async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
             let _ = delete_confirm::handle_event(event, app);
         }
         AppMode::Rss => {
-            rss::handle_event(
+            rss::handle_event_with_shutdown(
                 event,
                 &mut app.app_state,
                 &app.client_configs,
                 &app.app_command_tx,
+                &app.shutdown_tx,
             );
         }
         AppMode::FileBrowser => {}

@@ -5,7 +5,7 @@ use ratatui::{prelude::*, widgets::*};
 
 use crate::tui::screen_context::ScreenContext;
 use crate::tui::screens::{
-    browser, config, delete_confirm, help, journal, normal, power, rss, welcome,
+    browser, config, delete_confirm, help, journal, normal, power, rss, torrents, welcome,
 };
 
 use crate::app::{AppMode, AppState};
@@ -43,6 +43,13 @@ pub fn draw(
         AppMode::Journal => {
             apply_theme_particles_background_to_frame(f, &ctx);
             journal::draw(f, &screen);
+            apply_theme_effects_to_frame(f, &ctx);
+            apply_theme_particles_foreground_to_frame(f, &ctx);
+            return;
+        }
+        AppMode::TorrentManagement => {
+            apply_theme_particles_background_to_frame(f, &ctx);
+            torrents::draw(f, &screen);
             apply_theme_effects_to_frame(f, &ctx);
             apply_theme_particles_foreground_to_frame(f, &ctx);
             return;

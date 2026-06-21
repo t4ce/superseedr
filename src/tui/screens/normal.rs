@@ -10,7 +10,6 @@ use crate::app::torrent_is_effectively_incomplete;
 use crate::app::AppCommand;
 use crate::app::BrowserPane;
 use crate::app::ChartPanelView;
-use crate::app::FileBrowserMode;
 use crate::app::FilePriority;
 use crate::app::GraphDisplayMode;
 use crate::app::PeerInfo;
@@ -19,6 +18,7 @@ use crate::app::{
     App, AppMode, AppState, ConfigItem, RssScreen, SelectedHeader, TorrentControlState,
     TorrentDisplayState,
 };
+use crate::app::{DownloadSelectionTarget, FileBrowserMode};
 use crate::config::{PeerSortColumn, Settings, SortDirection, TorrentSortColumn};
 use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
 use crate::integrations::control::ControlRequest;
@@ -26,11 +26,13 @@ use crate::persistence::activity_history::{ActivityHistoryPoint, ActivityHistory
 use crate::persistence::network_history::NetworkHistoryPoint;
 use crate::theme::{ThemeContext, ThemeName};
 use crate::torrent_manager::{ManagerCommand, TorrentFileProbeStatus};
+use crate::tui::action_style::{footer_key_style, ActionTone};
+use crate::tui::app_command::spawn_app_command_sender;
 use crate::tui::formatters::{
-    auto_download_limit_applied, calculate_nice_upper_bound, format_bytes, format_countdown,
-    format_duration, format_iops, format_latency, format_limit_bps, format_memory, format_speed,
-    format_time, generate_x_axis_labels, ip_to_color, parse_peer_id, sanitize_text, speed_to_style,
-    truncate_with_ellipsis,
+    anonymize_preserving_shape, auto_download_limit_applied, calculate_nice_upper_bound,
+    format_bytes, format_countdown, format_duration, format_iops, format_latency, format_limit_bps,
+    format_memory, format_speed, format_time, generate_x_axis_labels, ip_to_color, parse_peer_id,
+    sanitize_text, speed_to_style, truncate_with_ellipsis,
 };
 use crate::tui::layout::common::compute_visible_peer_columns;
 use crate::tui::layout::common::compute_visible_torrent_columns;
@@ -57,9 +59,10 @@ use ratatui::crossterm::event::{
     Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
 use ratatui::layout::Layout;
+#[cfg(not(all(feature = "dht", feature = "pex")))]
+use ratatui::prelude::Stylize;
 use ratatui::prelude::{
     symbols, Alignment, Color, Constraint, Direction, Frame, Line, Modifier, Rect, Span, Style,
-    Stylize,
 };
 use ratatui::widgets::{
     Block, Borders, Cell, Clear, Gauge, LineGauge, List, ListItem, Padding, Paragraph, Row, Table,
@@ -397,7 +400,6 @@ pub enum UiAction {
     ClearSystemError,
     StartSearch,
     Navigate(KeyCode),
-    ToggleTorrentFiles,
     ToggleAnonymizeNames,
     EnterPowerSaving,
     RequestQuit,
@@ -406,10 +408,12 @@ pub enum UiAction {
     GraphNext,
     GraphPrev,
     OpenAddTorrentBrowser,
+    OpenSelectedTorrentFiles,
     OpenDeleteConfirm { with_files: bool },
     OpenConfig,
     OpenRss,
     OpenJournal,
+    OpenTorrentManagement,
     DataRateSlower,
     DataRateFaster,
     ThemePrev,
@@ -426,9 +430,11 @@ pub enum UiEffect {
     ToPowerSaving,
     ToDeleteConfirm,
     OpenAddTorrentFileBrowser,
+    OpenExistingTorrentFileBrowser(Vec<u8>),
     OpenConfigScreen,
     OpenRssScreen,
     OpenJournalScreen,
+    OpenTorrentManagementScreen,
     BroadcastManagerDataRate(u64),
     ApplyThemePrev,
     ApplyThemeNext,
@@ -463,13 +469,6 @@ pub fn reduce_ui_action(app_state: &mut AppState, action: UiAction) -> ReduceRes
         }
         UiAction::Navigate(key_code) => {
             handle_navigation(app_state, key_code);
-            ReduceResult {
-                redraw: true,
-                effects: Vec::new(),
-            }
-        }
-        UiAction::ToggleTorrentFiles => {
-            app_state.ui.show_torrent_files = !app_state.ui.show_torrent_files;
             ReduceResult {
                 redraw: true,
                 effects: Vec::new(),
@@ -525,6 +524,23 @@ pub fn reduce_ui_action(app_state: &mut AppState, action: UiAction) -> ReduceRes
             redraw: true,
             effects: vec![UiEffect::OpenAddTorrentFileBrowser],
         },
+        UiAction::OpenSelectedTorrentFiles => {
+            let selected_hash = app_state
+                .torrent_list_order
+                .get(app_state.ui.selected_torrent_index)
+                .cloned();
+            if let Some(info_hash) = selected_hash {
+                ReduceResult {
+                    redraw: true,
+                    effects: vec![UiEffect::OpenExistingTorrentFileBrowser(info_hash)],
+                }
+            } else {
+                ReduceResult {
+                    redraw: true,
+                    effects: Vec::new(),
+                }
+            }
+        }
         UiAction::OpenDeleteConfirm { with_files } => {
             if let Some(info_hash) = app_state
                 .torrent_list_order
@@ -550,6 +566,10 @@ pub fn reduce_ui_action(app_state: &mut AppState, action: UiAction) -> ReduceRes
         UiAction::OpenJournal => ReduceResult {
             redraw: true,
             effects: vec![UiEffect::OpenJournalScreen],
+        },
+        UiAction::OpenTorrentManagement => ReduceResult {
+            redraw: true,
+            effects: vec![UiEffect::OpenTorrentManagementScreen],
         },
         UiAction::DataRateSlower => {
             app_state.data_rate = app_state.data_rate.next_slower();
@@ -734,7 +754,6 @@ fn map_key_to_ui_action(key: KeyEvent) -> Option<UiAction> {
     match key.code {
         KeyCode::Esc => Some(UiAction::ClearSystemError),
         KeyCode::Char('/') => Some(UiAction::StartSearch),
-        KeyCode::Char('f') => Some(UiAction::ToggleTorrentFiles),
         KeyCode::Char('x') => Some(UiAction::ToggleAnonymizeNames),
         KeyCode::Char('z') => Some(UiAction::EnterPowerSaving),
         KeyCode::Char('Q') => Some(UiAction::RequestQuit),
@@ -743,11 +762,13 @@ fn map_key_to_ui_action(key: KeyEvent) -> Option<UiAction> {
         KeyCode::Char('t') => Some(UiAction::GraphNext),
         KeyCode::Char('T') => Some(UiAction::GraphPrev),
         KeyCode::Char('a') => Some(UiAction::OpenAddTorrentBrowser),
+        KeyCode::Char('f') => Some(UiAction::OpenSelectedTorrentFiles),
         KeyCode::Char('d') => Some(UiAction::OpenDeleteConfirm { with_files: false }),
         KeyCode::Char('D') => Some(UiAction::OpenDeleteConfirm { with_files: true }),
         KeyCode::Char('c') => Some(UiAction::OpenConfig),
         KeyCode::Char('r') => Some(UiAction::OpenRss),
         KeyCode::Char('J') => Some(UiAction::OpenJournal),
+        KeyCode::Char('M') => Some(UiAction::OpenTorrentManagement),
         KeyCode::Char('m') => Some(UiAction::OpenHelp),
         KeyCode::Char('[') | KeyCode::Char('{') => Some(UiAction::DataRateSlower),
         KeyCode::Char(']') | KeyCode::Char('}') => Some(UiAction::DataRateFaster),
@@ -774,6 +795,28 @@ fn torrent_sort_column_uses_autosort(column: TorrentSortColumn) -> bool {
 
 fn peer_sort_column_uses_autosort(column: PeerSortColumn) -> bool {
     matches!(column, PeerSortColumn::DL | PeerSortColumn::UL)
+}
+
+fn sort_direction_arrow_for_torrent_column(
+    column: TorrentSortColumn,
+    direction: SortDirection,
+) -> &'static str {
+    match (column, direction) {
+        (TorrentSortColumn::Down | TorrentSortColumn::Up, SortDirection::Descending) => " ▼",
+        (_, SortDirection::Ascending) => " ▼",
+        _ => " ▲",
+    }
+}
+
+fn sort_direction_arrow_for_peer_column(
+    column: PeerSortColumn,
+    direction: SortDirection,
+) -> &'static str {
+    match (column, direction) {
+        (PeerSortColumn::DL | PeerSortColumn::UL, SortDirection::Descending) => " ▼",
+        (_, SortDirection::Ascending) => " ▼",
+        _ => " ▲",
+    }
 }
 
 pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>, plan: &LayoutPlan) {
@@ -848,11 +891,6 @@ enum PeerTableRow {
 }
 
 fn draw_peer_files_area(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &ThemeContext) {
-    if app_state.ui.show_torrent_files {
-        draw_torrent_files_panel(f, app_state, area, ctx);
-        return;
-    }
-
     let Some(layout) = torrent_peer_files_layout(app_state, area) else {
         draw_peers_table(f, app_state, area, ctx);
         return;
@@ -1815,103 +1853,34 @@ pub fn draw_footer(
     push_if_fits(
         "[arrows]",
         " nav",
-        ctx.apply(Style::default().fg(ctx.state_info())),
+        footer_key_style(ctx, ActionTone::Navigate),
     );
-    push_if_fits(
-        "[Q]",
-        "uit",
-        ctx.apply(Style::default().fg(ctx.state_error())),
-    );
-    push_if_fits(
-        "[Paste]",
-        "paste",
-        ctx.apply(Style::default().fg(ctx.accent_teal())),
-    );
-    push_if_fits(
-        "[p]",
-        "ause",
-        ctx.apply(Style::default().fg(ctx.state_success())),
-    );
-    push_if_fits(
-        "[a]",
-        "dd",
-        ctx.apply(Style::default().fg(ctx.state_success())),
-    );
-    push_if_fits(
-        "[f]",
-        "iles",
-        ctx.apply(Style::default().fg(ctx.accent_teal())),
-    );
+    push_if_fits("[Q]", "uit", footer_key_style(ctx, ActionTone::Destructive));
+    push_if_fits("[Paste]", "paste", footer_key_style(ctx, ActionTone::Paste));
+    push_if_fits("[p]", "ause", footer_key_style(ctx, ActionTone::Queue));
+    push_if_fits("[a]", "dd", footer_key_style(ctx, ActionTone::Add));
     push_if_fits(
         "[d]",
         "elete",
-        ctx.apply(Style::default().fg(ctx.state_warning())),
+        footer_key_style(ctx, ActionTone::Destructive),
     );
-    push_if_fits(
-        "[s]",
-        "ort",
-        ctx.apply(Style::default().fg(ctx.state_selected())),
-    );
-    push_if_fits(
-        "[t]",
-        "ime",
-        ctx.apply(Style::default().fg(ctx.accent_sapphire())),
-    );
-    push_if_fits(
-        "[g]",
-        "raph",
-        ctx.apply(Style::default().fg(ctx.state_warning())),
-    );
-    push_if_fits(
-        "[<]theme[>]",
-        "",
-        ctx.apply(Style::default().fg(ctx.state_selected())),
-    );
-    push_if_fits(
-        "[/]",
-        "search",
-        ctx.apply(Style::default().fg(ctx.state_warning())),
-    );
-    push_if_fits(
-        "[c]",
-        "onfig",
-        ctx.apply(Style::default().fg(ctx.state_complete())),
-    );
-    push_if_fits(
-        "[r]",
-        "ss",
-        ctx.apply(Style::default().fg(ctx.accent_sapphire())),
-    );
+    push_if_fits("[s]", "ort", footer_key_style(ctx, ActionTone::Sort));
+    push_if_fits("[t]", "ime", footer_key_style(ctx, ActionTone::Rate));
+    push_if_fits("[g]", "raph", footer_key_style(ctx, ActionTone::Mode));
+    push_if_fits("[<]theme[>]", "", footer_key_style(ctx, ActionTone::Theme));
+    push_if_fits("[/]", "search", footer_key_style(ctx, ActionTone::Search));
+    push_if_fits("[c]", "onfig", footer_key_style(ctx, ActionTone::Open));
+    push_if_fits("[r]", "ss", footer_key_style(ctx, ActionTone::Open));
     push_if_fits(
         "[d]",
         "elete",
-        ctx.apply(Style::default().fg(ctx.state_error())),
+        footer_key_style(ctx, ActionTone::Destructive),
     );
-    push_if_fits(
-        "[x]",
-        "anon",
-        ctx.apply(Style::default().fg(ctx.accent_sapphire())),
-    );
-    push_if_fits(
-        "[z]",
-        "power",
-        ctx.apply(Style::default().fg(ctx.state_warning())),
-    );
-    push_if_fits(
-        "[T]",
-        "time++",
-        ctx.apply(Style::default().fg(ctx.accent_sapphire())),
-    );
-    push_if_fits(
-        "[[]",
-        "slower",
-        ctx.apply(Style::default().fg(ctx.state_info())),
-    );
-    push_if_fits(
-        "[]]",
-        "faster",
-        ctx.apply(Style::default().fg(ctx.state_success())),
-    );
+    push_if_fits("[x]", "anon", footer_key_style(ctx, ActionTone::Toggle));
+    push_if_fits("[z]", "power", footer_key_style(ctx, ActionTone::Toggle));
+    push_if_fits("[T]", "time++", footer_key_style(ctx, ActionTone::Rate));
+    push_if_fits("[[]", "slower", footer_key_style(ctx, ActionTone::Rate));
+    push_if_fits("[]]", "faster", footer_key_style(ctx, ActionTone::Rate));
 
     if !try_push_footer_command(
         &mut spans,
@@ -1919,7 +1888,7 @@ pub fn draw_footer(
         max_width,
         manual_key,
         manual_suffix,
-        ctx.apply(Style::default().fg(ctx.accent_teal())),
+        footer_key_style(ctx, ActionTone::Open),
     ) {
         let _ = try_push_footer_command(
             &mut spans,
@@ -2103,16 +2072,16 @@ pub fn draw_torrent_list(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &
             let mut spans = vec![];
             let mut text_span = Span::styled(def.header, style);
             if is_selected {
-                text_span = text_span.underlined().bold();
+                text_span = text_span.style(
+                    style
+                        .fg(ctx.state_selected())
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                );
             }
             spans.push(text_span);
 
             if is_sorting {
-                let arrow = if sort_dir == SortDirection::Ascending {
-                    " ▲"
-                } else {
-                    " ▼"
-                };
+                let arrow = sort_direction_arrow_for_torrent_column(sort_col, sort_dir);
                 spans.push(Span::styled(arrow, style));
             }
             Cell::from(Line::from(spans))
@@ -2374,14 +2343,11 @@ pub fn draw_details_panel(
         };
         let progress_ratio = (progress_pct / 100.0).clamp(0.0, 1.0);
         let progress_label_text = format!("{:.1}%", progress_pct);
-        let custom_line_set = symbols::line::Set {
-            horizontal: "⣿",
-            ..symbols::line::THICK
-        };
         let line_gauge = LineGauge::default()
             .ratio(progress_ratio)
             .label(progress_label_text)
-            .line_set(custom_line_set)
+            .filled_symbol("⣿")
+            .unfilled_symbol(symbols::line::THICK.horizontal)
             .filled_style(ctx.apply(Style::default().fg(ctx.state_success())));
         f.render_widget(line_gauge, progress_chunks[1]);
 
@@ -4868,16 +4834,19 @@ fn draw_peers_table_impl(
 
                             let mut text = def.header.to_string();
                             if is_sorting {
-                                text.push_str(if sort_direction == SortDirection::Ascending {
-                                    " ▲"
-                                } else {
-                                    " ▼"
-                                });
+                                text.push_str(sort_direction_arrow_for_peer_column(
+                                    sort_by,
+                                    sort_direction,
+                                ));
                             }
 
                             let mut span = Span::styled(text, style);
                             if is_selected {
-                                span = span.underlined().bold();
+                                span = span.style(
+                                    style
+                                        .fg(ctx.state_selected())
+                                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                                );
                             }
                             Cell::from(Line::from(vec![span]))
                         })
@@ -5211,15 +5180,6 @@ fn peer_is_inactive_for_table(peer: &PeerInfo) -> bool {
     peer.download_speed_bps == 0 && peer.upload_speed_bps == 0
 }
 
-pub fn draw_torrent_files_panel(
-    f: &mut Frame,
-    app_state: &AppState,
-    area: Rect,
-    ctx: &ThemeContext,
-) {
-    draw_torrent_files_panel_impl(f, app_state, area, ctx, true, TorrentFilesRenderMode::Tree);
-}
-
 fn draw_torrent_files_panel_without_swarm(
     f: &mut Frame,
     app_state: &AppState,
@@ -5227,7 +5187,7 @@ fn draw_torrent_files_panel_without_swarm(
     ctx: &ThemeContext,
     files_mode: TorrentFilesRenderMode,
 ) {
-    draw_torrent_files_panel_impl(f, app_state, area, ctx, false, files_mode);
+    draw_torrent_files_panel_impl(f, app_state, area, ctx, files_mode);
 }
 
 fn draw_torrent_files_panel_impl(
@@ -5235,14 +5195,13 @@ fn draw_torrent_files_panel_impl(
     app_state: &AppState,
     area: Rect,
     ctx: &ThemeContext,
-    include_swarm: bool,
     files_mode: TorrentFilesRenderMode,
 ) {
     if area.height < 2 || area.width < 2 {
         return;
     }
 
-    let Some((info_hash, torrent)) = selected_torrent_entry(app_state) else {
+    let Some((_, torrent)) = selected_torrent_entry(app_state) else {
         let body_area = draw_torrent_files_frame(f, area, ctx);
         let empty = Paragraph::new("No torrent selected")
             .alignment(Alignment::Center)
@@ -5251,70 +5210,20 @@ fn draw_torrent_files_panel_impl(
         return;
     };
 
-    let max_files_height_with_swarm = area
-        .height
-        .saturating_sub(MIN_SWARM_AVAILABILITY_HEIGHT)
-        .saturating_sub(FILES_SWARM_SPACER_HEIGHT);
-    let file_block_height_with_swarm = torrent_files_panel_height_needed(
+    let body_area = draw_torrent_files_frame(f, area, ctx);
+    let list_items = build_torrent_file_list_items(
         torrent,
-        area.width,
-        app_state.anonymize_torrent_names,
-        max_files_height_with_swarm,
+        TorrentFilesListRenderOptions {
+            width: body_area.width,
+            height: body_area.height,
+            anonymize: app_state.anonymize_torrent_names,
+            download_phase: app_state.ui.file_activity_download_phase,
+            upload_phase: app_state.ui.file_activity_upload_phase,
+            mode: files_mode,
+        },
+        ctx,
     );
-    let file_block_height_needed = file_block_height_with_swarm.unwrap_or(area.height);
-    let remaining_height = area
-        .height
-        .saturating_sub(file_block_height_needed)
-        .saturating_sub(FILES_SWARM_SPACER_HEIGHT);
-
-    if include_swarm
-        && file_block_height_with_swarm.is_some()
-        && remaining_height >= MIN_SWARM_AVAILABILITY_HEIGHT
-    {
-        let layout_chunks = Layout::vertical([
-            Constraint::Length(file_block_height_needed),
-            Constraint::Length(FILES_SWARM_SPACER_HEIGHT),
-            Constraint::Min(0),
-        ])
-        .split(area);
-        let inner_area = draw_torrent_files_frame(f, layout_chunks[0], ctx);
-        let list_items = build_torrent_file_list_items(
-            torrent,
-            TorrentFilesListRenderOptions {
-                width: inner_area.width,
-                height: inner_area.height,
-                anonymize: app_state.anonymize_torrent_names,
-                download_phase: app_state.ui.file_activity_download_phase,
-                upload_phase: app_state.ui.file_activity_upload_phase,
-                mode: files_mode,
-            },
-            ctx,
-        );
-        f.render_widget(List::new(list_items), inner_area);
-        draw_swarm_heatmap(
-            f,
-            ctx,
-            &torrent.latest_state.peers,
-            torrent.latest_state.number_of_pieces_total,
-            layout_chunks[2],
-            Some(swarm_heatmap_flash(app_state, info_hash)),
-        );
-    } else {
-        let body_area = draw_torrent_files_frame(f, area, ctx);
-        let list_items = build_torrent_file_list_items(
-            torrent,
-            TorrentFilesListRenderOptions {
-                width: body_area.width,
-                height: body_area.height,
-                anonymize: app_state.anonymize_torrent_names,
-                download_phase: app_state.ui.file_activity_download_phase,
-                upload_phase: app_state.ui.file_activity_upload_phase,
-                mode: files_mode,
-            },
-            ctx,
-        );
-        f.render_widget(List::new(list_items), body_area);
-    }
+    f.render_widget(List::new(list_items), body_area);
 }
 
 fn draw_torrent_files_frame(_f: &mut Frame, area: Rect, _ctx: &ThemeContext) -> Rect {
@@ -5963,9 +5872,14 @@ fn render_file_tree_name_spans(
         file_tree_activity_paths(torrent, relative_path, is_dir, download_wave, upload_wave);
     let row_active = !download_paths.is_empty() || !upload_paths.is_empty();
     let active_base_style = render_ctx.ctx.apply(render_ctx.base_style);
+    let inactive_base_style = render_ctx.ctx.apply(
+        render_ctx
+            .base_style
+            .fg(render_ctx.ctx.theme.semantic.surface1),
+    );
 
     if !row_active {
-        return vec![Span::styled(display_name.to_string(), active_base_style)];
+        return vec![Span::styled(display_name.to_string(), inactive_base_style)];
     }
 
     let download_step = render_ctx.download_phase.floor() as usize;
@@ -6318,46 +6232,11 @@ fn shape_root_path_for_viewport(path: &str, width: usize, height: usize) -> Vec<
 
 fn anonymize_tree_name(name: &str, is_dir: bool, anonymize: bool) -> String {
     if !anonymize {
-        return name.to_string();
+        return sanitize_text(name);
     }
 
     let _ = is_dir;
     anonymize_preserving_shape(name)
-}
-
-fn anonymize_preserving_shape(input: &str) -> String {
-    let seed = stable_string_seed(input);
-    input
-        .chars()
-        .enumerate()
-        .map(|(idx, ch)| anonymized_shape_char(seed, idx, ch))
-        .collect()
-}
-
-fn stable_string_seed(input: &str) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in input.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
-}
-
-fn anonymized_shape_char(seed: u64, idx: usize, ch: char) -> char {
-    let mut state = seed ^ ((idx as u64 + 1).wrapping_mul(0x9e3779b97f4a7c15));
-    state ^= state >> 30;
-    state = state.wrapping_mul(0xbf58476d1ce4e5b9);
-    state ^= state >> 27;
-    state = state.wrapping_mul(0x94d049bb133111eb);
-    state ^= state >> 31;
-
-    if ch.is_alphanumeric() || ch.is_alphabetic() {
-        (b'a' + (state % 26) as u8) as char
-    } else if ch.is_whitespace() || ch == '/' || ch == '\\' {
-        ch
-    } else {
-        ' '
-    }
 }
 
 fn peer_has_all_pieces(peer: &PeerInfo, total_pieces: usize) -> bool {
@@ -6718,13 +6597,6 @@ pub(crate) fn handle_navigation(app_state: &mut AppState, key_code: KeyCode) {
                         torrent_column_id_for_index(visible_torrent_columns[pos - 1])
                             .map(SelectedHeader::Torrent)
                             .unwrap_or(SelectedHeader::Torrent(column_id))
-                    } else if selected_torrent_has_peers {
-                        visible_peer_columns
-                            .last()
-                            .copied()
-                            .and_then(peer_column_id_for_index)
-                            .map(SelectedHeader::Peer)
-                            .unwrap_or(SelectedHeader::Torrent(column_id))
                     } else {
                         SelectedHeader::Torrent(column_id)
                     }
@@ -6784,12 +6656,7 @@ pub(crate) fn handle_navigation(app_state: &mut AppState, key_code: KeyCode) {
                             .map(SelectedHeader::Peer)
                             .unwrap_or(SelectedHeader::Peer(column_id))
                     } else {
-                        visible_torrent_columns
-                            .first()
-                            .copied()
-                            .and_then(torrent_column_id_for_index)
-                            .map(SelectedHeader::Torrent)
-                            .unwrap_or(SelectedHeader::Torrent(ColumnId::Name))
+                        SelectedHeader::Peer(column_id)
                     }
                 }
             };
@@ -6861,39 +6728,54 @@ async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
         PastedContent::Magnet(magnet_link) => {
             let download_path = app.client_configs.default_download_folder.clone();
 
-            if let Some(download_path) = download_path {
+            if let Some(download_path) =
+                download_path.filter(|_| !app.client_configs.always_show_add_location_prompt)
+            {
                 let request = app.prepare_add_magnet_request(
                     magnet_link.to_string(),
                     Some(download_path),
                     None,
                     HashMap::new(),
                 );
-                let _ = app
-                    .app_command_tx
-                    .send(AppCommand::SubmitControlRequest(request))
-                    .await;
+                spawn_app_command_sender(
+                    app.app_command_tx.clone(),
+                    app.shutdown_tx.subscribe(),
+                    AppCommand::SubmitControlRequest(request),
+                );
             } else {
                 app.app_state.pending_torrent_link = magnet_link.to_string();
                 let initial_path = app.get_initial_destination_path();
-                let _ = app.app_command_tx.try_send(AppCommand::FetchFileTree {
-                    path: initial_path,
-                    browser_mode: FileBrowserMode::DownloadLocSelection {
-                        torrent_files: vec![],
-                        container_name: String::new(),
-                        use_container: false,
-                        is_editing_name: false,
-                        focused_pane: BrowserPane::FileSystem,
-                        preview_tree: Vec::new(),
-                        preview_state: TreeViewState::default(),
-                        cursor_pos: 0,
-                        original_name_backup: "Magnet Download".to_string(),
+                let browser_generation = app.app_state.ui.file_browser.next_browser_generation();
+                spawn_app_command_sender(
+                    app.app_command_tx.clone(),
+                    app.shutdown_tx.subscribe(),
+                    AppCommand::FetchFileTree {
+                        browser_generation,
+                        path: initial_path,
+                        browser_mode: FileBrowserMode::DownloadLocSelection {
+                            target: DownloadSelectionTarget::PendingAdd,
+                            torrent_files: vec![],
+                            container_name: String::new(),
+                            use_container: false,
+                            is_editing_name: false,
+                            focused_pane: BrowserPane::FileSystem,
+                            preview_tree: Vec::new(),
+                            preview_state: TreeViewState::default(),
+                            cursor_pos: 0,
+                            original_name_backup: "Magnet Download".to_string(),
+                        },
+                        highlight_path: None,
                     },
-                    highlight_path: None,
-                });
+                );
             }
         }
         PastedContent::TorrentFile(path) => {
-            if let Some(download_path) = app.client_configs.default_download_folder.clone() {
+            if let Some(download_path) = app
+                .client_configs
+                .default_download_folder
+                .clone()
+                .filter(|_| !app.client_configs.always_show_add_location_prompt)
+            {
                 match app.prepare_add_torrent_file_request(
                     path.to_path_buf(),
                     Some(download_path),
@@ -6901,19 +6783,22 @@ async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
                     HashMap::new(),
                 ) {
                     Ok(request) => {
-                        let _ = app
-                            .app_command_tx
-                            .send(AppCommand::SubmitControlRequest(request))
-                            .await;
+                        spawn_app_command_sender(
+                            app.app_command_tx.clone(),
+                            app.shutdown_tx.subscribe(),
+                            AppCommand::SubmitControlRequest(request),
+                        );
                     }
                     Err(error) => {
                         app.app_state.system_error = Some(error);
                     }
                 }
             } else {
-                let _ = app
-                    .app_command_tx
-                    .try_send(AppCommand::AddTorrentFromFile(path.to_path_buf()));
+                spawn_app_command_sender(
+                    app.app_command_tx.clone(),
+                    app.shutdown_tx.subscribe(),
+                    AppCommand::AddTorrentFromFile(path.to_path_buf()),
+                );
             }
         }
         PastedContent::Unsupported => {
@@ -6988,11 +6873,20 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
         }
         UiEffect::OpenAddTorrentFileBrowser => {
             let initial_path = app.get_initial_source_path();
-            let _ = app.app_command_tx.try_send(AppCommand::FetchFileTree {
-                path: initial_path,
-                browser_mode: FileBrowserMode::File(vec![".torrent".to_string()]),
-                highlight_path: None,
-            });
+            let browser_generation = app.app_state.ui.file_browser.next_browser_generation();
+            spawn_app_command_sender(
+                app.app_command_tx.clone(),
+                app.shutdown_tx.subscribe(),
+                AppCommand::FetchFileTree {
+                    browser_generation,
+                    path: initial_path,
+                    browser_mode: FileBrowserMode::File(vec![".torrent".to_string()]),
+                    highlight_path: None,
+                },
+            );
+        }
+        UiEffect::OpenExistingTorrentFileBrowser(info_hash) => {
+            app.open_existing_torrent_file_browser(info_hash);
         }
         UiEffect::OpenConfigScreen => {
             *app.app_state.ui.config.settings_edit = app.client_configs.clone();
@@ -7026,9 +6920,11 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
             };
             app.client_configs.ui_theme = themes[new_idx];
             app.app_state.theme = crate::theme::Theme::builtin(themes[new_idx]);
-            let _ = app
-                .app_command_tx
-                .try_send(AppCommand::UpdateConfig(app.client_configs.clone()));
+            spawn_app_command_sender(
+                app.app_command_tx.clone(),
+                app.shutdown_tx.subscribe(),
+                AppCommand::UpdateConfig(app.client_configs.clone()),
+            );
         }
         UiEffect::ApplyThemeNext => {
             if app.is_current_shared_follower() {
@@ -7046,23 +6942,29 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
             let new_idx = (current_idx + 1) % themes.len();
             app.client_configs.ui_theme = themes[new_idx];
             app.app_state.theme = crate::theme::Theme::builtin(themes[new_idx]);
-            let _ = app
-                .app_command_tx
-                .try_send(AppCommand::UpdateConfig(app.client_configs.clone()));
+            spawn_app_command_sender(
+                app.app_command_tx.clone(),
+                app.shutdown_tx.subscribe(),
+                AppCommand::UpdateConfig(app.client_configs.clone()),
+            );
         }
         UiEffect::SendPause(info_hash) => {
-            let _ = app
-                .app_command_tx
-                .try_send(AppCommand::SubmitControlRequest(ControlRequest::Pause {
+            spawn_app_command_sender(
+                app.app_command_tx.clone(),
+                app.shutdown_tx.subscribe(),
+                AppCommand::SubmitControlRequest(ControlRequest::Pause {
                     info_hash_hex: hex::encode(info_hash),
-                }));
+                }),
+            );
         }
         UiEffect::SendResume(info_hash) => {
-            let _ = app
-                .app_command_tx
-                .try_send(AppCommand::SubmitControlRequest(ControlRequest::Resume {
+            spawn_app_command_sender(
+                app.app_command_tx.clone(),
+                app.shutdown_tx.subscribe(),
+                AppCommand::SubmitControlRequest(ControlRequest::Resume {
                     info_hash_hex: hex::encode(info_hash),
-                }));
+                }),
+            );
         }
         UiEffect::OpenHelpScreen => {
             app.app_state.mode = AppMode::Help;
@@ -7075,6 +6977,11 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
             app.app_state.ui.journal.selected_index = 0;
             app.app_state.mode = AppMode::Journal;
         }
+        UiEffect::OpenTorrentManagementScreen => {
+            app.app_state.ui.torrent_management.selected_index = 0;
+            app.app_state.ui.torrent_management.status_message = None;
+            app.app_state.mode = AppMode::TorrentManagement;
+        }
         UiEffect::HandlePastedText(text) => {
             handle_pasted_text(app, &text).await;
         }
@@ -7085,8 +6992,8 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
 mod tests {
     use super::*;
     use crate::app::{
-        AppState, DataRate, PeerInfo, SelectedHeader, TorrentControlState, TorrentDisplayState,
-        TorrentMetrics,
+        AppState, BrowserSearchState, DataRate, PeerInfo, SelectedHeader, TorrentControlState,
+        TorrentDisplayState, TorrentMetrics,
     };
     use crate::config::{PeerSortColumn, SortDirection, TorrentSortColumn};
     use crate::errors::StorageError;
@@ -7095,6 +7002,46 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
     use tempfile::tempdir;
+
+    #[test]
+    fn sort_direction_arrows_show_highest_first_rates_as_down() {
+        assert_eq!(
+            sort_direction_arrow_for_torrent_column(
+                TorrentSortColumn::Down,
+                SortDirection::Descending
+            ),
+            " ▼"
+        );
+        assert_eq!(
+            sort_direction_arrow_for_torrent_column(
+                TorrentSortColumn::Up,
+                SortDirection::Descending
+            ),
+            " ▼"
+        );
+        assert_eq!(
+            sort_direction_arrow_for_peer_column(PeerSortColumn::DL, SortDirection::Descending),
+            " ▼"
+        );
+        assert_eq!(
+            sort_direction_arrow_for_peer_column(PeerSortColumn::UL, SortDirection::Descending),
+            " ▼"
+        );
+        assert_eq!(
+            sort_direction_arrow_for_torrent_column(
+                TorrentSortColumn::Name,
+                SortDirection::Ascending
+            ),
+            " ▼"
+        );
+        assert_eq!(
+            sort_direction_arrow_for_torrent_column(
+                TorrentSortColumn::Name,
+                SortDirection::Descending
+            ),
+            " ▲"
+        );
+    }
 
     fn create_mock_metrics(peer_count: usize) -> TorrentMetrics {
         let mut peers = Vec::new();
@@ -7170,14 +7117,17 @@ mod tests {
     #[test]
     fn reducer_start_search_keeps_browser_search_state_intact() {
         let mut app_state = AppState::default();
-        app_state.ui.file_browser.is_searching = true;
+        app_state.ui.file_browser.search_state = BrowserSearchState::Editing;
         app_state.ui.file_browser.search_query = "downloads".to_string();
 
         let result = reduce_ui_action(&mut app_state, UiAction::StartSearch);
 
         assert!(result.redraw);
         assert!(app_state.ui.is_searching);
-        assert!(app_state.ui.file_browser.is_searching);
+        assert_eq!(
+            app_state.ui.file_browser.search_state,
+            BrowserSearchState::Editing
+        );
         assert_eq!(app_state.ui.file_browser.search_query, "downloads");
     }
 
@@ -7208,6 +7158,66 @@ mod tests {
     }
 
     #[test]
+    fn reducer_left_from_first_torrent_column_does_not_wrap_to_peer_table() {
+        let mut app_state = create_test_app_state();
+        app_state.ui.selected_torrent_index = 0;
+        app_state.ui.selected_header = SelectedHeader::Torrent(ColumnId::Name);
+
+        let result = reduce_ui_action(&mut app_state, UiAction::Navigate(KeyCode::Left));
+
+        assert!(result.redraw);
+        assert_eq!(
+            app_state.ui.selected_header,
+            SelectedHeader::Torrent(ColumnId::Name)
+        );
+    }
+
+    #[test]
+    fn reducer_right_from_last_peer_column_does_not_wrap_to_torrent_list() {
+        let mut app_state = create_test_app_state();
+        app_state.ui.selected_torrent_index = 0;
+        app_state.ui.selected_header = SelectedHeader::Peer(PeerColumnId::Action);
+
+        let result = reduce_ui_action(&mut app_state, UiAction::Navigate(KeyCode::Right));
+
+        assert!(result.redraw);
+        assert_eq!(
+            app_state.ui.selected_header,
+            SelectedHeader::Peer(PeerColumnId::Action)
+        );
+    }
+
+    #[test]
+    fn reducer_right_from_last_torrent_column_still_enters_peer_table() {
+        let mut app_state = create_test_app_state();
+        app_state.ui.selected_torrent_index = 0;
+        app_state.ui.selected_header = SelectedHeader::Torrent(ColumnId::Name);
+
+        let result = reduce_ui_action(&mut app_state, UiAction::Navigate(KeyCode::Right));
+
+        assert!(result.redraw);
+        assert_eq!(
+            app_state.ui.selected_header,
+            SelectedHeader::Peer(PeerColumnId::Flags)
+        );
+    }
+
+    #[test]
+    fn reducer_left_from_first_peer_column_still_returns_to_torrent_list() {
+        let mut app_state = create_test_app_state();
+        app_state.ui.selected_torrent_index = 0;
+        app_state.ui.selected_header = SelectedHeader::Peer(PeerColumnId::Flags);
+
+        let result = reduce_ui_action(&mut app_state, UiAction::Navigate(KeyCode::Left));
+
+        assert!(result.redraw);
+        assert_eq!(
+            app_state.ui.selected_header,
+            SelectedHeader::Torrent(ColumnId::Name)
+        );
+    }
+
+    #[test]
     fn reducer_toggle_anonymize_names_flips_flag() {
         let mut app_state = AppState::default();
         assert!(!app_state.anonymize_torrent_names);
@@ -7217,18 +7227,6 @@ mod tests {
 
         reduce_ui_action(&mut app_state, UiAction::ToggleAnonymizeNames);
         assert!(!app_state.anonymize_torrent_names);
-    }
-
-    #[test]
-    fn reducer_toggle_torrent_files_flips_flag() {
-        let mut app_state = AppState::default();
-        assert!(!app_state.ui.show_torrent_files);
-
-        reduce_ui_action(&mut app_state, UiAction::ToggleTorrentFiles);
-        assert!(app_state.ui.show_torrent_files);
-
-        reduce_ui_action(&mut app_state, UiAction::ToggleTorrentFiles);
-        assert!(!app_state.ui.show_torrent_files);
     }
 
     #[test]
@@ -7750,8 +7748,8 @@ mod tests {
     #[test]
     fn split_path_components_handles_windows_paths() {
         assert_eq!(
-            split_path_components(r"C:\Users\jagat\Documents\seedbox"),
-            vec!["C:", "Users", "jagat", "Documents", "seedbox"]
+            split_path_components(r"C:\Users\ExampleUser\Downloads\library"),
+            vec!["C:", "Users", "ExampleUser", "Downloads", "library"]
         );
     }
 
@@ -7765,10 +7763,10 @@ mod tests {
 
     #[test]
     fn middle_ellipsize_path_preserves_path_ends() {
-        let shaped = middle_ellipsize_path(r"C:\Users\jagat\Documents\seedbox", 18);
+        let shaped = middle_ellipsize_path(r"C:\Users\ExampleUser\Downloads\library", 18);
         assert!(shaped.chars().count() <= 18, "{shaped}");
         assert!(shaped.starts_with("C:"), "{shaped}");
-        assert!(shaped.ends_with("seedbox"), "{shaped}");
+        assert!(shaped.ends_with("library"), "{shaped}");
         assert!(shaped.contains("..."), "{shaped}");
     }
 
@@ -7784,7 +7782,7 @@ mod tests {
     #[test]
     fn torrent_root_path_label_uses_download_root_only() {
         let metrics = TorrentMetrics {
-            download_path: Some(PathBuf::from(r"C:\Users\jagat\Documents\seedbox")),
+            download_path: Some(PathBuf::from(r"C:\Users\ExampleUser\Downloads\library")),
             container_name: Some("[team] sample release".to_string()),
             is_multi_file: true,
             torrent_name: "episode 01.mkv".to_string(),
@@ -7794,16 +7792,15 @@ mod tests {
 
         assert_eq!(
             torrent_root_path_label(&metrics, false),
-            r"C:\Users\jagat\Documents\seedbox"
+            r"C:\Users\ExampleUser\Downloads\library"
         );
     }
 
     #[test]
-    fn anonymize_preserving_shape_keeps_length_and_path_separators() {
-        let original = r"C:\Users\jagat\Documents\seedbox\[Group] Episode_01.mkv";
+    fn anonymize_preserving_shape_keeps_path_separators() {
+        let original = r"C:\Users\ExampleUser\Downloads\library\[Group] Episode_01.mkv";
         let anonymized = anonymize_preserving_shape(original);
 
-        assert_eq!(anonymized.chars().count(), original.chars().count());
         assert_eq!(
             anonymized.matches('\\').count(),
             original.matches('\\').count()
@@ -7814,6 +7811,7 @@ mod tests {
         assert!(!anonymized.contains('['));
         assert!(!anonymized.contains(']'));
         assert!(!anonymized.chars().any(|ch| ch.is_ascii_digit()));
+        assert!(!anonymized.contains("  "));
         assert!(anonymized.chars().all(|ch| {
             ch.is_ascii_lowercase() || ch.is_whitespace() || ch == '/' || ch == '\\'
         }));
@@ -7825,8 +7823,7 @@ mod tests {
         let original = "[Group] Episode 01_sample S7 - 99 (2097y) [17AC1A4Z].qfo (1.36 GB)";
         let anonymized = anonymize_preserving_shape(original);
 
-        assert_eq!(anonymized.chars().count(), original.chars().count());
-        assert!(anonymized.matches(' ').count() > original.matches(' ').count());
+        assert!(!anonymized.contains("  "));
         assert!(!anonymized.contains("Episode"));
         assert!(!anonymized.contains("2097"));
         assert!(!anonymized.contains("qfo"));
@@ -7853,7 +7850,7 @@ mod tests {
     #[test]
     fn torrent_root_path_label_anonymize_preserves_path_shape() {
         let metrics = TorrentMetrics {
-            download_path: Some(PathBuf::from(r"C:\Users\jagat\Documents\seedbox")),
+            download_path: Some(PathBuf::from(r"C:\Users\ExampleUser\Downloads\library")),
             torrent_name: "episode 01.mkv".to_string(),
             ..Default::default()
         };
@@ -7861,12 +7858,12 @@ mod tests {
         let original = torrent_root_path_label(&metrics, false);
         let anonymized = torrent_root_path_label(&metrics, true);
 
-        assert_eq!(anonymized.chars().count(), original.chars().count());
         assert_eq!(
             anonymized.matches('\\').count(),
             original.matches('\\').count()
         );
         assert!(!anonymized.contains(':'));
+        assert!(!anonymized.contains("  "));
         assert_ne!(anonymized, original);
     }
 
@@ -7874,11 +7871,11 @@ mod tests {
     fn shaped_row_start_offsets_account_for_hidden_path_separators() {
         let rows = vec![
             r"C:\Users".to_string(),
-            "jagat".to_string(),
-            "seedbox".to_string(),
+            "ExampleUser".to_string(),
+            "library".to_string(),
         ];
 
-        assert_eq!(shaped_row_start_offsets(&rows), vec![0, 9, 15]);
+        assert_eq!(shaped_row_start_offsets(&rows), vec![0, 9, 21]);
     }
 
     #[test]
@@ -7942,7 +7939,7 @@ mod tests {
 
     #[test]
     fn shape_root_path_for_viewport_keeps_single_line_when_it_fits() {
-        let path = r"C:\Users\jagat\Documents";
+        let path = r"C:\Users\ExampleUser\Downloads";
         assert_eq!(
             shape_root_path_for_viewport(path, path.len(), 4),
             vec![path.to_string()]
@@ -7951,19 +7948,19 @@ mod tests {
 
     #[test]
     fn shape_root_path_for_viewport_uses_middle_ellipsis_when_only_one_row_is_available() {
-        let rows = shape_root_path_for_viewport(r"C:\Users\jagat\Documents\seedbox", 18, 1);
+        let rows = shape_root_path_for_viewport(r"C:\Users\ExampleUser\Downloads\library", 18, 1);
         assert_eq!(rows.len(), 1);
         assert!(rows_fit_in_box(&rows, 18, 1), "{rows:?}");
         assert!(rows[0].starts_with("C:"), "{rows:?}");
-        assert!(rows[0].ends_with("seedbox"), "{rows:?}");
+        assert!(rows[0].ends_with("library"), "{rows:?}");
         assert!(rows[0].contains("..."), "{rows:?}");
     }
 
     #[test]
     fn shape_root_path_for_viewport_splits_into_vertical_segments_when_narrow() {
         assert_eq!(
-            shape_root_path_for_viewport(r"C:\Users\jagat\Documents\seedbox", 10, 5),
-            vec!["C:\\Users", "jagat", "Documents", "seedbox"]
+            shape_root_path_for_viewport(r"C:\Users\ExampleUser\Downloads\library", 10, 5),
+            vec!["C:\\Users", "Example...", "Downloads", "library"]
         );
     }
 
@@ -7978,8 +7975,8 @@ mod tests {
     #[test]
     fn shape_root_path_for_viewport_regroups_segments_to_match_height_budget() {
         assert_eq!(
-            shape_root_path_for_viewport(r"C:\Users\jagat\Documents\seedbox", 16, 3),
-            vec!["C:\\Users\\jagat", "Documents", "seedbox"]
+            shape_root_path_for_viewport(r"C:\Users\ExampleUser\Downloads\library", 16, 3),
+            vec!["C:\\Users", "ExampleUser", "Downloads"]
         );
     }
 
@@ -7987,11 +7984,11 @@ mod tests {
     fn shape_root_path_for_viewport_truncates_overwide_group_when_needed() {
         assert_eq!(
             shape_root_path_for_viewport(
-                r"C:\Users\jagat\[251226][longlonglonglong] release",
+                r"C:\Users\ExampleUser\[251226][longlonglonglong] release",
                 12,
                 2
             ),
-            vec!["C:\\Users", "jagat"]
+            vec!["C:\\Users", "ExampleUser"]
         );
     }
 
@@ -8008,8 +8005,8 @@ mod tests {
     #[test]
     fn shaped_paths_fit_vertical_square_and_landscape_boxes() {
         let cases = [
-            r"C:\Users\jagat\Documents\seedbox",
-            r"C:\Users\jagat\Documents\seedbox\[251226][long-release-name] Episode 01.mkv",
+            r"C:\Users\ExampleUser\Downloads\library",
+            r"C:\Users\ExampleUser\Downloads\library\[251226][long-release-name] Episode 01.mkv",
             r"C:\seedbox\anime\season-01\episode-01.mkv",
             r"D:\dl\onefile.mkv",
             r"C:\very\deep\path\with\many\segments\and\a\long\final\component",
@@ -8039,7 +8036,8 @@ mod tests {
 
     #[test]
     fn wider_viewports_do_not_increase_row_count_or_truncation_for_same_height() {
-        let path = r"C:\Users\jagat\Documents\seedbox\[251226][long-release-name]\Episode 01.mkv";
+        let path =
+            r"C:\Users\ExampleUser\Downloads\library\[251226][long-release-name]\Episode 01.mkv";
 
         let narrow = shape_root_path_for_viewport(path, 12, 3);
         let medium = shape_root_path_for_viewport(path, 18, 3);
@@ -8060,8 +8058,7 @@ mod tests {
 
     #[test]
     fn taller_viewports_do_not_increase_truncation_for_same_width() {
-        let path =
-            r"C:\Users\jagat\Documents\seedbox\[251226][long-release-name]\subdir\Episode 01.mkv";
+        let path = r"C:\Users\ExampleUser\Downloads\library\[251226][long-release-name]\subdir\Episode 01.mkv";
 
         let short = shape_root_path_for_viewport(path, 14, 2);
         let medium = shape_root_path_for_viewport(path, 14, 4);
@@ -8113,12 +8110,12 @@ mod tests {
     #[test]
     fn root_path_shaping_peels_from_deepest_parent_first() {
         assert_eq!(
-            shape_root_path_for_viewport(r"C:\Users\jagat\Documents\seedbox", 24, 4),
-            vec!["C:\\Users\\jagat\\Documents", "seedbox"]
+            shape_root_path_for_viewport(r"C:\Users\ExampleUser\Downloads\library", 24, 4),
+            vec!["C:\\Users\\ExampleUser", "Downloads\\library"]
         );
         assert_eq!(
-            shape_root_path_for_viewport(r"C:\Users\jagat\Documents\seedbox", 18, 4),
-            vec!["C:\\Users\\jagat", "Documents\\seedbox"]
+            shape_root_path_for_viewport(r"C:\Users\ExampleUser\Downloads\library", 18, 4),
+            vec!["C:\\Users", "ExampleUser", "Downloads\\library"]
         );
     }
 
@@ -8453,11 +8450,15 @@ mod tests {
         );
         assert_eq!(
             map_key_to_ui_action(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)),
-            Some(UiAction::ToggleTorrentFiles)
+            Some(UiAction::OpenSelectedTorrentFiles)
         );
         assert_eq!(
             map_key_to_ui_action(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE)),
             Some(UiAction::ClearManualSorting)
+        );
+        assert_eq!(
+            map_key_to_ui_action(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::NONE)),
+            Some(UiAction::OpenTorrentManagement)
         );
     }
 
@@ -8542,6 +8543,23 @@ mod tests {
     }
 
     #[test]
+    fn reducer_open_selected_torrent_files_emits_selected_hash_effect() {
+        let mut app_state = AppState::default();
+        let first_hash = vec![1; 20];
+        let second_hash = vec![2; 20];
+        app_state.torrent_list_order = vec![first_hash, second_hash.clone()];
+        app_state.ui.selected_torrent_index = 1;
+
+        let result = reduce_ui_action(&mut app_state, UiAction::OpenSelectedTorrentFiles);
+
+        assert!(result.redraw);
+        assert_eq!(
+            result.effects,
+            vec![UiEffect::OpenExistingTorrentFileBrowser(second_hash)]
+        );
+    }
+
+    #[test]
     fn reducer_open_delete_confirm_emits_mode_effect_and_sets_payload() {
         let mut app_state = create_test_app_state();
         app_state.ui.selected_torrent_index = 1;
@@ -8600,6 +8618,16 @@ mod tests {
 
         assert!(result.redraw);
         assert_eq!(result.effects, vec![UiEffect::OpenJournalScreen]);
+    }
+
+    #[test]
+    fn reducer_open_torrent_management_emits_effect() {
+        let mut app_state = AppState::default();
+
+        let result = reduce_ui_action(&mut app_state, UiAction::OpenTorrentManagement);
+
+        assert!(result.redraw);
+        assert_eq!(result.effects, vec![UiEffect::OpenTorrentManagementScreen]);
     }
 
     #[test]
@@ -9254,7 +9282,7 @@ mod tests {
     }
 
     #[test]
-    fn render_file_tree_name_spans_keeps_inactive_rows_at_base_style() {
+    fn render_file_tree_name_spans_mutes_inactive_rows() {
         let mut torrent = create_mock_display_state(0);
         torrent.latest_state.torrent_name = "sample-tree".to_string();
         let ctx = ThemeContext::new(Theme::builtin(ThemeName::CatppuccinMocha), 0.0);
@@ -9278,7 +9306,10 @@ mod tests {
 
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].content, "file.bin");
-        assert_eq!(spans[0].style, ctx.apply(base_style));
+        assert_eq!(
+            spans[0].style,
+            ctx.apply(base_style.fg(ctx.theme.semantic.surface1))
+        );
     }
 
     fn render_list_item_plain_lines(items: Vec<ListItem<'static>>, width: u16) -> Vec<String> {

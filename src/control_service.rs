@@ -89,6 +89,12 @@ pub fn online_control_success_message(request: &ControlRequest) -> String {
             describe_priority_target(target),
             priority
         ),
+        ControlRequest::SetTorrentConfig { info_hash_hex, .. } => {
+            format!(
+                "Queued torrent config request for torrent '{}'",
+                info_hash_hex
+            )
+        }
         ControlRequest::AddTorrentFile { source_path, .. } => format!(
             "Queued add request for torrent file '{}'",
             source_path.display()
@@ -702,6 +708,25 @@ pub fn plan_control_request(
                 ),
             })
         }
+        ControlRequest::SetTorrentConfig {
+            info_hash_hex,
+            download_path,
+            container_name,
+            file_priorities,
+        } => {
+            let info_hash = decode_info_hash(info_hash_hex)?;
+            let Some(index) = find_torrent_settings_index_by_info_hash(settings, &info_hash) else {
+                return Err(format!("Torrent '{}' was not found", info_hash_hex));
+            };
+            let mut next_settings = settings.clone();
+            next_settings.torrents[index].download_path = download_path.clone();
+            next_settings.torrents[index].container_name = container_name.clone();
+            next_settings.torrents[index].file_priorities = file_priorities_to_map(file_priorities);
+            Ok(ControlExecutionPlan::ApplySettings {
+                next_settings,
+                success_message: format!("Updated torrent config for '{}'", info_hash_hex),
+            })
+        }
         ControlRequest::AddTorrentFile {
             source_path,
             download_path,
@@ -866,7 +891,10 @@ mod tests {
         resolve_purge_target_info_hash, resolve_target_info_hash, ControlExecutionPlan,
     };
     use crate::config::{set_app_paths_override_for_tests, Settings, TorrentSettings};
-    use crate::integrations::control::{ControlPriorityTarget, ControlRequest};
+    use crate::integrations::control::{
+        ControlFilePriorityOverride, ControlPriorityTarget, ControlRequest,
+    };
+    use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
 
@@ -1137,6 +1165,52 @@ mod tests {
                     crate::app::TorrentControlState::Deleting
                 );
                 assert!(next_settings.torrents[0].delete_files);
+            }
+            other => panic!("unexpected plan: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn set_torrent_config_replaces_location_container_and_priorities() {
+        let _guard = shared_env_guard().lock().unwrap();
+        let settings = Settings {
+            torrents: vec![TorrentSettings {
+                torrent_or_magnet: "magnet:?xt=urn:btih:1111111111111111111111111111111111111111"
+                    .to_string(),
+                name: "Sample Node".to_string(),
+                file_priorities: HashMap::from([(0, crate::app::FilePriority::High)]),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let request = ControlRequest::SetTorrentConfig {
+            info_hash_hex: "1111111111111111111111111111111111111111".to_string(),
+            download_path: Some(PathBuf::from("/downloads/next")),
+            container_name: Some(String::new()),
+            file_priorities: vec![
+                ControlFilePriorityOverride {
+                    file_index: 0,
+                    priority: crate::app::FilePriority::Normal,
+                },
+                ControlFilePriorityOverride {
+                    file_index: 1,
+                    priority: crate::app::FilePriority::Skip,
+                },
+            ],
+        };
+
+        match plan_control_request(&settings, &request).expect("plan config update") {
+            ControlExecutionPlan::ApplySettings { next_settings, .. } => {
+                let torrent = &next_settings.torrents[0];
+                assert_eq!(
+                    torrent.download_path,
+                    Some(PathBuf::from("/downloads/next"))
+                );
+                assert_eq!(torrent.container_name, Some(String::new()));
+                assert_eq!(
+                    torrent.file_priorities,
+                    HashMap::from([(1, crate::app::FilePriority::Skip)])
+                );
             }
             other => panic!("unexpected plan: {:?}", other),
         }

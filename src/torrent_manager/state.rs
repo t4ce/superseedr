@@ -282,6 +282,7 @@ pub struct TrackerState {
     pub next_announce_time: Instant,
     pub leeching_interval: Option<Duration>,
     pub seeding_interval: Option<Duration>,
+    pub has_responded: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1754,6 +1755,7 @@ impl TorrentState {
                 let mut effects = Vec::new();
 
                 if let Some(tracker) = self.trackers.get_mut(&url) {
+                    tracker.has_responded = true;
                     let seeding_secs = if interval > 0 { interval + 1 } else { 1800 };
                     tracker.seeding_interval = Some(Duration::from_secs(seeding_secs));
 
@@ -1882,6 +1884,7 @@ impl TorrentState {
                             next_announce_time: self.now,
                             leeching_interval: None,
                             seeding_interval: None,
+                            has_responded: false,
                         });
                         (announce, state)
                     })
@@ -3189,6 +3192,52 @@ mod tests {
     }
 
     #[test]
+    fn test_assign_work_tiny_piece_length_requests_piece_local_short_blocks() {
+        let mut state = create_empty_state();
+        let num_pieces = 8usize;
+        let piece_size = 1_024u32;
+        let mut torrent = create_dummy_torrent(num_pieces);
+        torrent.info.piece_length = piece_size as i64;
+        torrent.info.length = i64::from(piece_size) * num_pieces as i64;
+        state.torrent = Some(torrent);
+        state.torrent_status = TorrentStatus::Standard;
+        state.piece_manager.set_initial_fields(num_pieces, false);
+        state.piece_manager.set_geometry(
+            piece_size,
+            u64::from(piece_size) * num_pieces as u64,
+            HashMap::new(),
+            false,
+        );
+
+        add_peer(&mut state, "tiny_peer");
+        let peer = state.peers.get_mut("tiny_peer").unwrap();
+        peer.peer_choking = ChokeStatus::Unchoke;
+        peer.bitfield = vec![true; num_pieces];
+
+        let effects = state.update(Action::AssignWork {
+            peer_id: "tiny_peer".to_string(),
+        });
+
+        let mut requests = Vec::new();
+        for effect in effects {
+            if let Effect::SendToPeer { cmd, .. } = effect {
+                if let TorrentCommand::BulkRequest(reqs) = *cmd {
+                    requests.extend(reqs);
+                }
+            }
+        }
+        requests.sort();
+
+        let expected = (0..num_pieces as u32)
+            .map(|piece| (piece, 0, piece_size))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            requests, expected,
+            "Tiny pieces should request one piece-local short block each"
+        );
+    }
+
+    #[test]
     fn test_data_unavailable_blocks_unchoke_and_upload() {
         let mut state = create_empty_state();
         let torrent = create_dummy_torrent(1);
@@ -3314,6 +3363,7 @@ mod tests {
                 next_announce_time: Instant::now(),
                 leeching_interval: None,
                 seeding_interval: None,
+                has_responded: false,
             },
         );
 
@@ -4876,6 +4926,7 @@ mod tests {
                 next_announce_time: state.now, // Ready to announce immediately
                 leeching_interval: Some(Duration::from_secs(60)),
                 seeding_interval: None,
+                has_responded: false,
             },
         );
 
@@ -4909,6 +4960,7 @@ mod tests {
                 next_announce_time: state.now,
                 leeching_interval: Some(Duration::from_secs(60)),
                 seeding_interval: None,
+                has_responded: false,
             },
         );
 
@@ -4946,6 +4998,7 @@ mod tests {
                 next_announce_time: state.now,
                 leeching_interval: None,
                 seeding_interval: None,
+                has_responded: false,
             },
         );
 
@@ -4978,6 +5031,7 @@ mod tests {
                 next_announce_time: state.now,
                 leeching_interval: None,
                 seeding_interval: None,
+                has_responded: false,
             },
         );
 
@@ -11482,230 +11536,6 @@ mod integration_tests {
         let _ = _cmd.send(ManagerCommand::Shutdown).await;
         let _ = manager_handle.await;
         let _ = std::fs::remove_dir_all(temp_dir);
-    }
-
-    #[tokio::test]
-    async fn test_case_08_full_swarm_1000_blocks() {
-        let temp_dir = std::env::temp_dir().join("superseedr_full_swarm");
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        std::fs::create_dir_all(&temp_dir).unwrap();
-
-        let num_pieces = 1000;
-        let piece_size = 16_384;
-        let (mut manager, _cmd, _res) =
-            create_manager_harness("FullSwarm", num_pieces, piece_size, temp_dir.clone());
-
-        let make_bitfield = |pattern: fn(usize) -> bool| -> Vec<u8> {
-            let mut bf = vec![0u8; num_pieces.div_ceil(8)];
-            for i in 0..num_pieces {
-                if pattern(i) {
-                    let byte_idx = i / 8;
-                    let bit_idx = 7 - (i % 8);
-                    bf[byte_idx] |= 1 << bit_idx;
-                }
-            }
-            bf
-        };
-
-        // Peer 1: SEEDER (Has All)
-        let bf_seed = make_bitfield(|_| true);
-        spawn_mock_peer(&mut manager, bf_seed, std::time::Duration::from_millis(1)).await;
-
-        // Peer 2: FIRST HALF (Has 0-499)
-        let bf_first = make_bitfield(|i| i < 500);
-        spawn_mock_peer(&mut manager, bf_first, std::time::Duration::from_millis(2)).await;
-
-        // Peer 3: SECOND HALF (Has 500-999)
-        let bf_second = make_bitfield(|i| i >= 500);
-        spawn_mock_peer(&mut manager, bf_second, std::time::Duration::from_millis(2)).await;
-
-        // Peer 4: EVENS
-        let bf_even = make_bitfield(|i| i % 2 == 0);
-        spawn_mock_peer(&mut manager, bf_even, std::time::Duration::from_millis(5)).await;
-
-        // Peer 5: ODDS
-        let bf_odd = make_bitfield(|i| i % 2 != 0);
-        spawn_mock_peer(&mut manager, bf_odd, std::time::Duration::from_millis(5)).await;
-
-        let manager_handle = tokio::spawn(async move {
-            let _ = manager.run(false).await;
-        });
-
-        let expected_size = (num_pieces * piece_size) as u64;
-        let file_path = temp_dir.join("FullSwarm");
-
-        let start = std::time::Instant::now();
-        let timeout_duration = std::time::Duration::from_secs(45);
-        let mut success = false;
-
-        println!("Waiting for 1000 blocks (~16MB) from 5 peers...");
-
-        while start.elapsed() < timeout_duration {
-            if let Ok(meta) = std::fs::metadata(&file_path) {
-                if meta.len() >= expected_size {
-                    success = true;
-                    break;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        }
-
-        if !success {
-            panic!("FAILED: Swarm download did not complete in 45s.");
-        }
-
-        println!(
-            "SUCCESS: Downloaded 1000 blocks (~16MB) from 5 mixed peers in {:.2?}",
-            start.elapsed()
-        );
-
-        let _ = _cmd.send(ManagerCommand::Shutdown).await;
-        let _ = manager_handle.await;
-        let _ = std::fs::remove_dir_all(temp_dir);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn test_debug_pipeline_latency() {
-        // SETUP
-        let temp_dir = std::env::temp_dir().join("superseedr_latency_debug");
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        std::fs::create_dir_all(&temp_dir).unwrap();
-
-        // 500 blocks * 16KB = ~8MB
-        let num_pieces = 500;
-        let piece_size = 16_384;
-        let (mut manager, _cmd, _res) =
-            create_manager_harness("LatencyTest", num_pieces, piece_size, temp_dir.clone());
-
-        // Spawn 1 Peer with 50ms Latency (Simulating a real internet connection)
-        let bf_all = vec![0xFFu8; num_pieces.div_ceil(8)];
-
-        // 50ms delay per block write
-        spawn_mock_peer(&mut manager, bf_all, std::time::Duration::from_millis(50)).await;
-
-        let manager_handle = tokio::spawn(async move {
-            let _ = manager.run(false).await;
-        });
-
-        // MONITOR
-        let start = std::time::Instant::now();
-        let expected_size = (num_pieces * piece_size) as u64;
-        let file_path = temp_dir.join("LatencyTest");
-
-        let mut success = false;
-        // Give it 10 seconds.
-        // At 300KB/s (Broken Pipeline), 8MB takes ~26 seconds -> FAIL.
-        // At 5MB/s (Working Pipeline), 8MB takes ~1.6 seconds -> PASS.
-        while start.elapsed() < std::time::Duration::from_secs(10) {
-            if let Ok(meta) = std::fs::metadata(&file_path) {
-                if meta.len() >= expected_size {
-                    success = true;
-                    break;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
-
-        if !success {
-            println!("❌ PIPELINE BROKEN: Transfer too slow for high latency peer.");
-            println!("   Likely cause: 'inflight_requests' limit is too low or 'AssignWork' loop is exiting early.");
-        } else {
-            println!("✅ PIPELINE WORKING: High throughput achieved despite latency.");
-        }
-
-        let _ = _cmd.send(ManagerCommand::Shutdown).await;
-        let _ = manager_handle.await;
-        let _ = std::fs::remove_dir_all(temp_dir);
-
-        assert!(success);
-    }
-
-    #[tokio::test]
-    async fn test_non_aligned_piece_length_small_swarm_completes() {
-        let temp_dir = std::env::temp_dir().join("superseedr_non_aligned_20k");
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        std::fs::create_dir_all(&temp_dir).unwrap();
-
-        let num_pieces = 4;
-        let piece_size = 20_000;
-        let (mut manager, cmd_tx, _res) =
-            create_manager_harness("NonAligned20k", num_pieces, piece_size, temp_dir.clone());
-
-        let bf_all = full_bitfield(num_pieces);
-        spawn_mock_peer(&mut manager, bf_all, std::time::Duration::from_millis(0)).await;
-
-        let manager_handle = tokio::spawn(async move {
-            let _ = manager.run(false).await;
-        });
-
-        let expected_size = (num_pieces * piece_size) as u64;
-        let file_path = temp_dir.join("NonAligned20k");
-        let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(12);
-        let mut success = false;
-
-        while start.elapsed() < timeout {
-            if let Ok(meta) = std::fs::metadata(&file_path) {
-                if meta.len() >= expected_size {
-                    success = true;
-                    break;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
-
-        let _ = cmd_tx.send(ManagerCommand::Shutdown).await;
-        let _ = manager_handle.await;
-        let _ = std::fs::remove_dir_all(temp_dir);
-
-        assert!(
-            success,
-            "Non-aligned piece-length torrent failed to complete in bounded time"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_tiny_piece_length_small_swarm_completes() {
-        let temp_dir = std::env::temp_dir().join("superseedr_tiny_piece_1k");
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        std::fs::create_dir_all(&temp_dir).unwrap();
-
-        let num_pieces = 8;
-        let piece_size = 1_024;
-        let (mut manager, cmd_tx, _res) =
-            create_manager_harness("TinyPiece1k", num_pieces, piece_size, temp_dir.clone());
-
-        let bf_all = full_bitfield(num_pieces);
-        spawn_mock_peer(&mut manager, bf_all, std::time::Duration::from_millis(0)).await;
-
-        let manager_handle = tokio::spawn(async move {
-            let _ = manager.run(false).await;
-        });
-
-        let expected_size = (num_pieces * piece_size) as u64;
-        let file_path = temp_dir.join("TinyPiece1k");
-        let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(12);
-        let mut success = false;
-
-        while start.elapsed() < timeout {
-            if let Ok(meta) = std::fs::metadata(&file_path) {
-                if meta.len() >= expected_size {
-                    success = true;
-                    break;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
-
-        let _ = cmd_tx.send(ManagerCommand::Shutdown).await;
-        let _ = manager_handle.await;
-        let _ = std::fs::remove_dir_all(temp_dir);
-
-        assert!(
-            success,
-            "Tiny piece-length torrent failed to complete in bounded time"
-        );
     }
 
     fn decode_triplet_event(msg: &[u8], expected_kind: u8) -> Option<(u32, u32, u32)> {

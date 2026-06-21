@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::app::{AppMode, AppState, PeerInfo, TorrentMetrics};
+use crate::app::{AppMode, AppState, PeerInfo, TorrentDisplayState, TorrentMetrics};
 use crate::config::{PeerSortColumn, SortDirection, TorrentSortColumn};
 use crate::torrent_manager::{DiskIoOperation, FileActivityDirection, ManagerEvent};
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::System;
 use tracing::{event as tracing_event, Level};
 
@@ -157,7 +157,13 @@ impl UiTelemetry {
     }
 
     pub fn on_metrics(app_state: &mut AppState, message: TorrentMetrics) {
-        let display_state = app_state.torrents.entry(message.info_hash).or_default();
+        let display_state = app_state
+            .torrents
+            .entry(message.info_hash)
+            .or_insert_with(|| TorrentDisplayState {
+                added_at_unix_secs: Some(current_unix_secs()),
+                ..Default::default()
+            });
         let now = Instant::now();
         prune_stale_recent_file_activity(display_state, now);
         for activity_update in &message.file_activity_updates {
@@ -469,6 +475,13 @@ impl UiTelemetry {
         }
         app_state.is_seeding = is_seeding;
     }
+}
+
+fn current_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn prune_stale_recent_file_activity(

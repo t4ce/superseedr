@@ -45,7 +45,7 @@ Use a dedicated folder inside the mounted volume, not the entire volume root.
 
 Examples:
 
-- Windows: `C:\Users\jagat\Documents\seedbox\test`
+- Windows: `C:\Users\ExampleUser\Downloads\library\test`
 - macOS: `/Volumes/seedbox/test`
 - Linux: `/mnt/shared-drive/test`
 
@@ -245,7 +245,7 @@ Different hosts may mount the same shared root at different local paths.
 
 Examples:
 
-- Windows: `C:\Users\jagat\Documents\seedbox\test`
+- Windows: `C:\Users\ExampleUser\Downloads\library\test`
 - macOS: `/Volumes/seedbox/test`
 - Linux: `/mnt/shared-drive/test`
 

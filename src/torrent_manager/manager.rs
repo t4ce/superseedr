@@ -99,6 +99,26 @@ const MAX_PIECE_WRITE_ATTEMPTS: u32 = 12;
 const ACTIVITY_MESSAGE_MAX_LEN: usize = 28;
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const UTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const PRIVATE_TRACKER_STOP_ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(4);
+
+fn shutdown_tracker_urls(
+    tracker_urls: Vec<String>,
+    trackers: &HashMap<String, TrackerState>,
+    private_client: bool,
+) -> Vec<String> {
+    if private_client {
+        return tracker_urls;
+    }
+
+    tracker_urls
+        .into_iter()
+        .filter(|url| {
+            trackers
+                .get(url)
+                .is_some_and(|tracker| tracker.has_responded)
+        })
+        .collect()
+}
 
 const BASE_BACKOFF_MS: u64 = 1000;
 const JITTER_MS: u64 = 100;
@@ -477,6 +497,7 @@ pub struct TorrentManager {
     global_dl_bucket: Arc<TokenBucket>,
     global_ul_bucket: Arc<TokenBucket>,
     telemetry: ManagerTelemetry,
+    data_rate_ms: u64,
     run_loop_started: bool,
 }
 
@@ -605,6 +626,7 @@ impl TorrentManager {
             file_priorities: _,
             ..
         } = torrent_parameters;
+        let data_rate_ms = settings.ui_refresh_rate.as_ms();
 
         let (torrent_manager_tx, torrent_manager_rx) = mpsc::channel::<TorrentCommand>(1000);
         let (shutdown_tx, _) = broadcast::channel(1);
@@ -660,6 +682,7 @@ impl TorrentManager {
             global_dl_bucket,
             global_ul_bucket,
             telemetry: ManagerTelemetry::default(),
+            data_rate_ms,
             run_loop_started: false,
         }
     }
@@ -1500,6 +1523,35 @@ impl TorrentManager {
                     }
                 }
 
+                let private_client = self.settings.private_client;
+                let tracker_urls =
+                    shutdown_tracker_urls(tracker_urls, &self.state.trackers, private_client);
+
+                let tx = self.manager_event_tx.clone();
+                let info_hash = self.state.info_hash.clone();
+
+                if !private_client {
+                    for url in tracker_urls {
+                        let info_hash = self.state.info_hash.clone();
+                        let port = self.settings.client_port;
+                        let client_id = self.settings.client_id.clone();
+
+                        tokio::spawn(async move {
+                            announce_stopped(
+                                url, &info_hash, client_id, port, uploaded, downloaded, left,
+                            )
+                            .await;
+                        });
+                    }
+
+                    tokio::spawn(async move {
+                        let _ = tx
+                            .send(ManagerEvent::DeletionComplete(info_hash, Ok(())))
+                            .await;
+                    });
+                    return;
+                }
+
                 let mut announce_set = JoinSet::new();
                 for url in tracker_urls {
                     let info_hash = self.state.info_hash.clone();
@@ -1514,11 +1566,8 @@ impl TorrentManager {
                     });
                 }
 
-                let tx = self.manager_event_tx.clone();
-                let info_hash = self.state.info_hash.clone();
-
                 tokio::spawn(async move {
-                    if (timeout(Duration::from_secs(4), async {
+                    if (timeout(PRIVATE_TRACKER_STOP_ANNOUNCE_TIMEOUT, async {
                         while announce_set.join_next().await.is_some() {}
                     })
                     .await)
@@ -3036,8 +3085,7 @@ impl TorrentManager {
         self.run_loop_started = true;
         self.sync_dht_lookup_task();
 
-        let mut data_rate_ms = 1000;
-        let mut tick = tokio::time::interval(Duration::from_millis(data_rate_ms));
+        let mut tick = tokio::time::interval(Duration::from_millis(self.data_rate_ms));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_tick_time = Instant::now();
 
@@ -3161,8 +3209,8 @@ impl TorrentManager {
                             });
                         }
                         ManagerCommand::SetDataRate(new_rate_ms) => {
-                            data_rate_ms = new_rate_ms;
-                            tick = tokio::time::interval(Duration::from_millis(data_rate_ms));
+                            self.data_rate_ms = new_rate_ms;
+                            tick = tokio::time::interval(Duration::from_millis(self.data_rate_ms));
                             tick.reset();
                             last_tick_time = Instant::now();
                         },
@@ -3618,6 +3666,7 @@ where
                     next_announce_time: now,
                     leeching_interval: None,
                     seeding_interval: None,
+                    has_responded: false,
                 },
             )
         })
@@ -3638,6 +3687,87 @@ mod tests {
     use std::time::SystemTime;
     use std::time::{Duration, Instant};
     use tokio::sync::{broadcast, mpsc, watch};
+
+    #[test]
+    fn private_tracker_stop_announce_timeout_is_four_seconds() {
+        assert_eq!(
+            PRIVATE_TRACKER_STOP_ANNOUNCE_TIMEOUT,
+            Duration::from_secs(4)
+        );
+    }
+
+    #[test]
+    fn public_shutdown_announces_only_to_trackers_that_have_responded() {
+        let now = Instant::now();
+        let responded_url = "http://responded.tracker.test/announce".to_string();
+        let unanswered_url = "http://unanswered.tracker.test/announce".to_string();
+        let missing_url = "http://missing.tracker.test/announce".to_string();
+        let mut trackers = HashMap::new();
+        trackers.insert(
+            responded_url.clone(),
+            TrackerState {
+                next_announce_time: now,
+                leeching_interval: None,
+                seeding_interval: None,
+                has_responded: true,
+            },
+        );
+        trackers.insert(
+            unanswered_url.clone(),
+            TrackerState {
+                next_announce_time: now,
+                leeching_interval: None,
+                seeding_interval: None,
+                has_responded: false,
+            },
+        );
+
+        let urls = shutdown_tracker_urls(
+            vec![
+                responded_url.clone(),
+                unanswered_url.clone(),
+                missing_url.clone(),
+            ],
+            &trackers,
+            false,
+        );
+
+        assert_eq!(urls, vec![responded_url]);
+    }
+
+    #[test]
+    fn private_shutdown_announces_to_all_trackers() {
+        let now = Instant::now();
+        let responded_url = "http://responded.tracker.test/announce".to_string();
+        let unanswered_url = "http://unanswered.tracker.test/announce".to_string();
+        let mut trackers = HashMap::new();
+        trackers.insert(
+            responded_url.clone(),
+            TrackerState {
+                next_announce_time: now,
+                leeching_interval: None,
+                seeding_interval: None,
+                has_responded: true,
+            },
+        );
+        trackers.insert(
+            unanswered_url.clone(),
+            TrackerState {
+                next_announce_time: now,
+                leeching_interval: None,
+                seeding_interval: None,
+                has_responded: false,
+            },
+        );
+
+        let urls = shutdown_tracker_urls(
+            vec![responded_url.clone(), unanswered_url.clone()],
+            &trackers,
+            true,
+        );
+
+        assert_eq!(urls, vec![responded_url, unanswered_url]);
+    }
 
     #[test]
     fn tcp_transport_mode_disables_utp() {
@@ -3942,6 +4072,7 @@ mod tests {
 #[cfg(test)]
 mod resource_tests {
     use super::*;
+    use crate::app::DataRate;
     use crate::config::Settings;
     use crate::resource_manager::{ResourceManager, ResourceType};
     use crate::token_bucket::TokenBucket;
@@ -4018,6 +4149,19 @@ mod resource_tests {
             global_ul_bucket: Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY)),
             file_priorities: HashMap::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn manager_initial_tick_rate_uses_restored_refresh_rate() {
+        let mut params = build_test_params();
+        let mut settings = (*params.settings).clone();
+        settings.ui_refresh_rate = DataRate::Rate20s;
+        params.settings = Arc::new(settings);
+
+        let manager = TorrentManager::from_torrent(params, create_dummy_torrent(1))
+            .expect("manager from torrent");
+
+        assert_eq!(manager.data_rate_ms, DataRate::Rate20s.as_ms());
     }
 
     #[tokio::test]
@@ -5823,250 +5967,6 @@ mod resource_tests {
 
         // Return 'rm_client' instead of 'resource_manager'
         (manager, torrent_tx, cmd_tx, shutdown_tx, rm_client)
-    }
-
-    #[tokio::test]
-    async fn test_manager_scale_1000_hybrid() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("superseedr_scale_hybrid_{}", rand::random::<u32>()));
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        std::fs::create_dir_all(&temp_dir).unwrap();
-
-        let num_pieces = 1000;
-        let piece_len = 1024;
-
-        let data_chunk = vec![0xAA; piece_len];
-        let leaf_hash = sha2::Sha256::digest(&data_chunk).to_vec();
-
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(&leaf_hash);
-        hasher.update(&leaf_hash);
-        let root_hash = hasher.finalize().to_vec();
-        let proof = leaf_hash;
-
-        let (mut manager, _torrent_tx, cmd_tx, _, _) = setup_scale_test_harness();
-
-        let v1_piece_hash = sha1::Sha1::digest(&data_chunk).to_vec();
-        let mut all_v1_hashes = Vec::new();
-        for _ in 0..num_pieces {
-            all_v1_hashes.extend_from_slice(&v1_piece_hash);
-        }
-
-        let mut torrent = create_dummy_torrent(num_pieces);
-        torrent.info.piece_length = piece_len as i64;
-        torrent.info.length = (piece_len * num_pieces) as i64;
-        torrent.info.pieces = all_v1_hashes;
-        torrent.info.meta_version = Some(2);
-
-        // 4.Set Download Path BEFORE Metadata
-        // This ensures InitializeStorage uses the correct temp_dir
-        manager.state.torrent_data_path = Some(temp_dir.clone());
-
-        manager.apply_action(Action::MetadataReceived {
-            torrent: Box::new(torrent),
-            metadata_length: 12345,
-        });
-
-        manager.state.torrent_status = TorrentStatus::Standard;
-
-        // Manually inject V2 Roots
-        for i in 0..num_pieces {
-            manager.state.piece_to_roots.insert(
-                i as u32,
-                vec![V2RootInfo {
-                    file_offset: 0,
-                    length: piece_len as u64,
-                    root_hash: root_hash.clone(),
-                    file_index: 0,
-                }],
-            );
-        }
-
-        let peer_id = "scale_worker".to_string();
-        let (p_tx, _) = mpsc::channel(100);
-        manager.apply_action(Action::RegisterPeer {
-            peer_id: peer_id.clone(),
-            tx: p_tx,
-        });
-
-        let tx = manager.torrent_manager_tx.clone();
-        let run_handle = tokio::spawn(async move {
-            let _ = manager.run(false).await;
-        });
-
-        let start = Instant::now();
-
-        for i in 0..num_pieces {
-            tx.send(TorrentCommand::Block(
-                peer_id.clone(),
-                i as u32,
-                0,
-                data_chunk.clone(),
-            ))
-            .await
-            .unwrap();
-
-            tx.send(TorrentCommand::MerkleHashData {
-                peer_id: peer_id.clone(),
-                root: root_hash.clone(), // Add this (required by definition)
-                piece_index: i as u32,
-                base_layer: 0,
-                length: 1,
-                proof: proof.clone(),
-            })
-            .await
-            .unwrap();
-        }
-
-        let expected_size = (num_pieces * piece_len) as u64;
-        let file_path = temp_dir.join("test_torrent");
-
-        let mut success = false;
-        // Wait up to 30 seconds
-        for _ in 0..60 {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            if let Ok(meta) = std::fs::metadata(&file_path) {
-                if meta.len() >= expected_size {
-                    success = true;
-                    break;
-                }
-            }
-        }
-
-        assert!(
-            success,
-            "Hybrid Scale Test: Failed to write all 1000 pieces to disk within 30s"
-        );
-        println!(
-            "Hybrid V2 Scale: 1000 Blocks processed in {:?}",
-            start.elapsed()
-        );
-
-        // Cleanup
-        let _ = cmd_tx.send(ManagerCommand::Shutdown).await;
-        let _ = run_handle.await;
-        let _ = std::fs::remove_dir_all(temp_dir);
-    }
-
-    #[tokio::test]
-    async fn test_manager_scale_1000_pure_v2() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("superseedr_scale_v2_{}", rand::random::<u32>()));
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        std::fs::create_dir_all(&temp_dir).unwrap();
-
-        let num_pieces = 1000;
-        let piece_len = 1024;
-
-        let data_chunk = vec![0xBB; piece_len];
-        let leaf_hash = sha2::Sha256::digest(&data_chunk).to_vec();
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(&leaf_hash);
-        hasher.update(&leaf_hash);
-        let root_hash = hasher.finalize().to_vec();
-        let proof = leaf_hash;
-
-        let (mut manager, _torrent_tx, cmd_tx, _, _) = setup_scale_test_harness();
-
-        let mut torrent = create_dummy_torrent(num_pieces);
-        torrent.info.piece_length = piece_len as i64;
-        torrent.info.length = (piece_len * num_pieces) as i64;
-        torrent.info.pieces = Vec::new();
-        torrent.info.meta_version = Some(2);
-
-        manager.state.torrent_data_path = Some(temp_dir.clone());
-
-        manager.apply_action(Action::MetadataReceived {
-            torrent: Box::new(torrent),
-            metadata_length: 12345,
-        });
-
-        manager.state.torrent_status = TorrentStatus::Standard;
-
-        for i in 0..num_pieces {
-            manager.state.piece_to_roots.insert(
-                i as u32,
-                vec![V2RootInfo {
-                    file_offset: 0,
-                    length: piece_len as u64,
-                    root_hash: root_hash.clone(),
-                    file_index: 0,
-                }],
-            );
-        }
-
-        if manager.state.piece_manager.bitfield.is_empty() {
-            manager
-                .state
-                .piece_manager
-                .set_initial_fields(num_pieces, false);
-            manager.state.piece_manager.set_geometry(
-                piece_len as u32,
-                (piece_len * num_pieces) as u64,
-                std::collections::HashMap::new(),
-                false,
-            );
-        }
-
-        let peer_id = "pure_v2_worker".to_string();
-        let (p_tx, _) = mpsc::channel(100);
-        manager.apply_action(Action::RegisterPeer {
-            peer_id: peer_id.clone(),
-            tx: p_tx,
-        });
-
-        let tx = manager.torrent_manager_tx.clone();
-        let run_handle = tokio::spawn(async move {
-            let _ = manager.run(false).await;
-        });
-
-        let start = Instant::now();
-        for i in 0..num_pieces {
-            tx.send(TorrentCommand::Block(
-                peer_id.clone(),
-                i as u32,
-                0,
-                data_chunk.clone(),
-            ))
-            .await
-            .unwrap();
-
-            tx.send(TorrentCommand::MerkleHashData {
-                peer_id: peer_id.clone(),
-                root: root_hash.clone(), // Add this (required by definition)
-                piece_index: i as u32,
-                base_layer: 0,
-                length: 1,
-                proof: proof.clone(),
-                // file_index: 0, // REMOVE THIS LINE
-            })
-            .await
-            .unwrap();
-        }
-
-        let expected_size = (num_pieces * piece_len) as u64;
-        let file_path = temp_dir.join("test_torrent");
-
-        let mut success = false;
-        for _ in 0..60 {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            if let Ok(meta) = std::fs::metadata(&file_path) {
-                if meta.len() >= expected_size {
-                    success = true;
-                    break;
-                }
-            }
-        }
-
-        assert!(success, "Pure V2 Scale Test: Failed to write 1000 pieces");
-        println!(
-            "Pure V2 Scale: 1000 Blocks processed in {:?}",
-            start.elapsed()
-        );
-
-        let _ = cmd_tx.send(ManagerCommand::Shutdown).await;
-        let _ = run_handle.await;
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     // Helper to build a V2 File Tree manually

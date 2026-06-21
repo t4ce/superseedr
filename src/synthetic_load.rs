@@ -5,7 +5,7 @@ use crate::app::TorrentMetrics;
 use crate::config::Settings;
 use crate::integrations::cli::{
     SyntheticBenchmarkArgs, SyntheticLoadAddMode, SyntheticLoadArgs, SyntheticLoadMode,
-    SyntheticTransport, SyntheticUdpChaosArgs,
+    SyntheticTorrentFormat, SyntheticTransport, SyntheticUdpChaosArgs,
 };
 use crate::networking::protocol::{generate_message, Message};
 use crate::networking::shared_udp::{SharedUdpFamily, SharedUdpHandle, SHARED_UDP_CHAOS_ENV};
@@ -16,6 +16,7 @@ use crate::resource_manager::{
 };
 use crate::token_bucket::TokenBucket;
 use crate::torrent_file::{Info, Torrent};
+use crate::torrent_manager::merkle::compute_v2_piece_root;
 use crate::torrent_manager::IncomingPeerSession;
 use crate::torrent_manager::{
     ManagerCommand, ManagerEvent, SyntheticPeerConnectFailure, TorrentManager, TorrentParameters,
@@ -23,7 +24,9 @@ use crate::torrent_manager::{
 
 use chrono::Local;
 use serde::Serialize;
+use serde_bencode::value::Value;
 use sha1::{Digest, Sha1};
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::File;
@@ -654,6 +657,7 @@ struct SyntheticSummary {
     run_id: String,
     mode: String,
     transport: String,
+    torrent_format: String,
     utp_chaos: Option<String>,
     add_mode: String,
     peer_add_mode: String,
@@ -707,6 +711,7 @@ struct SyntheticSummary {
 struct BenchmarkSummary {
     run_id: String,
     transport: String,
+    torrent_format: String,
     utp_chaos: Option<String>,
     interrupted: bool,
     disk_budget_bytes: u64,
@@ -738,6 +743,7 @@ struct BenchmarkReport {
     disk_budget_bytes: u64,
     preferred_size_per_torrent_bytes: u64,
     piece_size_bytes: u64,
+    torrent_format: String,
     issue_retries: usize,
     retry_delay_ms: u64,
     peer_connection_limit_policy: String,
@@ -1120,8 +1126,9 @@ pub async fn run(args: &SyntheticLoadArgs, json_output: bool) -> Result<(), DynE
         println!("{}", serde_json::to_string_pretty(&summary)?);
     } else {
         println!(
-            "Synthetic load complete: transport={} down={} up={} samples={} summary={}",
+            "Synthetic load complete: transport={} format={} down={} up={} samples={} summary={}",
             summary.transport,
+            summary.torrent_format,
             format_bps(summary.avg_download_bps),
             format_bps(summary.avg_upload_bps),
             samples_path.display(),
@@ -1177,8 +1184,13 @@ async fn run_once(
         interval: Duration::from_millis(args.peer_add_interval_ms),
         burst_size: args.peer_add_burst_size,
     };
-    let specs: Arc<[SyntheticTorrentSpec]> =
-        build_torrent_specs(args.torrents, config.size_per_torrent, config.piece_size)?.into();
+    let specs: Arc<[SyntheticTorrentSpec]> = build_torrent_specs(
+        args.torrents,
+        config.size_per_torrent,
+        config.piece_size,
+        args.torrent_format,
+    )?
+    .into();
     let (client_port, _client_udp_reservation) = synthetic_client_port(args.transport).await?;
 
     let resource_manager = build_resource_manager(args, topology, resource_shutdown_tx.clone());
@@ -1433,6 +1445,7 @@ pub async fn run_benchmark(
     let summary = BenchmarkSummary {
         run_id,
         transport: args.transport.as_str().to_string(),
+        torrent_format: args.torrent_format.as_str().to_string(),
         utp_chaos: shared_udp_chaos_env_value(args.utp_chaos),
         interrupted,
         disk_budget_bytes: config.disk_budget,
@@ -3199,6 +3212,7 @@ async fn sample_loop(
         run_id: run_id.to_string(),
         mode: mode_name(args.mode).to_string(),
         transport: args.transport.as_str().to_string(),
+        torrent_format: args.torrent_format.as_str().to_string(),
         utp_chaos: shared_udp_chaos_env_value(args.utp_chaos),
         add_mode: add_mode_name(add_plan.mode).to_string(),
         peer_add_mode: add_mode_name(peer_plan.mode).to_string(),
@@ -3538,6 +3552,7 @@ fn benchmark_synthetic_args(
         peer_add_burst_size: args.peer_add_burst_size,
         size_per_torrent: size_per_torrent.to_string(),
         piece_size: args.piece_size.clone(),
+        torrent_format: args.torrent_format,
         duration_secs: args.duration_secs,
         warmup_secs: args.warmup_secs,
         metrics_interval_ms: args.metrics_interval_ms,
@@ -4148,6 +4163,7 @@ fn benchmark_report(
         disk_budget_bytes: config.disk_budget,
         preferred_size_per_torrent_bytes: config.preferred_size_per_torrent,
         piece_size_bytes: config.piece_size,
+        torrent_format: args.torrent_format.as_str().to_string(),
         issue_retries: args.issue_retries,
         retry_delay_ms: args.retry_delay_ms,
         peer_connection_limit_policy: peer_connection_limit_policy(args),
@@ -4357,8 +4373,9 @@ fn print_benchmark_report(summary: &BenchmarkSummary, summary_path: &Path) {
         summary.report.issue_steps
     );
     println!(
-        "Target: transport={} | up to {} torrents / {} peers | disk budget={} | torrent size={} | piece size={}",
+        "Target: transport={} | format={} | up to {} torrents / {} peers | disk budget={} | torrent size={} | piece size={}",
         summary.transport,
+        summary.torrent_format,
         summary.report.configured_max_torrents,
         summary.report.configured_max_peers,
         format_bytes(summary.report.disk_budget_bytes),
@@ -4395,6 +4412,7 @@ fn print_interrupted_benchmark_report(summary: &BenchmarkSummary, summary_path: 
     );
     println!("Partial JSON: {}", summary_path.display());
     println!("Transport: {}", summary.transport);
+    println!("Torrent format: {}", summary.torrent_format);
     println!();
     println!("Partial Results");
     println!("---------------");
@@ -4645,17 +4663,30 @@ fn build_torrent_specs(
     torrents: usize,
     size_per_torrent: u64,
     piece_size: u64,
+    torrent_format: SyntheticTorrentFormat,
 ) -> Result<Vec<SyntheticTorrentSpec>, DynError> {
+    let v1_pieces = if synthetic_format_has_v1(torrent_format) {
+        Some(build_synthetic_v1_piece_hashes(
+            size_per_torrent,
+            piece_size,
+        )?)
+    } else {
+        None
+    };
+    let v2_material = if synthetic_format_has_v2(torrent_format) {
+        Some(build_synthetic_v2_material(size_per_torrent, piece_size)?)
+    } else {
+        None
+    };
+
     let mut specs = Vec::with_capacity(torrents);
     for index in 0..torrents {
         let name = format!("synthetic-torrent-{index:04}.bin");
         let piece_count = size_per_torrent.div_ceil(piece_size) as usize;
-        let mut pieces = Vec::with_capacity(piece_count * 20);
-        for piece_index in 0..piece_count {
-            let piece_start = piece_index as u64 * piece_size;
-            let len = piece_size.min(size_per_torrent.saturating_sub(piece_start)) as usize;
-            pieces.extend_from_slice(&Sha1::digest(vec![SYNTHETIC_BYTE; len]));
-        }
+        let pieces = v1_pieces.clone().unwrap_or_default();
+        let file_tree = v2_material
+            .as_ref()
+            .map(|material| build_synthetic_v2_file_tree(&name, size_per_torrent, &material.root));
 
         let info = Info {
             piece_length: piece_size as i64,
@@ -4665,11 +4696,11 @@ fn build_torrent_specs(
             name: name.clone(),
             length: size_per_torrent as i64,
             md5sum: None,
-            meta_version: None,
-            file_tree: None,
+            meta_version: synthetic_format_has_v2(torrent_format).then_some(2),
+            file_tree,
         };
         let info_dict_bencode = serde_bencode::to_bytes(&info)?;
-        let info_hash = Sha1::digest(&info_dict_bencode).to_vec();
+        let info_hash = synthetic_info_hash(torrent_format, &info_dict_bencode);
         let torrent = Torrent {
             info_dict_bencode,
             info,
@@ -4680,7 +4711,7 @@ fn build_torrent_specs(
             comment: None,
             created_by: Some("superseedr synthetic load harness".to_string()),
             encoding: None,
-            piece_layers: None,
+            piece_layers: v2_material.as_ref().map(build_synthetic_v2_piece_layers),
         };
         specs.push(SyntheticTorrentSpec {
             index,
@@ -4693,6 +4724,142 @@ fn build_torrent_specs(
         });
     }
     Ok(specs)
+}
+
+struct SyntheticV2Material {
+    root: Vec<u8>,
+    piece_layer: Vec<u8>,
+}
+
+fn synthetic_format_has_v1(torrent_format: SyntheticTorrentFormat) -> bool {
+    matches!(
+        torrent_format,
+        SyntheticTorrentFormat::V1 | SyntheticTorrentFormat::Hybrid
+    )
+}
+
+fn synthetic_format_has_v2(torrent_format: SyntheticTorrentFormat) -> bool {
+    matches!(
+        torrent_format,
+        SyntheticTorrentFormat::V2 | SyntheticTorrentFormat::Hybrid
+    )
+}
+
+fn synthetic_info_hash(
+    torrent_format: SyntheticTorrentFormat,
+    info_dict_bencode: &[u8],
+) -> Vec<u8> {
+    if torrent_format == SyntheticTorrentFormat::V2 {
+        Sha256::digest(info_dict_bencode)[0..20].to_vec()
+    } else {
+        Sha1::digest(info_dict_bencode).to_vec()
+    }
+}
+
+fn build_synthetic_v1_piece_hashes(
+    size_per_torrent: u64,
+    piece_size: u64,
+) -> Result<Vec<u8>, DynError> {
+    let piece_count = size_per_torrent.div_ceil(piece_size) as usize;
+    let mut pieces = Vec::with_capacity(piece_count * 20);
+    for piece_index in 0..piece_count {
+        let piece_start = piece_index as u64 * piece_size;
+        let len = piece_size.min(size_per_torrent.saturating_sub(piece_start)) as usize;
+        pieces.extend_from_slice(&Sha1::digest(vec![SYNTHETIC_BYTE; len]));
+    }
+    Ok(pieces)
+}
+
+fn build_synthetic_v2_material(
+    size_per_torrent: u64,
+    piece_size: u64,
+) -> Result<SyntheticV2Material, DynError> {
+    Ok(SyntheticV2Material {
+        root: build_synthetic_v2_file_root(size_per_torrent)?,
+        piece_layer: build_synthetic_v2_piece_layer(size_per_torrent, piece_size)?,
+    })
+}
+
+fn build_synthetic_v2_piece_layer(
+    size_per_torrent: u64,
+    piece_size: u64,
+) -> Result<Vec<u8>, DynError> {
+    let piece_count = size_per_torrent.div_ceil(piece_size) as usize;
+    let hashing_context_len = if size_per_torrent <= piece_size {
+        usize::try_from(size_per_torrent)?
+    } else {
+        usize::try_from(piece_size)?
+    };
+    let mut layer = Vec::with_capacity(piece_count * 32);
+    for piece_index in 0..piece_count {
+        let piece_start = piece_index as u64 * piece_size;
+        let len = piece_size.min(size_per_torrent.saturating_sub(piece_start)) as usize;
+        let piece_data = vec![SYNTHETIC_BYTE; len];
+        layer.extend_from_slice(&compute_v2_piece_root(&piece_data, hashing_context_len));
+    }
+    Ok(layer)
+}
+
+fn build_synthetic_v2_file_root(size_per_torrent: u64) -> Result<Vec<u8>, DynError> {
+    let full_block = vec![SYNTHETIC_BYTE; BLOCK_SIZE as usize];
+    let full_block_hash: [u8; 32] = Sha256::digest(&full_block).into();
+    let full_blocks = size_per_torrent / BLOCK_SIZE as u64;
+    let tail_len = (size_per_torrent % BLOCK_SIZE as u64) as usize;
+    let leaf_count = size_per_torrent
+        .div_ceil(BLOCK_SIZE as u64)
+        .max(1)
+        .next_power_of_two() as usize;
+    let mut layer = Vec::with_capacity(leaf_count);
+
+    for _ in 0..full_blocks {
+        layer.push(full_block_hash);
+    }
+    if tail_len > 0 {
+        let tail = vec![SYNTHETIC_BYTE; tail_len];
+        layer.push(Sha256::digest(tail).into());
+    }
+    while layer.len() < leaf_count {
+        layer.push([0u8; 32]);
+    }
+
+    while layer.len() > 1 {
+        layer = layer
+            .chunks(2)
+            .map(|pair| {
+                let mut hasher = Sha256::new();
+                hasher.update(pair[0]);
+                hasher.update(pair[1]);
+                hasher.finalize().into()
+            })
+            .collect();
+    }
+
+    Ok(layer[0].to_vec())
+}
+
+fn build_synthetic_v2_file_tree(name: &str, length: u64, root: &[u8]) -> Value {
+    let mut metadata = HashMap::new();
+    metadata.insert("length".as_bytes().to_vec(), Value::Int(length as i64));
+    metadata.insert(
+        "pieces root".as_bytes().to_vec(),
+        Value::Bytes(root.to_vec()),
+    );
+
+    let mut leaf = HashMap::new();
+    leaf.insert(Vec::new(), Value::Dict(metadata));
+
+    let mut tree = HashMap::new();
+    tree.insert(name.as_bytes().to_vec(), Value::Dict(leaf));
+    Value::Dict(tree)
+}
+
+fn build_synthetic_v2_piece_layers(material: &SyntheticV2Material) -> Value {
+    let mut layers = HashMap::new();
+    layers.insert(
+        material.root.clone(),
+        Value::Bytes(material.piece_layer.clone()),
+    );
+    Value::Dict(layers)
 }
 
 async fn prepare_seed_file(
@@ -5311,6 +5478,77 @@ mod tests {
     }
 
     #[test]
+    fn build_torrent_specs_generates_v1_metainfo_by_default() {
+        let spec = build_torrent_specs(1, 32 * 1024, 16 * 1024, SyntheticTorrentFormat::V1)
+            .expect("build v1 synthetic spec")
+            .pop()
+            .expect("one spec");
+
+        assert_eq!(spec.piece_count, 2);
+        assert_eq!(spec.torrent.info.pieces.len(), 40);
+        assert_eq!(spec.torrent.info.meta_version, None);
+        assert!(spec.torrent.info.file_tree.is_none());
+        assert!(spec.torrent.piece_layers.is_none());
+        assert_eq!(
+            spec.info_hash,
+            Sha1::digest(&spec.torrent.info_dict_bencode).to_vec()
+        );
+    }
+
+    #[test]
+    fn build_torrent_specs_generates_pure_v2_metainfo() {
+        let spec = build_torrent_specs(1, 32 * 1024, 16 * 1024, SyntheticTorrentFormat::V2)
+            .expect("build v2 synthetic spec")
+            .pop()
+            .expect("one spec");
+        let roots = spec.torrent.get_v2_roots();
+        let root = roots.first().expect("v2 file root").2.clone();
+        let layer = spec
+            .torrent
+            .get_layer_hashes(&root)
+            .expect("v2 piece layer");
+
+        assert_eq!(spec.piece_count, 2);
+        assert!(spec.torrent.info.pieces.is_empty());
+        assert_eq!(spec.torrent.info.meta_version, Some(2));
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].0, spec.name);
+        assert_eq!(roots[0].1, 32 * 1024);
+        assert_eq!(layer.len(), 64);
+        assert_eq!(
+            spec.info_hash,
+            Sha256::digest(&spec.torrent.info_dict_bencode)[0..20].to_vec()
+        );
+
+        let piece_hash = spec
+            .torrent
+            .get_v2_hash_layer(1, 0, 32 * 1024, 1, &root)
+            .expect("piece hash from layer");
+        assert_eq!(
+            piece_hash,
+            compute_v2_piece_root(&vec![SYNTHETIC_BYTE; 16 * 1024], 16 * 1024).to_vec()
+        );
+    }
+
+    #[test]
+    fn build_torrent_specs_generates_hybrid_metainfo() {
+        let spec = build_torrent_specs(1, 32 * 1024, 16 * 1024, SyntheticTorrentFormat::Hybrid)
+            .expect("build hybrid synthetic spec")
+            .pop()
+            .expect("one spec");
+
+        assert_eq!(spec.piece_count, 2);
+        assert_eq!(spec.torrent.info.pieces.len(), 40);
+        assert_eq!(spec.torrent.info.meta_version, Some(2));
+        assert!(spec.torrent.info.file_tree.is_some());
+        assert!(spec.torrent.piece_layers.is_some());
+        assert_eq!(
+            spec.info_hash,
+            Sha1::digest(&spec.torrent.info_dict_bencode).to_vec()
+        );
+    }
+
+    #[test]
     fn outbound_connect_sample_tracks_transport_breakdown() {
         let counters = SyntheticCounters::default();
         counters
@@ -5363,6 +5601,7 @@ mod tests {
             disk_budget: "20MiB".to_string(),
             size_per_torrent: "8MiB".to_string(),
             piece_size: "1MiB".to_string(),
+            torrent_format: SyntheticTorrentFormat::V1,
             duration_secs: 1,
             warmup_secs: 0,
             metrics_interval_ms: 1000,

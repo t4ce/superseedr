@@ -5,25 +5,16 @@ use crate::app::{AppCommand, AppMode, AppState, JournalFilter};
 use crate::persistence::event_journal::{
     EventCategory, EventDetails, EventJournalEntry, EventType,
 };
-use crate::theme::ThemeContext;
+use crate::tui::action_style::{footer_key_style, ActionTone};
+use crate::tui::app_command::spawn_app_command_sender;
 use crate::tui::formatters::sanitize_text;
 use crate::tui::screen_context::ScreenContext;
 use chrono::{DateTime, Local};
 use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
-use ratatui::prelude::{Alignment, Constraint, Frame, Line, Modifier, Span, Style, Stylize};
+use ratatui::prelude::{Alignment, Constraint, Frame, Line, Modifier, Span, Style};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 use std::path::{Component, Path};
-use tokio::sync::mpsc;
-
-const JOURNAL_CLOSE_KEYS_LABEL: &str = "Esc / q";
-const JOURNAL_FILTER_KEYS_LABEL: &str = "Tab / Shift+Tab";
-const JOURNAL_MOVE_KEYS_LABEL: &str = "Up / Down / k / j";
-const JOURNAL_REPLAY_KEYS_LABEL: &str = "Shift+Y";
-const JOURNAL_CLOSE_DESCRIPTION: &str = "Close the event journal";
-const JOURNAL_FILTER_DESCRIPTION: &str = "Cycle between ALL, QUEUE, COMMANDS, and HEALTH";
-const JOURNAL_MOVE_DESCRIPTION: &str = "Move selection through journal entries";
-const JOURNAL_REPLAY_DESCRIPTION: &str =
-    "Replay the selected archived .torrent, .magnet, or .path source";
+use tokio::sync::{broadcast, mpsc};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JournalAction {
@@ -51,10 +42,20 @@ fn map_key_to_journal_action(key_code: KeyCode, key_kind: KeyEventKind) -> Optio
     }
 }
 
-pub fn handle_event(
+pub fn handle_event_with_shutdown(
     event: CrosstermEvent,
     app_state: &mut AppState,
     app_command_tx: &mpsc::Sender<AppCommand>,
+    shutdown_tx: &broadcast::Sender<()>,
+) {
+    handle_event_inner(event, app_state, app_command_tx, Some(shutdown_tx));
+}
+
+fn handle_event_inner(
+    event: CrosstermEvent,
+    app_state: &mut AppState,
+    app_command_tx: &mpsc::Sender<AppCommand>,
+    shutdown_tx: Option<&broadcast::Sender<()>>,
 ) {
     if !matches!(app_state.mode, AppMode::Journal) {
         return;
@@ -91,7 +92,9 @@ pub fn handle_event(
                     (app_state.ui.journal.selected_index + 1).min(len - 1);
             }
         }
-        JournalAction::ReplaySelected => replay_selected_entry(app_state, app_command_tx),
+        JournalAction::ReplaySelected => {
+            replay_selected_entry(app_state, app_command_tx, shutdown_tx)
+        }
     }
 }
 
@@ -289,39 +292,6 @@ fn selected_detail_text(app_state: &AppState, entry: Option<&EventJournalEntry>)
     detail_text(Some(entry), app_state.anonymize_torrent_names)
 }
 
-pub fn journal_help_rows(ctx: &ThemeContext) -> Vec<Row<'static>> {
-    vec![
-        Row::new(vec![
-            Cell::from(Span::styled(
-                JOURNAL_CLOSE_KEYS_LABEL,
-                ctx.apply(Style::default().fg(ctx.state_error())),
-            )),
-            Cell::from(JOURNAL_CLOSE_DESCRIPTION),
-        ]),
-        Row::new(vec![
-            Cell::from(Span::styled(
-                JOURNAL_FILTER_KEYS_LABEL,
-                ctx.apply(Style::default().fg(ctx.state_selected())),
-            )),
-            Cell::from(JOURNAL_FILTER_DESCRIPTION),
-        ]),
-        Row::new(vec![
-            Cell::from(Span::styled(
-                JOURNAL_MOVE_KEYS_LABEL,
-                ctx.apply(Style::default().fg(ctx.state_info())),
-            )),
-            Cell::from(JOURNAL_MOVE_DESCRIPTION),
-        ]),
-        Row::new(vec![
-            Cell::from(Span::styled(
-                JOURNAL_REPLAY_KEYS_LABEL,
-                ctx.apply(Style::default().fg(ctx.state_success())),
-            )),
-            Cell::from(JOURNAL_REPLAY_DESCRIPTION),
-        ]),
-    ]
-}
-
 fn replay_command_for_path(path: &Path) -> Option<AppCommand> {
     match path.extension().and_then(|ext| ext.to_str()) {
         Some(ext) if ext.eq_ignore_ascii_case("torrent") => {
@@ -337,7 +307,11 @@ fn replay_command_for_path(path: &Path) -> Option<AppCommand> {
     }
 }
 
-fn replay_selected_entry(app_state: &mut AppState, app_command_tx: &mpsc::Sender<AppCommand>) {
+fn replay_selected_entry(
+    app_state: &mut AppState,
+    app_command_tx: &mpsc::Sender<AppCommand>,
+    shutdown_tx: Option<&broadcast::Sender<()>>,
+) {
     let entries = filtered_entries(app_state);
     let Some(entry) = entries.get(app_state.ui.journal.selected_index).copied() else {
         app_state.ui.journal.status_message = Some("No journal entry selected".to_string());
@@ -362,13 +336,20 @@ fn replay_selected_entry(app_state: &mut AppState, app_command_tx: &mpsc::Sender
         return;
     }
 
-    match app_command_tx.try_send(command) {
-        Ok(()) => {
-            app_state.ui.journal.status_message =
-                Some(format!("Replayed {}", compact_path_label(source_path, 2)));
-        }
-        Err(_) => {
-            app_state.ui.journal.status_message = Some("Replay request queue is busy".to_string());
+    if let Some(shutdown_tx) = shutdown_tx {
+        spawn_app_command_sender(app_command_tx.clone(), shutdown_tx.subscribe(), command);
+        app_state.ui.journal.status_message =
+            Some(format!("Replayed {}", compact_path_label(source_path, 2)));
+    } else {
+        match app_command_tx.try_send(command) {
+            Ok(()) => {
+                app_state.ui.journal.status_message =
+                    Some(format!("Replayed {}", compact_path_label(source_path, 2)));
+            }
+            Err(_) => {
+                app_state.ui.journal.status_message =
+                    Some("Replay request queue is busy".to_string());
+            }
         }
     }
 }
@@ -599,42 +580,27 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     );
 
     let footer_hint = Paragraph::new(Line::from(vec![
-        Span::styled(
-            "[Tab]",
-            ctx.apply(Style::default().fg(ctx.state_selected()).bold()),
-        ),
+        Span::styled("[Tab]", footer_key_style(ctx, ActionTone::Mode)),
         Span::styled(
             " Filter  ",
             ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
         ),
-        Span::styled(
-            "[Shift+Tab]",
-            ctx.apply(Style::default().fg(ctx.state_selected()).bold()),
-        ),
+        Span::styled("[Shift+Tab]", footer_key_style(ctx, ActionTone::Mode)),
         Span::styled(
             " Back  ",
             ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
         ),
-        Span::styled(
-            "[j/k]",
-            ctx.apply(Style::default().fg(ctx.state_info()).bold()),
-        ),
+        Span::styled("[j/k]", footer_key_style(ctx, ActionTone::Navigate)),
         Span::styled(
             " Move  ",
             ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
         ),
-        Span::styled(
-            "[Shift+Y]",
-            ctx.apply(Style::default().fg(ctx.state_success()).bold()),
-        ),
+        Span::styled("[Shift+Y]", footer_key_style(ctx, ActionTone::Replay)),
         Span::styled(
             " Replay  ",
             ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
         ),
-        Span::styled(
-            "[q]",
-            ctx.apply(Style::default().fg(ctx.state_error()).bold()),
-        ),
+        Span::styled("[q]", footer_key_style(ctx, ActionTone::Cancel)),
         Span::styled(
             " Close",
             ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
@@ -686,6 +652,14 @@ mod tests {
             ],
         };
         state
+    }
+
+    fn handle_event(
+        event: CrosstermEvent,
+        app_state: &mut AppState,
+        app_command_tx: &mpsc::Sender<AppCommand>,
+    ) {
+        handle_event_inner(event, app_state, app_command_tx, None);
     }
 
     #[test]

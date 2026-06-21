@@ -6,6 +6,8 @@ use std::sync::Arc;
 use crate::app::{AppCommand, AppMode, ConfigItem, FileBrowserMode};
 use crate::config::Settings;
 use crate::token_bucket::{rate_limit_bps_to_bucket_bytes_per_sec, TokenBucket};
+use crate::tui::action_style::{footer_key_style, ActionTone};
+use crate::tui::app_command::spawn_app_command_sender;
 use crate::tui::formatters::{format_limit_bps, path_to_string};
 use crate::tui::screen_context::ScreenContext;
 use directories::UserDirs;
@@ -13,7 +15,7 @@ use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::prelude::{Frame, Line, Span, Style};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 const RATE_LIMIT_STEP_BPS: u64 = 10_000 * 8;
 const UNLIMITED_RATE_LIMIT_BPS: u64 = crate::config::UNLIMITED_RATE_LIMIT_BPS;
@@ -22,6 +24,8 @@ const UNLIMITED_RATE_LIMIT_BPS: u64 = crate::config::UNLIMITED_RATE_LIMIT_BPS;
 pub enum ConfigAction {
     SaveAndExit,
     StartEditOrBrowse,
+    ToggleSelectedBool,
+    SetSelectedBool(bool),
     MoveUp,
     MoveDown,
     ResetSelected,
@@ -47,6 +51,8 @@ pub struct ConfigHandleContext<'a> {
     pub items: &'a mut [ConfigItem],
     pub editing: &'a mut Option<(ConfigItem, String)>,
     pub app_command_tx: &'a mpsc::Sender<AppCommand>,
+    pub shutdown_tx: &'a broadcast::Sender<()>,
+    pub file_browser_generation: &'a mut u64,
     pub global_dl_bucket: &'a Arc<TokenBucket>,
     pub global_ul_bucket: &'a Arc<TokenBucket>,
 }
@@ -97,6 +103,9 @@ fn map_key_to_config_action(
     match key_code {
         KeyCode::Esc | KeyCode::Char('Q') => Some(ConfigAction::SaveAndExit),
         KeyCode::Enter => Some(ConfigAction::StartEditOrBrowse),
+        KeyCode::Char(' ') => Some(ConfigAction::ToggleSelectedBool),
+        KeyCode::Char('t') => Some(ConfigAction::SetSelectedBool(true)),
+        KeyCode::Char('f') => Some(ConfigAction::SetSelectedBool(false)),
         KeyCode::Up | KeyCode::Char('k') => Some(ConfigAction::MoveUp),
         KeyCode::Down | KeyCode::Char('j') => Some(ConfigAction::MoveDown),
         KeyCode::Char('r') => Some(ConfigAction::ResetSelected),
@@ -131,6 +140,10 @@ pub fn reduce_config_action(
                 | ConfigItem::ClientPort => {
                     *editing = Some((selected_item, String::new()));
                 }
+                ConfigItem::AlwaysShowAddLocationPrompt => {
+                    settings_edit.always_show_add_location_prompt =
+                        !settings_edit.always_show_add_location_prompt;
+                }
                 ConfigItem::DefaultDownloadFolder | ConfigItem::WatchFolder => {
                     if shared_path_is_manual(selected_item) {
                         return result;
@@ -148,6 +161,7 @@ pub fn reduce_config_action(
 
                     result.effects.push(ConfigEffect::AppCommand(Box::new(
                         AppCommand::FetchFileTree {
+                            browser_generation: 0,
                             path: initial_path,
                             browser_mode: FileBrowserMode::ConfigPathSelection {
                                 target_item: selected_item,
@@ -159,6 +173,19 @@ pub fn reduce_config_action(
                         },
                     )));
                 }
+            }
+        }
+        ConfigAction::ToggleSelectedBool => {
+            result.consumed = true;
+            if items[*selected_index] == ConfigItem::AlwaysShowAddLocationPrompt {
+                settings_edit.always_show_add_location_prompt =
+                    !settings_edit.always_show_add_location_prompt;
+            }
+        }
+        ConfigAction::SetSelectedBool(value) => {
+            result.consumed = true;
+            if items[*selected_index] == ConfigItem::AlwaysShowAddLocationPrompt {
+                settings_edit.always_show_add_location_prompt = value;
             }
         }
         ConfigAction::MoveUp => {
@@ -187,6 +214,10 @@ pub fn reduce_config_action(
                 }
                 ConfigItem::WatchFolder => {
                     settings_edit.watch_folder = default_settings.watch_folder;
+                }
+                ConfigItem::AlwaysShowAddLocationPrompt => {
+                    settings_edit.always_show_add_location_prompt =
+                        default_settings.always_show_add_location_prompt;
                 }
                 ConfigItem::GlobalDownloadLimit => {
                     settings_edit.global_download_limit_bps =
@@ -336,6 +367,14 @@ pub fn draw(
                 "Torrent Watch Folder",
                 path_to_string(settings.watch_folder.as_deref()),
             ),
+            ConfigItem::AlwaysShowAddLocationPrompt => (
+                "Always Confirm Add Priority And Location",
+                if settings.always_show_add_location_prompt {
+                    "[x] true".to_string()
+                } else {
+                    "[ ] false".to_string()
+                },
+            ),
             ConfigItem::GlobalDownloadLimit => (
                 "Global DL Limit",
                 format_limit_bps(settings.global_download_limit_bps),
@@ -389,12 +428,9 @@ pub fn draw(
         && items.get(selected_index) == Some(&ConfigItem::DefaultDownloadFolder);
     let help_text = if editing.is_some() {
         Line::from(vec![
-            Span::styled(
-                "[Enter]",
-                ctx.apply(Style::default().fg(ctx.state_success())),
-            ),
+            Span::styled("[Enter]", footer_key_style(ctx, ActionTone::Confirm)),
             Span::raw(" to confirm, "),
-            Span::styled("[Esc]", ctx.apply(Style::default().fg(ctx.state_error()))),
+            Span::styled("[Esc]", footer_key_style(ctx, ActionTone::Cancel)),
             Span::raw(" to cancel."),
         ])
     } else if shared_path_notice {
@@ -409,25 +445,27 @@ pub fn draw(
             ),
             Span::raw(". Host-local fields still save here."),
         ])
+    } else if items.get(selected_index) == Some(&ConfigItem::AlwaysShowAddLocationPrompt) {
+        Line::from(vec![
+            Span::styled("[t]", footer_key_style(ctx, ActionTone::Toggle)),
+            Span::raw(" true, "),
+            Span::styled("[f]", footer_key_style(ctx, ActionTone::Toggle)),
+            Span::raw(" false, "),
+            Span::styled("[Enter]|[Space]", footer_key_style(ctx, ActionTone::Toggle)),
+            Span::raw(" toggle. "),
+            Span::styled("[Esc]|[Q]", footer_key_style(ctx, ActionTone::Confirm)),
+            Span::raw(" to Save & Exit."),
+        ])
     } else {
         Line::from(vec![
             Span::raw("Use "),
-            Span::styled(
-                "↑/↓/k/j",
-                ctx.apply(Style::default().fg(ctx.state_warning())),
-            ),
+            Span::styled("↑/↓/k/j", footer_key_style(ctx, ActionTone::Navigate)),
             Span::raw(" to navigate. "),
-            Span::styled(
-                "[Enter]",
-                ctx.apply(Style::default().fg(ctx.state_warning())),
-            ),
+            Span::styled("[Enter]", footer_key_style(ctx, ActionTone::Edit)),
             Span::raw(" to edit. "),
-            Span::styled("[r]", ctx.apply(Style::default().fg(ctx.state_warning()))),
+            Span::styled("[r]", footer_key_style(ctx, ActionTone::Clear)),
             Span::raw("eset to default. "),
-            Span::styled(
-                "[Esc]|[Q]",
-                ctx.apply(Style::default().fg(ctx.state_success())),
-            ),
+            Span::styled("[Esc]|[Q]", footer_key_style(ctx, ActionTone::Confirm)),
             Span::raw(" to Save & Exit, "),
         ])
     };
@@ -454,7 +492,20 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> bool
             for effect in reduced.effects {
                 match effect {
                     ConfigEffect::AppCommand(command) => {
-                        let _ = ctx.app_command_tx.try_send(*command);
+                        let mut command = *command;
+                        if let AppCommand::FetchFileTree {
+                            browser_generation, ..
+                        } = &mut command
+                        {
+                            *ctx.file_browser_generation =
+                                ctx.file_browser_generation.wrapping_add(1);
+                            *browser_generation = *ctx.file_browser_generation;
+                        }
+                        spawn_app_command_sender(
+                            ctx.app_command_tx.clone(),
+                            ctx.shutdown_tx.subscribe(),
+                            command,
+                        );
                     }
                     ConfigEffect::SetDownloadRate(new_rate) => {
                         let bucket = ctx.global_dl_bucket.clone();
@@ -469,6 +520,7 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> bool
                         });
                     }
                     ConfigEffect::ToNormal => {
+                        *ctx.file_browser_generation = ctx.file_browser_generation.wrapping_add(1);
                         *ctx.mode = AppMode::Normal;
                     }
                 }
@@ -489,6 +541,7 @@ mod tests {
             ConfigItem::ClientPort,
             ConfigItem::DefaultDownloadFolder,
             ConfigItem::WatchFolder,
+            ConfigItem::AlwaysShowAddLocationPrompt,
             ConfigItem::GlobalDownloadLimit,
             ConfigItem::GlobalUploadLimit,
         ]
@@ -517,7 +570,7 @@ mod tests {
     #[test]
     fn reducer_edit_commit_updates_download_limit_and_emits_effect() {
         let mut settings = Box::new(Settings::default());
-        let mut idx = 3usize;
+        let mut idx = 4usize;
         let mut items = config_items();
         let mut editing = Some((ConfigItem::GlobalDownloadLimit, "123".to_string()));
 
@@ -538,7 +591,7 @@ mod tests {
     #[test]
     fn reducer_rate_limit_arrows_keep_unlimited_as_sentinel() {
         let mut settings = Box::new(Settings::default());
-        let mut idx = 3usize;
+        let mut idx = 4usize;
         let mut items = config_items();
         let mut editing = None;
 
@@ -586,7 +639,7 @@ mod tests {
     fn reducer_upload_rate_decrease_from_small_cap_returns_to_unlimited() {
         let mut settings = Box::new(Settings::default());
         settings.global_upload_limit_bps = RATE_LIMIT_STEP_BPS / 2;
-        let mut idx = 4usize;
+        let mut idx = 5usize;
         let mut items = config_items();
         let mut editing = None;
 
@@ -603,6 +656,44 @@ mod tests {
             out.effects.as_slice(),
             [ConfigEffect::SetUploadRate(UNLIMITED_RATE_LIMIT_BPS)]
         ));
+    }
+
+    #[test]
+    fn reducer_boolean_row_accepts_toggle_true_and_false() {
+        let mut settings = Box::new(Settings::default());
+        let mut idx = 3usize;
+        let mut items = config_items();
+        let mut editing = None;
+
+        let out = reduce_config_action(
+            ConfigAction::ToggleSelectedBool,
+            &mut settings,
+            &mut idx,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+        assert!(out.consumed);
+        assert!(settings.always_show_add_location_prompt);
+
+        let out = reduce_config_action(
+            ConfigAction::SetSelectedBool(false),
+            &mut settings,
+            &mut idx,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+        assert!(out.consumed);
+        assert!(!settings.always_show_add_location_prompt);
+
+        let out = reduce_config_action(
+            ConfigAction::SetSelectedBool(true),
+            &mut settings,
+            &mut idx,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+        assert!(out.consumed);
+        assert!(settings.always_show_add_location_prompt);
     }
 
     #[test]

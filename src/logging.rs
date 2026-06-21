@@ -100,26 +100,26 @@ struct DailyRollingFileWriter {
     filename_prefix: String,
     max_log_files: usize,
     date_provider: Box<dyn LogDateProvider>,
-    report_stderr: bool,
+    report_errors_to_stderr: bool,
     current_date: Option<NaiveDate>,
     reported_roll_error_date: Option<NaiveDate>,
     file: Option<File>,
 }
 
 impl DailyRollingFileWriter {
-    fn new(
+    fn new_with_error_reporting(
         log_dir: PathBuf,
         filename_prefix: String,
         max_log_files: usize,
         date_provider: Box<dyn LogDateProvider>,
-        report_stderr: bool,
+        report_errors_to_stderr: bool,
     ) -> io::Result<Self> {
         let mut writer = Self {
             log_dir,
             filename_prefix,
             max_log_files,
             date_provider,
-            report_stderr,
+            report_errors_to_stderr,
             current_date: None,
             reported_roll_error_date: None,
             file: None,
@@ -157,13 +157,14 @@ impl DailyRollingFileWriter {
             Ok(file) => file,
             Err(error) if self.file.is_some() => {
                 if self.reported_roll_error_date != Some(today) {
-                    if self.report_stderr {
-                        eprintln!(
-                            "[Warn] Could not roll log file to {}; continuing with previous file: {}",
+                    report_stderr_warning(
+                        self.report_errors_to_stderr,
+                        &format!(
+                            "Could not roll log file to {}; continuing with previous file: {}",
                             path.display(),
                             error
-                        );
-                    }
+                        ),
+                    );
                     self.reported_roll_error_date = Some(today);
                 }
                 return Ok(());
@@ -186,50 +187,95 @@ impl DailyRollingFileWriter {
             &self.log_dir,
             &self.filename_prefix,
             self.max_log_files,
-            self.report_stderr,
             |path| fs::remove_file(path),
+            self.report_errors_to_stderr,
         ) {
-            if self.report_stderr {
-                eprintln!(
-                    "[Warn] Error pruning log files in {}: {}",
+            report_stderr_warning(
+                self.report_errors_to_stderr,
+                &format!(
+                    "Error pruning log files in {}: {}",
                     self.log_dir.display(),
                     error
-                );
-            }
+                ),
+            );
         }
     }
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "kept as the default-reporting wrapper and covered by logging tests"
+    )
+)]
+pub(crate) fn non_blocking_daily_file_writer(
+    log_dir: &Path,
+    filename_prefix: &str,
+    max_log_files: usize,
+) -> io::Result<(NonBlockingLogWriter, LogWorkerGuard)> {
+    non_blocking_daily_file_writer_with_stderr_reporting(
+        log_dir,
+        filename_prefix,
+        max_log_files,
+        true,
+    )
 }
 
 pub(crate) fn non_blocking_daily_file_writer_with_stderr_reporting(
     log_dir: &Path,
     filename_prefix: &str,
     max_log_files: usize,
-    report_stderr: bool,
+    report_errors_to_stderr: bool,
 ) -> io::Result<(NonBlockingLogWriter, LogWorkerGuard)> {
-    non_blocking_daily_file_writer_with_date_provider(
+    non_blocking_daily_file_writer_with_date_provider_and_error_reporting(
         log_dir,
         filename_prefix,
         max_log_files,
         DEFAULT_BUFFERED_LINES,
         Box::new(UtcDateProvider),
-        report_stderr,
+        report_errors_to_stderr,
     )
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "test-only date injection helper for rolling log coverage"
+    )
+)]
 fn non_blocking_daily_file_writer_with_date_provider(
     log_dir: &Path,
     filename_prefix: &str,
     max_log_files: usize,
     buffered_lines: usize,
     date_provider: Box<dyn LogDateProvider>,
-    report_stderr: bool,
 ) -> io::Result<(NonBlockingLogWriter, LogWorkerGuard)> {
-    let file_writer = DailyRollingFileWriter::new(
+    non_blocking_daily_file_writer_with_date_provider_and_error_reporting(
+        log_dir,
+        filename_prefix,
+        max_log_files,
+        buffered_lines,
+        date_provider,
+        true,
+    )
+}
+
+fn non_blocking_daily_file_writer_with_date_provider_and_error_reporting(
+    log_dir: &Path,
+    filename_prefix: &str,
+    max_log_files: usize,
+    buffered_lines: usize,
+    date_provider: Box<dyn LogDateProvider>,
+    report_errors_to_stderr: bool,
+) -> io::Result<(NonBlockingLogWriter, LogWorkerGuard)> {
+    let file_writer = DailyRollingFileWriter::new_with_error_reporting(
         log_dir.to_path_buf(),
         filename_prefix.to_string(),
         max_log_files,
         date_provider,
-        report_stderr,
+        report_errors_to_stderr,
     )?;
     let (sender, receiver) = mpsc::sync_channel(buffered_lines);
     let handle = thread::Builder::new()
@@ -250,12 +296,16 @@ fn non_blocking_daily_file_writer_with_date_provider(
 
 fn run_log_worker(mut file_writer: DailyRollingFileWriter, receiver: Receiver<LogCommand>) {
     let mut reported_write_error = false;
-    let report_stderr = file_writer.report_stderr;
+    let report_errors_to_stderr = file_writer.report_errors_to_stderr;
     while let Ok(command) = receiver.recv() {
         match command {
             LogCommand::Write(bytes) => {
                 if let Err(error) = file_writer.write_all(&bytes) {
-                    report_log_worker_error(&mut reported_write_error, error, report_stderr);
+                    report_log_worker_error(
+                        &mut reported_write_error,
+                        error,
+                        report_errors_to_stderr,
+                    );
                 }
             }
             LogCommand::Flush(sender) => {
@@ -263,7 +313,11 @@ fn run_log_worker(mut file_writer: DailyRollingFileWriter, receiver: Receiver<Lo
             }
             LogCommand::Shutdown => {
                 if let Err(error) = file_writer.flush() {
-                    report_log_worker_error(&mut reported_write_error, error, report_stderr);
+                    report_log_worker_error(
+                        &mut reported_write_error,
+                        error,
+                        report_errors_to_stderr,
+                    );
                 }
                 break;
             }
@@ -271,14 +325,32 @@ fn run_log_worker(mut file_writer: DailyRollingFileWriter, receiver: Receiver<Lo
     }
 }
 
-fn report_log_worker_error(reported: &mut bool, error: io::Error, report_stderr: bool) {
-    if !*reported && report_stderr {
-        eprintln!(
-            "[Warn] File logging failed; future log lines may be lost: {}",
-            error
+fn report_log_worker_error(reported: &mut bool, error: io::Error, report_errors_to_stderr: bool) {
+    if !*reported {
+        report_stderr_warning(
+            report_errors_to_stderr,
+            &format!(
+                "File logging failed; future log lines may be lost: {}",
+                error
+            ),
         );
+        *reported = true;
     }
-    *reported = true;
+}
+
+fn report_stderr_warning(report_to_stderr: bool, message: &str) {
+    let _ = write_stderr_warning(report_to_stderr, io::stderr().lock(), message);
+}
+
+fn write_stderr_warning<W: Write>(
+    report_to_stderr: bool,
+    mut writer: W,
+    message: &str,
+) -> io::Result<()> {
+    if report_to_stderr {
+        writeln!(writer, "[Warn] {message}")?;
+    }
+    Ok(())
 }
 
 fn daily_log_file_name(filename_prefix: &str, date: NaiveDate) -> String {
@@ -327,8 +399,8 @@ fn prune_old_logs<F>(
     log_dir: &Path,
     filename_prefix: &str,
     max_log_files: usize,
-    report_stderr: bool,
     remove_file: F,
+    report_errors_to_stderr: bool,
 ) -> io::Result<()>
 where
     F: Fn(&Path) -> io::Result<()>,
@@ -346,13 +418,14 @@ where
     let remove_count = logs.len() - max_log_files;
     for (_, path) in logs.into_iter().take(remove_count) {
         if let Err(error) = remove_file(&path) {
-            if report_stderr {
-                eprintln!(
-                    "[Warn] Failed to remove old log file {}: {}",
+            report_stderr_warning(
+                report_errors_to_stderr,
+                &format!(
+                    "Failed to remove old log file {}: {}",
                     path.display(),
                     error
-                );
-            }
+                ),
+            );
         }
     }
     Ok(())
@@ -381,6 +454,25 @@ mod tests {
     }
 
     #[test]
+    fn stderr_warning_writer_suppresses_output_when_disabled() {
+        let mut output = Vec::new();
+
+        write_stderr_warning(false, &mut output, "hidden warning").expect("write warning");
+
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn stderr_warning_writer_formats_enabled_warning() {
+        let mut output = Vec::new();
+
+        write_stderr_warning(true, &mut output, "visible warning").expect("write warning");
+
+        let output = String::from_utf8(output).expect("utf8 warning");
+        assert_eq!(output, "[Warn] visible warning\n");
+    }
+
+    #[test]
     fn daily_log_file_name_matches_existing_format() {
         assert_eq!(
             daily_log_file_name("app", date(2026, 5, 2)),
@@ -396,8 +488,7 @@ mod tests {
     fn non_blocking_writer_flushes_on_guard_drop() {
         let dir = tempdir().expect("create tempdir");
         let (mut writer, guard) =
-            non_blocking_daily_file_writer_with_stderr_reporting(dir.path(), "app", 31, true)
-                .expect("create log writer");
+            non_blocking_daily_file_writer(dir.path(), "app", 31).expect("create log writer");
 
         writer.write_all(b"sample log line\n").expect("queue log");
         drop(guard);
@@ -423,7 +514,6 @@ mod tests {
             31,
             16,
             Box::new(provider),
-            true,
         )
         .expect("create log writer");
 
@@ -470,7 +560,6 @@ mod tests {
             31,
             16,
             Box::new(provider),
-            true,
         )
         .expect("create log writer");
         drop(guard);
@@ -502,9 +591,13 @@ mod tests {
             .expect("seed log");
         }
 
-        let result = prune_old_logs(dir.path(), "app", 2, true, |_path| {
-            Err(io::Error::new(io::ErrorKind::PermissionDenied, "locked"))
-        });
+        let result = prune_old_logs(
+            dir.path(),
+            "app",
+            2,
+            |_path| Err(io::Error::new(io::ErrorKind::PermissionDenied, "locked")),
+            false,
+        );
 
         assert!(result.is_ok());
         let matching = matching_log_files(dir.path(), "app").expect("list matching logs");
@@ -518,12 +611,12 @@ mod tests {
         let provider = SharedDateProvider {
             date: Arc::clone(&current_date),
         };
-        let mut writer = DailyRollingFileWriter::new(
+        let mut writer = DailyRollingFileWriter::new_with_error_reporting(
             dir.path().to_path_buf(),
             "app".to_string(),
             31,
             Box::new(provider),
-            true,
+            false,
         )
         .expect("create log writer");
 
@@ -581,8 +674,7 @@ mod tests {
         let blocking_file = dir.path().join("not-a-directory");
         fs::write(&blocking_file, "blocking").expect("create blocking file");
 
-        let result =
-            non_blocking_daily_file_writer_with_stderr_reporting(&blocking_file, "app", 31, true);
+        let result = non_blocking_daily_file_writer(&blocking_file, "app", 31);
 
         assert!(result.is_err(), "file path should not act as a log dir");
     }

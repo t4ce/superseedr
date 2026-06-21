@@ -46,8 +46,19 @@
   - `c` -> `Config`.
   - `a` -> `FileBrowser` (add torrent flow).
   - `d`/`D` -> `DeleteConfirm`.
+  - `M` -> `TorrentManagement`.
   - `Q` sets quit flag.
   - `Esc` clears `system_error` (stays in `Normal`).
+- `TorrentManagement`:
+  - `/` searches torrent names and paths.
+  - `Tab` toggles search mode.
+  - `x` toggles anonymized torrent names.
+  - `h`/`l` or `←`/`→` moves between visible columns; `s` sorts by the focused column.
+  - `Space` multi-selects the focused torrent; `A` selects all visible torrents.
+  - `p`, `d`, and `D` queue pause/resume, remove, and purge actions for selected torrents.
+  - `Y` opens the draft-command confirmation when commands are queued; `Y` again submits confirmed draft commands.
+  - `u` clears draft commands for the current target set.
+  - `Esc`/`q` returns to `Normal`.
 - `PowerSaving`: `z` -> `Normal`.
 - `Config`:
   - `Esc`/`Q` applies edited settings and returns to `Normal`.
@@ -55,8 +66,9 @@
 - `FileBrowser`:
   - `Y` confirms current action.
   - `Esc` returns to `Normal` or `Config` depending on browser mode.
-  - `/` enters browser search.
-- `DeleteConfirm`: `Enter` confirms and returns to `Normal`; `Esc` cancels.
+  - `/` enters browser search for the active pane; while the search bar is active, `Tab` toggles fuzzy/regex instead of switching panes.
+  - Torrent preview pane: `Space` or `p` cycles the selected file/folder priority, `P` cycles all file priorities, `e` expands all, and `c` closes all.
+- `DeleteConfirm`: `Y` confirms and returns to `Normal`; `Esc` cancels.
 
 ## Navigation Contract (Minimal)
 This contract formalizes top-level screen transitions. Any transition behavior change should update this table and the transition tests.
@@ -65,13 +77,15 @@ This contract formalizes top-level screen transitions. Any transition behavior c
 | --- | --- | --- | --- |
 | `Welcome` | `Esc` press | `Normal` | Entry handoff |
 | `Normal` | `m` | `Help` | Manual/help route |
-| `Help` | `Esc` | `Normal` | Close help |
+| `Help` | `Esc`, `m`, or `q` | `Normal` | Close help when search is not active |
 | `Normal` | `z` | `PowerSaving` | Zen mode |
 | `PowerSaving` | `z` | `Normal` | Return from zen |
 | `Normal` | `c` | `Config` | Open settings |
 | `Config` | `Esc` or `Q` | `Normal` | Save + exit |
+| `Normal` | `M` | `TorrentManagement` | Batch torrent management |
+| `TorrentManagement` | `Esc` or `q` | `Normal` | Close management |
 | `Normal` | `d`/`D` | `DeleteConfirm` | Selected torrent only |
-| `DeleteConfirm` | `Enter` or `Esc` | `Normal` | Confirm/cancel dialog |
+| `DeleteConfirm` | `Y` or `Esc` | `Normal` | Confirm/cancel dialog |
 | `Normal` | `a` | `FileBrowser` | Add torrent path flow |
 | `Config` | `Enter` on path item | `FileBrowser` | Path picker flow |
 | `FileBrowser` | `Esc` | `Normal` or `Config` | Depends on browser sub-mode |
@@ -99,6 +113,9 @@ Keep the current lightweight contract unless one or more of these happen:
 - Help now uses dedicated route mode: `AppMode::Help`.
 - Windows: `m` press toggles between `Normal` and `Help`.
 - Non-Windows: `m` press opens help from `Normal`; `m` release or `Esc` closes to `Normal`.
+- Help content is sectioned (`General`, `Torrents`, `Graphs`, `Legends`, `Screens`, `Paths`, `Build`) and scrolls with `Up`/`Down` or `k`/`j`.
+- `Tab`/`Shift+Tab` or `h`/`l` moves between sections.
+- `/` opens a prompt-panel search across all help contents, including path and build rows; typed characters filter live, `Tab` toggles fuzzy/regex matching, `Enter` keeps results, and `Esc` clears search.
 
 ## Invariants
 - Reducers are deterministic and side-effect free; side effects execute via effect runners.
