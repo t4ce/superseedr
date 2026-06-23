@@ -3826,20 +3826,25 @@ impl App {
                 let pending_info_hash = btih.or(btmh);
                 let initial_path = self.get_initial_destination_path();
                 let browser_generation = self.app_state.ui.file_browser.next_browser_generation();
+                let (container_name, use_container) = if self.is_current_shared_follower() {
+                    (String::new(), false)
+                } else {
+                    (AWAITING_MAGNET_METADATA_LABEL.to_string(), true)
+                };
                 self.start_file_browser_fetch(
                     browser_generation,
                     initial_path,
                     FileBrowserMode::DownloadLocSelection {
                         target: DownloadSelectionTarget::PendingAdd,
                         torrent_files: vec![],
-                        container_name: AWAITING_MAGNET_METADATA_LABEL.to_string(),
-                        use_container: true,
+                        container_name: container_name.clone(),
+                        use_container,
                         is_editing_name: false,
                         preview_tree: Vec::new(),
                         preview_state: TreeViewState::default(),
                         focused_pane: BrowserPane::FileSystem,
                         cursor_pos: 0,
-                        original_name_backup: AWAITING_MAGNET_METADATA_LABEL.to_string(),
+                        original_name_backup: container_name,
                     },
                     None,
                 );
@@ -12689,6 +12694,7 @@ mod tests {
         let FileBrowserMode::DownloadLocSelection {
             target,
             container_name,
+            use_container,
             preview_tree,
             ..
         } = &app.app_state.ui.file_browser.browser_mode
@@ -12696,10 +12702,120 @@ mod tests {
             panic!("expected download location selection browser");
         };
         assert_eq!(target, &DownloadSelectionTarget::PendingAdd);
-        assert_eq!(container_name, AWAITING_MAGNET_METADATA_LABEL);
+        assert_eq!(container_name, "");
+        assert!(!*use_container);
         assert!(preview_tree.is_empty());
 
         let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn shared_follower_manual_magnet_confirm_queues_leader_request_without_runtime() {
+        let _guard = lock_shared_env();
+        let shared_root = tempfile::tempdir().expect("create shared root");
+        let effective_root = shared_root.path().join("superseedr-config");
+        let original_shared_dir = env::var_os("SUPERSEEDR_SHARED_CONFIG_DIR");
+        let original_host_id = env::var_os("SUPERSEEDR_SHARED_HOST_ID");
+
+        env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", shared_root.path());
+        env::set_var("SUPERSEEDR_SHARED_HOST_ID", "node-a");
+        clear_shared_config_state_for_tests();
+
+        std::fs::create_dir_all(effective_root.join("hosts").join("node-a"))
+            .expect("create hosts dir");
+        std::fs::write(
+            effective_root
+                .join("hosts")
+                .join("node-a")
+                .join("config.toml"),
+            "client_port = 0\n",
+        )
+        .expect("write host config");
+
+        let mut settings = crate::config::load_settings().expect("load shared settings");
+        settings.client_port = 0;
+        settings.default_download_folder = Some(effective_root.join("data").join("downloads"));
+        settings.always_show_add_location_prompt = true;
+        crate::config::save_settings(&settings).expect("save shared settings");
+
+        let mut app = App::new(settings.clone(), AppRuntimeMode::SharedFollower)
+            .await
+            .expect("build shared follower app");
+        while app.app_command_rx.try_recv().is_ok() {}
+
+        let magnet_link = "magnet:?xt=urn:btih:5555555555555555555555555555555555555555";
+        app.open_manual_magnet_browser(magnet_link.to_string())
+            .await
+            .expect("open manual magnet browser");
+
+        assert!(app.app_state.torrents.is_empty());
+        assert!(app.torrent_manager_command_txs.is_empty());
+
+        let payload = build_download_confirm_payload(
+            &app.app_state.ui.file_browser.state,
+            &app.app_state.ui.file_browser.browser_mode,
+        )
+        .expect("shared follower can confirm manual magnet prompt");
+        let transition = execute_confirm_decision(
+            &mut app,
+            crate::tui::screens::browser::ConfirmDecision::Download(payload),
+        )
+        .await;
+        assert!(matches!(
+            transition,
+            Some(crate::tui::screens::browser::BrowserTransition::ToNormal)
+        ));
+
+        let command = time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(command) = app.app_command_rx.recv().await {
+                    if matches!(command, AppCommand::SubmitControlRequest(_)) {
+                        break command;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("queued submit control request");
+        app.handle_app_command(command).await;
+
+        assert!(app.app_state.torrents.is_empty());
+        assert!(app.torrent_manager_command_txs.is_empty());
+        let inbox_entries: Vec<_> = std::fs::read_dir(effective_root.join("inbox"))
+            .expect("read shared inbox")
+            .collect();
+        assert_eq!(inbox_entries.len(), 1);
+        let queued_path = inbox_entries[0]
+            .as_ref()
+            .expect("queued inbox entry")
+            .path();
+        let queued_request = read_control_request(&queued_path).expect("read queued request");
+        match queued_request {
+            ControlRequest::AddMagnet {
+                magnet_link: queued_link,
+                download_path,
+                container_name,
+                ..
+            } => {
+                assert_eq!(queued_link, magnet_link);
+                assert_eq!(download_path, settings.default_download_folder);
+                assert_eq!(container_name.as_deref(), Some(""));
+            }
+            other => panic!("unexpected queued request: {:?}", other),
+        }
+
+        let _ = app.shutdown_tx.send(());
+        if let Some(value) = original_shared_dir {
+            env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", value);
+        } else {
+            env::remove_var("SUPERSEEDR_SHARED_CONFIG_DIR");
+        }
+        if let Some(value) = original_host_id {
+            env::set_var("SUPERSEEDR_SHARED_HOST_ID", value);
+        } else {
+            env::remove_var("SUPERSEEDR_SHARED_HOST_ID");
+        }
+        clear_shared_config_state_for_tests();
     }
 
     #[tokio::test]
