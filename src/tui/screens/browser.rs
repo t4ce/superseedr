@@ -4,12 +4,10 @@
 use crate::app::{
     refresh_torrent_preview_directory_priorities, App, AppCommand, AppMode, BrowserPane,
     BrowserSearchState, ConfigItem, ConfigUiState, DownloadSelectionTarget, FileBrowserMode,
-    FileMetadata, FilePriority, SearchMode, TorrentDisplayState, TorrentPreviewPayload,
-    AWAITING_MAGNET_METADATA_LABEL,
+    FileMetadata, FilePriority, SearchMode, TorrentPreviewPayload, AWAITING_MAGNET_METADATA_LABEL,
 };
 use crate::integrations::control::{ControlFilePriorityOverride, ControlRequest};
 use crate::theme::ThemeContext;
-use crate::torrent_manager::ManagerCommand;
 use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::app_command::spawn_app_command_sender;
 use crate::tui::formatters::{centered_rect, format_bytes, sanitize_text, truncate_with_ellipsis};
@@ -28,10 +26,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
-use tokio::sync::{
-    broadcast,
-    mpsc::{self, Sender},
-};
+use tokio::sync::{broadcast, mpsc};
 
 const ASCII_TREE_DIR_ICON: &str = "> ";
 const ASCII_TREE_FILE_ICON: &str = "  ";
@@ -1124,7 +1119,7 @@ pub enum BrowserDialogAction {
 pub enum BrowserDialogEffect {
     ExecuteConfirmDecision(ConfirmDecision),
     ToConfig(ConfigUiState),
-    CleanupPendingLink { async_delete: bool },
+    CleanupPendingLink,
     ToNormalAndClearPending,
     ClearSearch,
 }
@@ -1872,11 +1867,7 @@ pub fn reduce_browser_dialog_action(
             if matches!(browser_mode, FileBrowserMode::DownloadLocSelection { .. })
                 && has_pending_torrent_link
             {
-                result
-                    .effects
-                    .push(BrowserDialogEffect::CleanupPendingLink {
-                        async_delete: false,
-                    });
+                result.effects.push(BrowserDialogEffect::CleanupPendingLink);
             }
 
             result.effects.push(BrowserDialogEffect::ClearSearch);
@@ -1886,9 +1877,7 @@ pub fn reduce_browser_dialog_action(
         }
         BrowserDialogAction::CancelDownloadSelection => {
             if has_pending_torrent_link {
-                result
-                    .effects
-                    .push(BrowserDialogEffect::CleanupPendingLink { async_delete: true });
+                result.effects.push(BrowserDialogEffect::CleanupPendingLink);
             }
             result.effects.push(BrowserDialogEffect::ClearSearch);
             result
@@ -1912,21 +1901,14 @@ pub async fn execute_browser_dialog_effects(app: &mut App, effects: Vec<BrowserD
                 app.app_state.ui.config = config_ui;
                 apply_browser_transition(app, BrowserTransition::ToConfig);
             }
-            BrowserDialogEffect::CleanupPendingLink { async_delete } => {
-                let shutdown_tx = app.shutdown_tx.clone();
-                cleanup_pending_link_on_escape(
-                    &app.app_state.pending_torrent_link,
-                    &mut app.torrent_manager_command_txs,
-                    &mut app.app_state.torrents,
-                    &mut app.app_state.torrent_list_order,
-                    &shutdown_tx,
-                    async_delete,
-                );
+            BrowserDialogEffect::CleanupPendingLink => {
+                app.cleanup_pending_magnet_preview_runtime();
             }
             BrowserDialogEffect::ToNormalAndClearPending => {
                 apply_browser_close_transition(app);
                 app.app_state.pending_torrent_path = None;
                 app.app_state.pending_torrent_link.clear();
+                app.app_state.pending_magnet_preview_info_hash = None;
             }
             BrowserDialogEffect::ClearSearch => {
                 app.app_state.ui.file_browser.search_state = BrowserSearchState::Closed;
@@ -2132,6 +2114,7 @@ pub async fn execute_confirm_decision(
                         AppCommand::SubmitControlRequest(request),
                     );
                     app.app_state.pending_torrent_link.clear();
+                    app.app_state.pending_magnet_preview_info_hash = None;
                 } else {
                     tracing::warn!(target: "superseedr", "SHIFT+Y pressed but no pending content was found");
                 }
@@ -2224,57 +2207,13 @@ pub fn build_download_confirm_payload(
     None
 }
 
+#[cfg(test)]
 pub fn pending_link_info_hash(pending_torrent_link: &str) -> Option<Vec<u8>> {
     if pending_torrent_link.is_empty() {
         return None;
     }
     let (btih, btmh) = crate::app::parse_hybrid_hashes(pending_torrent_link);
     btih.or(btmh)
-}
-
-pub fn cleanup_pending_link_on_escape(
-    pending_torrent_link: &str,
-    torrent_manager_command_txs: &mut HashMap<Vec<u8>, Sender<ManagerCommand>>,
-    torrents: &mut HashMap<Vec<u8>, TorrentDisplayState>,
-    torrent_list_order: &mut Vec<Vec<u8>>,
-    shutdown_tx: &broadcast::Sender<()>,
-    async_delete: bool,
-) {
-    if let Some(info_hash) = pending_link_info_hash(pending_torrent_link) {
-        if async_delete {
-            if let Some(manager_tx) = torrent_manager_command_txs.get(&info_hash) {
-                spawn_manager_delete_until_shutdown(manager_tx.clone(), shutdown_tx.subscribe());
-            }
-            torrent_manager_command_txs.remove(&info_hash);
-        } else if let Some(manager_tx) = torrent_manager_command_txs.remove(&info_hash) {
-            spawn_manager_delete_until_shutdown(manager_tx, shutdown_tx.subscribe());
-        }
-
-        torrents.remove(&info_hash);
-        torrent_list_order.retain(|h| h != &info_hash);
-    }
-}
-
-fn spawn_manager_delete_until_shutdown(
-    manager_tx: Sender<ManagerCommand>,
-    mut shutdown_rx: broadcast::Receiver<()>,
-) {
-    tokio::spawn(async move {
-        tokio::select! {
-            result = manager_tx.send(ManagerCommand::DeleteFile) => {
-                if let Err(error) = result {
-                    tracing::error!("Failed to send DeleteFile to cancelled manager: {}", error);
-                }
-            }
-            shutdown = shutdown_rx.recv() => {
-                match shutdown {
-                    Ok(())
-                    | Err(broadcast::error::RecvError::Closed)
-                    | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                }
-            }
-        }
-    });
 }
 
 pub fn apply_priority_cycle(
@@ -2377,7 +2316,8 @@ pub fn apply_priority_cycle_to_all(nodes: &mut [RawNode<TorrentPreviewPayload>])
 mod tests {
     use super::*;
     use crate::app::{
-        AppRuntimeMode, BrowserPane, ConfigItem, TorrentMetrics, TorrentPreviewPayload,
+        AppRuntimeMode, BrowserPane, ConfigItem, TorrentDisplayState, TorrentMetrics,
+        TorrentPreviewPayload,
     };
     use crate::config::Settings;
     use crate::tui::tree::{RawNode, TreeViewState};
@@ -3537,9 +3477,7 @@ mod tests {
         assert_eq!(out.effects.len(), 3);
         assert!(matches!(
             out.effects[0],
-            BrowserDialogEffect::CleanupPendingLink {
-                async_delete: false
-            }
+            BrowserDialogEffect::CleanupPendingLink
         ));
         assert!(matches!(out.effects[1], BrowserDialogEffect::ClearSearch));
         assert!(matches!(
@@ -3574,7 +3512,7 @@ mod tests {
         assert_eq!(out.effects.len(), 3);
         assert!(matches!(
             out.effects[0],
-            BrowserDialogEffect::CleanupPendingLink { async_delete: true }
+            BrowserDialogEffect::CleanupPendingLink
         ));
         assert!(matches!(out.effects[1], BrowserDialogEffect::ClearSearch));
         assert!(matches!(
@@ -3586,25 +3524,6 @@ mod tests {
     #[test]
     fn pending_link_hash_is_none_for_empty() {
         assert!(pending_link_info_hash("").is_none());
-    }
-
-    #[test]
-    fn cleanup_pending_link_is_noop_for_empty() {
-        let mut txs: HashMap<Vec<u8>, Sender<ManagerCommand>> = HashMap::new();
-        let mut torrents: HashMap<Vec<u8>, TorrentDisplayState> = HashMap::new();
-        let mut order = vec![];
-        let (shutdown_tx, _) = broadcast::channel(1);
-        cleanup_pending_link_on_escape(
-            "",
-            &mut txs,
-            &mut torrents,
-            &mut order,
-            &shutdown_tx,
-            false,
-        );
-        assert!(txs.is_empty());
-        assert!(torrents.is_empty());
-        assert!(order.is_empty());
     }
 
     #[test]
