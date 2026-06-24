@@ -3609,26 +3609,6 @@ impl App {
             }
         };
 
-        if self.client_configs.always_show_add_location_prompt
-            && !is_host_watch_path
-            && (!is_shared_inbox_path || matches!(self.runtime_mode, AppRuntimeMode::SharedLeader))
-        {
-            return AddIngressAction::OpenManualBrowser { payload };
-        }
-
-        if self.is_current_shared_follower()
-            && !is_shared_inbox_path
-            && self.client_configs.default_download_folder.is_some()
-        {
-            return match self.control_request_for_add_payload(
-                &payload,
-                self.client_configs.default_download_folder.clone(),
-            ) {
-                Ok(request) => AddIngressAction::QueueControlRequest(request),
-                Err(message) => AddIngressAction::Fail { message },
-            };
-        }
-
         if self.is_current_shared_follower()
             && is_host_watch_path
             && matches!(source, IngestSource::TorrentPathFile)
@@ -3638,10 +3618,36 @@ impl App {
             };
         }
 
+        if self.is_current_shared_follower() && !is_shared_inbox_path {
+            let Some(default_download_folder) = self.client_configs.default_download_folder.clone()
+            else {
+                return AddIngressAction::Fail {
+                    message: "Follower add ingest requires a default download folder so the leader can apply the torrent without local manual UI.".to_string(),
+                };
+            };
+            return match self
+                .control_request_for_add_payload(&payload, Some(default_download_folder))
+            {
+                Ok(request) => AddIngressAction::QueueControlRequest(request),
+                Err(message) => AddIngressAction::Fail { message },
+            };
+        }
+
+        if self.client_configs.always_show_add_location_prompt
+            && !is_host_watch_path
+            && (!is_shared_inbox_path || matches!(self.runtime_mode, AppRuntimeMode::SharedLeader))
+        {
+            return AddIngressAction::OpenManualBrowser { payload };
+        }
+
         if let Some(download_path) = self.client_configs.default_download_folder.clone() {
             AddIngressAction::ApplyDirectly {
                 payload,
                 download_path,
+            }
+        } else if self.is_current_shared_follower() {
+            AddIngressAction::Fail {
+                message: "Follower add ingest requires a default download folder so the leader can apply the torrent without local manual UI.".to_string(),
             }
         } else {
             AddIngressAction::OpenManualBrowser { payload }
@@ -3708,7 +3714,6 @@ impl App {
     }
 
     fn open_manual_browser_for_torrent_file(&mut self, path: PathBuf) -> Result<(), String> {
-        self.app_state.pending_magnet_preview_info_hash = None;
         let buffer = fs::read(&path).map_err(|error| {
             format_filesystem_path_error("Failed to read torrent file", &path, &error)
         })?;
@@ -3765,6 +3770,7 @@ impl App {
             node.expand_all(&mut preview_state);
         }
 
+        self.cleanup_pending_magnet_preview_runtime();
         self.app_state.pending_torrent_path = Some(final_path);
         let initial_path = self.get_initial_destination_path();
         let browser_generation = self.app_state.ui.file_browser.next_browser_generation();
@@ -3799,7 +3805,7 @@ impl App {
                 if matches!(source, IngestSource::TorrentFile) {
                     self.open_manual_browser_for_torrent_file(source_path)
                 } else {
-                    self.app_state.pending_magnet_preview_info_hash = None;
+                    self.cleanup_pending_magnet_preview_runtime();
                     self.app_state.pending_torrent_path = Some(source_path);
                     let initial_path = self.get_initial_destination_path();
                     let browser_generation =
@@ -3825,8 +3831,8 @@ impl App {
                 }
             }
             ResolvedAddPayload::MagnetLink { magnet_link } => {
+                self.cleanup_pending_magnet_preview_runtime();
                 self.app_state.pending_torrent_link = magnet_link.clone();
-                self.app_state.pending_magnet_preview_info_hash = None;
                 let (btih, btmh) = parse_hybrid_hashes(&magnet_link);
                 let pending_info_hash = btih.or(btmh);
                 let initial_path = self.get_initial_destination_path();
@@ -12790,6 +12796,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn second_manual_magnet_replaces_and_cleans_old_pending_preview_runtime() {
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let settings = crate::config::Settings {
+            client_port: 0,
+            default_download_folder: Some(temp_dir.path().join("downloads")),
+            always_show_add_location_prompt: true,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        while app.app_command_rx.try_recv().is_ok() {}
+
+        let first_magnet = "magnet:?xt=urn:btih:5555555555555555555555555555555555555555";
+        let first_hash = vec![0x55; 20];
+        app.open_manual_magnet_browser(first_magnet.to_string())
+            .await
+            .expect("open first manual magnet browser");
+        assert_eq!(
+            app.app_state.pending_magnet_preview_info_hash,
+            Some(first_hash.clone())
+        );
+        assert!(app.app_state.torrents.contains_key(&first_hash));
+        assert!(app.torrent_manager_command_txs.contains_key(&first_hash));
+
+        let second_magnet = "magnet:?xt=urn:btih:6666666666666666666666666666666666666666";
+        let second_hash = vec![0x66; 20];
+        app.open_manual_magnet_browser(second_magnet.to_string())
+            .await
+            .expect("open second manual magnet browser");
+
+        assert_eq!(app.app_state.pending_torrent_link, second_magnet);
+        assert_eq!(
+            app.app_state.pending_magnet_preview_info_hash,
+            Some(second_hash.clone())
+        );
+        assert!(!app.app_state.torrents.contains_key(&first_hash));
+        assert!(!app.app_state.torrent_list_order.contains(&first_hash));
+        assert!(!app.torrent_manager_command_txs.contains_key(&first_hash));
+        assert!(app.app_state.torrents.contains_key(&second_hash));
+
+        let payload = build_persist_payload(
+            &mut app.client_configs,
+            &mut app.app_state,
+            &VecDeque::new(),
+        );
+        assert!(payload
+            .settings
+            .torrents
+            .iter()
+            .all(|torrent| !torrent.torrent_or_magnet.contains(first_magnet)));
+        assert!(payload
+            .settings
+            .torrents
+            .iter()
+            .all(|torrent| !torrent.torrent_or_magnet.contains(second_magnet)));
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
     async fn pending_magnet_escape_shuts_down_and_removes_all_preview_runtime_state() {
         let temp_dir = tempfile::tempdir().expect("create tempdir");
         let settings = crate::config::Settings {
@@ -12920,49 +12987,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_follower_manual_magnet_browser_does_not_start_local_runtime() {
+    async fn shared_follower_always_show_prompt_queues_leader_request_without_manual_browser() {
         let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let download_folder = temp_dir.path().join("downloads");
+        let magnet_path = temp_dir.path().join("manual-input.magnet");
+        let magnet_link = "magnet:?xt=urn:btih:5555555555555555555555555555555555555555";
+        std::fs::write(&magnet_path, magnet_link).expect("write magnet file");
         let settings = crate::config::Settings {
             client_port: 0,
-            default_download_folder: Some(temp_dir.path().join("downloads")),
+            default_download_folder: Some(download_folder.clone()),
             always_show_add_location_prompt: true,
             ..Default::default()
         };
-        let mut app = App::new(settings, AppRuntimeMode::SharedFollower)
+        let app = App::new(settings, AppRuntimeMode::SharedFollower)
             .await
             .expect("build app");
-        while app.app_command_rx.try_recv().is_ok() {}
 
-        let magnet_link = "magnet:?xt=urn:btih:5555555555555555555555555555555555555555";
-        app.open_manual_magnet_browser(magnet_link.to_string())
-            .await
-            .expect("open manual magnet browser");
+        let action = app.resolve_add_ingress_action(IngestSource::MagnetFile, &magnet_path);
 
-        assert_eq!(app.app_state.pending_torrent_link, magnet_link);
-        assert!(matches!(app.app_state.mode, AppMode::FileBrowser));
+        match action {
+            super::AddIngressAction::QueueControlRequest(ControlRequest::AddMagnet {
+                magnet_link: queued_link,
+                download_path,
+                container_name,
+                ..
+            }) => {
+                assert_eq!(queued_link, magnet_link);
+                assert_eq!(download_path, Some(download_folder));
+                assert!(container_name.is_none());
+            }
+            other => panic!("unexpected follower add action: {:?}", other),
+        }
+        assert!(!matches!(app.app_state.mode, AppMode::FileBrowser));
         assert!(app.app_state.torrents.is_empty());
         assert!(app.torrent_manager_command_txs.is_empty());
-
-        let FileBrowserMode::DownloadLocSelection {
-            target,
-            container_name,
-            use_container,
-            preview_tree,
-            ..
-        } = &app.app_state.ui.file_browser.browser_mode
-        else {
-            panic!("expected download location selection browser");
-        };
-        assert_eq!(target, &DownloadSelectionTarget::PendingAdd);
-        assert_eq!(container_name, "");
-        assert!(!*use_container);
-        assert!(preview_tree.is_empty());
 
         let _ = app.shutdown_tx.send(());
     }
 
     #[tokio::test]
-    async fn shared_follower_manual_magnet_confirm_queues_leader_request_without_runtime() {
+    async fn shared_follower_with_shared_config_default_queues_leader_request_without_manual_browser(
+    ) {
         let _guard = lock_shared_env();
         let shared_root = tempfile::tempdir().expect("create shared root");
         let effective_root = shared_root.path().join("superseedr-config");
@@ -12980,81 +13045,41 @@ mod tests {
                 .join("hosts")
                 .join("node-a")
                 .join("config.toml"),
-            "client_port = 0\n",
+            "client_port = 0\nalways_show_add_location_prompt = true\n",
         )
         .expect("write host config");
 
-        let mut settings = crate::config::load_settings().expect("load shared settings");
-        settings.client_port = 0;
-        settings.default_download_folder = Some(effective_root.join("data").join("downloads"));
-        settings.always_show_add_location_prompt = true;
-        crate::config::save_settings(&settings).expect("save shared settings");
-
-        let mut app = App::new(settings.clone(), AppRuntimeMode::SharedFollower)
-            .await
-            .expect("build shared follower app");
-        while app.app_command_rx.try_recv().is_ok() {}
-
+        let magnet_path = shared_root.path().join("manual-input.magnet");
         let magnet_link = "magnet:?xt=urn:btih:5555555555555555555555555555555555555555";
-        app.open_manual_magnet_browser(magnet_link.to_string())
+        std::fs::write(&magnet_path, magnet_link).expect("write magnet file");
+        let settings = crate::config::load_settings().expect("load shared settings");
+        assert_eq!(
+            settings.default_download_folder.as_deref(),
+            Some(shared_root.path())
+        );
+        assert!(settings.always_show_add_location_prompt);
+        let app = App::new(settings, AppRuntimeMode::SharedFollower)
             .await
-            .expect("open manual magnet browser");
+            .expect("build app");
 
-        assert!(app.app_state.torrents.is_empty());
-        assert!(app.torrent_manager_command_txs.is_empty());
+        let action = app.resolve_add_ingress_action(IngestSource::MagnetFile, &magnet_path);
 
-        let payload = build_download_confirm_payload(
-            &app.app_state.ui.file_browser.state,
-            &app.app_state.ui.file_browser.browser_mode,
-        )
-        .expect("shared follower can confirm manual magnet prompt");
-        let transition = execute_confirm_decision(
-            &mut app,
-            crate::tui::screens::browser::ConfirmDecision::Download(payload),
-        )
-        .await;
-        assert!(matches!(
-            transition,
-            Some(crate::tui::screens::browser::BrowserTransition::ToNormal)
-        ));
-
-        let command = time::timeout(Duration::from_secs(1), async {
-            loop {
-                if let Some(command) = app.app_command_rx.recv().await {
-                    if matches!(command, AppCommand::SubmitControlRequest(_)) {
-                        break command;
-                    }
-                }
-            }
-        })
-        .await
-        .expect("queued submit control request");
-        app.handle_app_command(command).await;
-
-        assert!(app.app_state.torrents.is_empty());
-        assert!(app.torrent_manager_command_txs.is_empty());
-        let inbox_entries: Vec<_> = std::fs::read_dir(effective_root.join("inbox"))
-            .expect("read shared inbox")
-            .collect();
-        assert_eq!(inbox_entries.len(), 1);
-        let queued_path = inbox_entries[0]
-            .as_ref()
-            .expect("queued inbox entry")
-            .path();
-        let queued_request = read_control_request(&queued_path).expect("read queued request");
-        match queued_request {
-            ControlRequest::AddMagnet {
+        match action {
+            super::AddIngressAction::QueueControlRequest(ControlRequest::AddMagnet {
                 magnet_link: queued_link,
                 download_path,
                 container_name,
                 ..
-            } => {
+            }) => {
                 assert_eq!(queued_link, magnet_link);
-                assert_eq!(download_path, settings.default_download_folder);
-                assert_eq!(container_name.as_deref(), Some(""));
+                assert_eq!(download_path.as_deref(), Some(shared_root.path()));
+                assert!(container_name.is_none());
             }
-            other => panic!("unexpected queued request: {:?}", other),
+            other => panic!("unexpected follower add action: {:?}", other),
         }
+        assert!(!matches!(app.app_state.mode, AppMode::FileBrowser));
+        assert!(app.app_state.torrents.is_empty());
+        assert!(app.torrent_manager_command_txs.is_empty());
 
         let _ = app.shutdown_tx.send(());
         if let Some(value) = original_shared_dir {

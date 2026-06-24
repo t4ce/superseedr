@@ -19,7 +19,7 @@ use crate::app::{
     App, AppMode, AppState, ConfigItem, RssScreen, SelectedHeader, TorrentControlState,
     TorrentDisplayState,
 };
-use crate::config::{PeerSortColumn, Settings, SortDirection, TorrentSortColumn};
+use crate::config::{PeerSortColumn, Settings, SortDirection, TorrentSortColumn, UiLayoutMode};
 use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
 use crate::integrations::control::ControlRequest;
 use crate::persistence::activity_history::{ActivityHistoryPoint, ActivityHistorySeries};
@@ -451,6 +451,27 @@ pub struct ReduceResult {
 }
 
 pub fn reduce_ui_action(app_state: &mut AppState, action: UiAction) -> ReduceResult {
+    reduce_ui_action_with_layout_mode(app_state, action, UiLayoutMode::Auto)
+}
+
+fn calculate_header_interaction_layout(
+    app_state: &AppState,
+    layout_mode: UiLayoutMode,
+) -> LayoutPlan {
+    let layout_ctx = LayoutContext::new(
+        app_state.screen_area,
+        app_state,
+        layout_mode,
+        DEFAULT_SIDEBAR_PERCENT,
+    );
+    calculate_layout(app_state.screen_area, &layout_ctx)
+}
+
+pub fn reduce_ui_action_with_layout_mode(
+    app_state: &mut AppState,
+    action: UiAction,
+    layout_mode: UiLayoutMode,
+) -> ReduceResult {
     match action {
         UiAction::ClearSystemError => {
             app_state.system_error = None;
@@ -468,7 +489,7 @@ pub fn reduce_ui_action(app_state: &mut AppState, action: UiAction) -> ReduceRes
             }
         }
         UiAction::Navigate(key_code) => {
-            handle_navigation(app_state, key_code);
+            handle_navigation_with_layout_mode(app_state, key_code, layout_mode);
             ReduceResult {
                 redraw: true,
                 effects: Vec::new(),
@@ -631,13 +652,7 @@ pub fn reduce_ui_action(app_state: &mut AppState, action: UiAction) -> ReduceRes
             }
         }
         UiAction::SortBySelectedColumn => {
-            let layout_ctx = LayoutContext::new(
-                app_state.screen_area,
-                app_state,
-                crate::config::UiLayoutMode::Auto,
-                DEFAULT_SIDEBAR_PERCENT,
-            );
-            let layout_plan = calculate_layout(app_state.screen_area, &layout_ctx);
+            let layout_plan = calculate_header_interaction_layout(app_state, layout_mode);
             let (_, visible_torrent_columns) =
                 compute_visible_torrent_columns(app_state, layout_plan.list.width);
             let (_, visible_peer_columns) =
@@ -6544,7 +6559,16 @@ fn draw_swarm_heatmap(
     f.render_widget(heatmap, inner_area);
 }
 
+#[cfg(test)]
 pub(crate) fn handle_navigation(app_state: &mut AppState, key_code: KeyCode) {
+    handle_navigation_with_layout_mode(app_state, key_code, UiLayoutMode::Auto);
+}
+
+pub(crate) fn handle_navigation_with_layout_mode(
+    app_state: &mut AppState,
+    key_code: KeyCode,
+    layout_mode: UiLayoutMode,
+) {
     let selected_torrent = app_state
         .torrent_list_order
         .get(app_state.ui.selected_torrent_index)
@@ -6555,13 +6579,7 @@ pub(crate) fn handle_navigation(app_state: &mut AppState, key_code: KeyCode) {
     let selected_torrent_peer_count =
         selected_torrent.map_or(0, |torrent| torrent.latest_state.peers.len());
 
-    let layout_ctx = LayoutContext::new(
-        app_state.screen_area,
-        app_state,
-        crate::config::UiLayoutMode::Auto,
-        DEFAULT_SIDEBAR_PERCENT,
-    );
-    let layout_plan = calculate_layout(app_state.screen_area, &layout_ctx);
+    let layout_plan = calculate_header_interaction_layout(app_state, layout_mode);
     let (_, visible_torrent_columns) =
         compute_visible_torrent_columns(app_state, layout_plan.list.width);
     let (_, visible_peer_columns) =
@@ -6748,6 +6766,27 @@ async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
         PastedContent::Magnet(magnet_link) => {
             let download_path = app.client_configs.default_download_folder.clone();
 
+            if app.is_current_shared_follower() {
+                let Some(download_path) = download_path else {
+                    app.app_state.system_error = Some(
+                        "Follower pasted magnet adds require a default download folder so the leader can apply the torrent without local manual UI.".to_string(),
+                    );
+                    return;
+                };
+                let request = app.prepare_add_magnet_request(
+                    magnet_link.to_string(),
+                    Some(download_path),
+                    None,
+                    HashMap::new(),
+                );
+                spawn_app_command_sender(
+                    app.app_command_tx.clone(),
+                    app.shutdown_tx.subscribe(),
+                    AppCommand::SubmitControlRequest(request),
+                );
+                return;
+            }
+
             if let Some(download_path) =
                 download_path.filter(|_| !app.client_configs.always_show_add_location_prompt)
             {
@@ -6843,7 +6882,11 @@ async fn handle_reducer_key(key: KeyEvent, app: &mut App) -> bool {
         return false;
     };
 
-    let result = reduce_ui_action(&mut app.app_state, action);
+    let result = reduce_ui_action_with_layout_mode(
+        &mut app.app_state,
+        action,
+        app.client_configs.ui_layout_mode,
+    );
     if result.redraw {
         app.app_state.ui.needs_redraw = true;
     }
@@ -7157,6 +7200,58 @@ mod tests {
         assert!(result.redraw);
         assert_eq!(app_state.ui.selected_torrent_index, 1);
         assert_eq!(app_state.ui.selected_peer_index, 0);
+    }
+
+    #[test]
+    fn reducer_sort_uses_forced_layout_visible_columns() {
+        let mut app_state = create_test_app_state();
+        app_state.screen_area = Rect::new(0, 0, 80, 70);
+        app_state.ui.selected_header = SelectedHeader::Torrent(ColumnId::DownSpeed);
+        app_state.torrent_sort = (TorrentSortColumn::Up, SortDirection::Descending);
+        let selected = app_state.torrent_list_order[0].clone();
+        if let Some(torrent) = app_state.torrents.get_mut(&selected) {
+            torrent.smoothed_download_speed_bps = 32;
+            torrent.smoothed_upload_speed_bps = 16;
+        }
+
+        let result = reduce_ui_action_with_layout_mode(
+            &mut app_state,
+            UiAction::SortBySelectedColumn,
+            UiLayoutMode::Horizontal,
+        );
+
+        assert!(result.redraw);
+        assert_eq!(
+            app_state.ui.selected_header,
+            SelectedHeader::Torrent(ColumnId::Name),
+            "forced horizontal layout should normalize hidden speed columns using the drawn list width"
+        );
+        assert_eq!(app_state.torrent_sort.0, TorrentSortColumn::Name);
+    }
+
+    #[test]
+    fn navigation_uses_forced_layout_visible_columns() {
+        let mut app_state = create_test_app_state();
+        app_state.screen_area = Rect::new(0, 0, 80, 70);
+        app_state.ui.selected_torrent_index = 0;
+        app_state.ui.selected_header = SelectedHeader::Torrent(ColumnId::DownSpeed);
+        let selected = app_state.torrent_list_order[0].clone();
+        if let Some(torrent) = app_state.torrents.get_mut(&selected) {
+            torrent.smoothed_download_speed_bps = 32;
+            torrent.smoothed_upload_speed_bps = 16;
+        }
+
+        handle_navigation_with_layout_mode(
+            &mut app_state,
+            KeyCode::Right,
+            UiLayoutMode::Horizontal,
+        );
+
+        assert_eq!(
+            app_state.ui.selected_header,
+            SelectedHeader::Peer(PeerColumnId::Address),
+            "forced horizontal layout should normalize the hidden torrent speed column before moving right"
+        );
     }
 
     #[test]
@@ -9821,6 +9916,47 @@ mod tests {
 
         assert!(matches!(app.app_state.mode, AppMode::Journal));
         assert_eq!(app.app_state.ui.journal.selected_index, 0);
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn pasted_magnet_on_shared_follower_queues_leader_request_without_browser() {
+        let temp_dir = tempdir().expect("create tempdir");
+        let download_folder = temp_dir.path().join("downloads");
+        let magnet_link = "magnet:?xt=urn:btih:5555555555555555555555555555555555555555";
+        let settings = crate::config::Settings {
+            client_port: 0,
+            default_download_folder: Some(download_folder.clone()),
+            always_show_add_location_prompt: true,
+            ..crate::config::Settings::default()
+        };
+        let mut app = App::new(settings, crate::app::AppRuntimeMode::SharedFollower)
+            .await
+            .expect("build app");
+        while app.app_command_rx.try_recv().is_ok() {}
+
+        handle_pasted_text(&mut app, magnet_link).await;
+
+        let command = tokio::time::timeout(Duration::from_secs(1), app.app_command_rx.recv())
+            .await
+            .expect("queued pasted magnet request")
+            .expect("app command channel open");
+        let AppCommand::SubmitControlRequest(ControlRequest::AddMagnet {
+            magnet_link: queued_link,
+            download_path,
+            container_name,
+            ..
+        }) = command
+        else {
+            panic!("expected add magnet control request");
+        };
+        assert_eq!(queued_link, magnet_link);
+        assert_eq!(download_path, Some(download_folder));
+        assert!(container_name.is_none());
+        assert!(!matches!(app.app_state.mode, AppMode::FileBrowser));
+        assert!(app.app_state.torrents.is_empty());
+        assert!(app.torrent_manager_command_txs.is_empty());
+
         let _ = app.shutdown_tx.send(());
     }
 }
