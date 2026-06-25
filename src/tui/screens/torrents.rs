@@ -35,6 +35,10 @@ pub enum TorrentManagementAction {
     ToNormal,
     MoveUp,
     MoveDown,
+    MovePageUp,
+    MovePageDown,
+    MoveFirst,
+    MoveLast,
     MoveColumnLeft,
     MoveColumnRight,
     SortBySelectedColumn,
@@ -200,6 +204,10 @@ fn map_key_to_management_action(
         KeyCode::Esc | KeyCode::Char('q') => Some(TorrentManagementAction::ToNormal),
         KeyCode::Up | KeyCode::Char('k') => Some(TorrentManagementAction::MoveUp),
         KeyCode::Down | KeyCode::Char('j') => Some(TorrentManagementAction::MoveDown),
+        KeyCode::PageUp => Some(TorrentManagementAction::MovePageUp),
+        KeyCode::PageDown => Some(TorrentManagementAction::MovePageDown),
+        KeyCode::Home => Some(TorrentManagementAction::MoveFirst),
+        KeyCode::End => Some(TorrentManagementAction::MoveLast),
         KeyCode::Left | KeyCode::Char('h') => Some(TorrentManagementAction::MoveColumnLeft),
         KeyCode::Right | KeyCode::Char('l') => Some(TorrentManagementAction::MoveColumnRight),
         KeyCode::Char('s') => Some(TorrentManagementAction::SortBySelectedColumn),
@@ -254,6 +262,35 @@ pub fn reduce_torrent_management_action(
             if row_count > 0 {
                 app_state.ui.torrent_management.selected_index =
                     (app_state.ui.torrent_management.selected_index + 1).min(row_count - 1);
+            }
+        }
+        TorrentManagementAction::MovePageUp => {
+            let page = management_page_rows(app_state);
+            app_state.ui.torrent_management.selected_index = app_state
+                .ui
+                .torrent_management
+                .selected_index
+                .saturating_sub(page);
+        }
+        TorrentManagementAction::MovePageDown => {
+            let row_count = build_management_rows(app_state).len();
+            if row_count > 0 {
+                let page = management_page_rows(app_state);
+                app_state.ui.torrent_management.selected_index = app_state
+                    .ui
+                    .torrent_management
+                    .selected_index
+                    .saturating_add(page)
+                    .min(row_count - 1);
+            }
+        }
+        TorrentManagementAction::MoveFirst => {
+            app_state.ui.torrent_management.selected_index = 0;
+        }
+        TorrentManagementAction::MoveLast => {
+            let row_count = build_management_rows(app_state).len();
+            if row_count > 0 {
+                app_state.ui.torrent_management.selected_index = row_count - 1;
             }
         }
         TorrentManagementAction::MoveColumnLeft => {
@@ -536,6 +573,21 @@ fn management_content_area(area: Rect) -> Rect {
         area.width.saturating_sub(2),
         area.height.saturating_sub(2),
     )
+}
+
+fn management_page_rows(app_state: &AppState) -> usize {
+    let content_area = management_content_area(app_state.screen_area);
+    let search_height = if management_search_panel_active(app_state) {
+        3
+    } else {
+        0
+    };
+    content_area
+        .height
+        .saturating_sub(search_height)
+        .saturating_sub(1) // footer
+        .saturating_sub(3) // table borders + header
+        .max(1) as usize
 }
 
 fn management_search_panel_active(app_state: &AppState) -> bool {
@@ -1922,6 +1974,60 @@ mod tests {
             map_key_to_management_action(KeyCode::Char('s'), &app_state),
             Some(TorrentManagementAction::SortBySelectedColumn)
         );
+    }
+
+    #[test]
+    fn management_keymap_maps_page_home_end_vertical_movement() {
+        let app_state = app_state_with_torrents(vec![(hash(1), "Harbor Lights S01E01", 50, 5, 1)]);
+
+        assert_eq!(
+            map_key_to_management_action(KeyCode::PageUp, &app_state),
+            Some(TorrentManagementAction::MovePageUp)
+        );
+        assert_eq!(
+            map_key_to_management_action(KeyCode::PageDown, &app_state),
+            Some(TorrentManagementAction::MovePageDown)
+        );
+        assert_eq!(
+            map_key_to_management_action(KeyCode::Home, &app_state),
+            Some(TorrentManagementAction::MoveFirst)
+        );
+        assert_eq!(
+            map_key_to_management_action(KeyCode::End, &app_state),
+            Some(TorrentManagementAction::MoveLast)
+        );
+    }
+
+    #[test]
+    fn management_page_home_end_move_selected_row_vertically() {
+        let mut app_state = app_state_with_torrents(vec![
+            (hash(0), "Harbor Lights S01E00", 50, 5, 1),
+            (hash(1), "Harbor Lights S01E01", 50, 5, 1),
+            (hash(2), "Harbor Lights S01E02", 50, 5, 1),
+            (hash(3), "Harbor Lights S01E03", 50, 5, 1),
+            (hash(4), "Harbor Lights S01E04", 50, 5, 1),
+            (hash(5), "Harbor Lights S01E05", 50, 5, 1),
+            (hash(6), "Harbor Lights S01E06", 50, 5, 1),
+            (hash(7), "Harbor Lights S01E07", 50, 5, 1),
+            (hash(8), "Harbor Lights S01E08", 50, 5, 1),
+            (hash(9), "Harbor Lights S01E09", 50, 5, 1),
+            (hash(10), "Harbor Lights S01E10", 50, 5, 1),
+            (hash(11), "Harbor Lights S01E11", 50, 5, 1),
+        ]);
+        app_state.screen_area = Rect::new(0, 0, 200, 100);
+
+        reduce_torrent_management_action(&mut app_state, TorrentManagementAction::MovePageDown);
+        assert_eq!(app_state.ui.torrent_management.selected_index, 11);
+
+        reduce_torrent_management_action(&mut app_state, TorrentManagementAction::MovePageUp);
+        assert_eq!(app_state.ui.torrent_management.selected_index, 0);
+
+        app_state.ui.torrent_management.selected_index = 5;
+        reduce_torrent_management_action(&mut app_state, TorrentManagementAction::MoveLast);
+        assert_eq!(app_state.ui.torrent_management.selected_index, 11);
+
+        reduce_torrent_management_action(&mut app_state, TorrentManagementAction::MoveFirst);
+        assert_eq!(app_state.ui.torrent_management.selected_index, 0);
     }
 
     #[test]

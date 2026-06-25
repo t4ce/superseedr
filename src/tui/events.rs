@@ -291,6 +291,21 @@ mod tests {
         app_state
     }
 
+    fn create_test_app_state_with_torrent_count(count: usize) -> AppState {
+        let mut app_state = AppState {
+            screen_area: ratatui::layout::Rect::new(0, 0, 200, 100),
+            ..Default::default()
+        };
+        for i in 0..count {
+            let info_hash = format!("hash_{i:02}").into_bytes();
+            app_state
+                .torrents
+                .insert(info_hash.clone(), create_mock_display_state(0));
+            app_state.torrent_list_order.push(info_hash);
+        }
+        app_state
+    }
+
     // --- NAVIGATION TESTS ---
 
     async fn build_test_app() -> App {
@@ -418,6 +433,41 @@ mod tests {
 
         // Should stay at 1, as it's the last index
         assert_eq!(app_state.ui.selected_torrent_index, 1);
+    }
+
+    #[test]
+    fn test_nav_page_down_and_page_up_torrents() {
+        let mut app_state = create_test_app_state_with_torrent_count(12);
+        app_state.ui.selected_torrent_index = 0;
+        app_state.ui.selected_header = SelectedHeader::Torrent(ColumnId::Name);
+
+        normal::handle_navigation(&mut app_state, KeyCode::PageDown);
+
+        assert_eq!(app_state.ui.selected_torrent_index, 11);
+        assert_eq!(app_state.ui.selected_peer_index, 0);
+
+        normal::handle_navigation(&mut app_state, KeyCode::PageUp);
+
+        assert_eq!(app_state.ui.selected_torrent_index, 0);
+        assert_eq!(app_state.ui.selected_peer_index, 0);
+    }
+
+    #[test]
+    fn test_nav_home_and_end_torrents() {
+        let mut app_state = create_test_app_state_with_torrent_count(12);
+        app_state.ui.selected_torrent_index = 5;
+        app_state.ui.selected_peer_index = 1;
+        app_state.ui.selected_header = SelectedHeader::Torrent(ColumnId::Name);
+
+        normal::handle_navigation(&mut app_state, KeyCode::End);
+
+        assert_eq!(app_state.ui.selected_torrent_index, 11);
+        assert_eq!(app_state.ui.selected_peer_index, 0);
+
+        normal::handle_navigation(&mut app_state, KeyCode::Home);
+
+        assert_eq!(app_state.ui.selected_torrent_index, 0);
+        assert_eq!(app_state.ui.selected_peer_index, 0);
     }
 
     #[test]

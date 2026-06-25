@@ -800,6 +800,10 @@ fn map_key_to_ui_action(key: KeyEvent) -> Option<UiAction> {
         | KeyCode::Char('k')
         | KeyCode::Down
         | KeyCode::Char('j')
+        | KeyCode::PageUp
+        | KeyCode::PageDown
+        | KeyCode::Home
+        | KeyCode::End
         | KeyCode::Left
         | KeyCode::Char('h')
         | KeyCode::Char('l')
@@ -6623,6 +6627,64 @@ pub(crate) fn handle_navigation_with_layout_mode(
                 }
             }
         },
+        KeyCode::PageUp => match app_state.ui.selected_header {
+            SelectedHeader::Torrent(_) => {
+                let page = normal_torrent_page_rows(layout_plan.list.height);
+                app_state.ui.selected_torrent_index =
+                    app_state.ui.selected_torrent_index.saturating_sub(page);
+                app_state.ui.selected_peer_index = 0;
+            }
+            SelectedHeader::Peer(_) => {
+                let page = normal_torrent_page_rows(layout_plan.peers.height);
+                app_state.ui.selected_peer_index =
+                    app_state.ui.selected_peer_index.saturating_sub(page);
+            }
+        },
+        KeyCode::PageDown => match app_state.ui.selected_header {
+            SelectedHeader::Torrent(_) => {
+                if !app_state.torrent_list_order.is_empty() {
+                    let page = normal_torrent_page_rows(layout_plan.list.height);
+                    app_state.ui.selected_torrent_index = app_state
+                        .ui
+                        .selected_torrent_index
+                        .saturating_add(page)
+                        .min(app_state.torrent_list_order.len() - 1);
+                }
+                app_state.ui.selected_peer_index = 0;
+            }
+            SelectedHeader::Peer(_) => {
+                if selected_torrent_peer_count > 0 {
+                    let page = normal_torrent_page_rows(layout_plan.peers.height);
+                    app_state.ui.selected_peer_index = app_state
+                        .ui
+                        .selected_peer_index
+                        .saturating_add(page)
+                        .min(selected_torrent_peer_count - 1);
+                }
+            }
+        },
+        KeyCode::Home => match app_state.ui.selected_header {
+            SelectedHeader::Torrent(_) => {
+                app_state.ui.selected_torrent_index = 0;
+                app_state.ui.selected_peer_index = 0;
+            }
+            SelectedHeader::Peer(_) => {
+                app_state.ui.selected_peer_index = 0;
+            }
+        },
+        KeyCode::End => match app_state.ui.selected_header {
+            SelectedHeader::Torrent(_) => {
+                if !app_state.torrent_list_order.is_empty() {
+                    app_state.ui.selected_torrent_index = app_state.torrent_list_order.len() - 1;
+                }
+                app_state.ui.selected_peer_index = 0;
+            }
+            SelectedHeader::Peer(_) => {
+                if selected_torrent_peer_count > 0 {
+                    app_state.ui.selected_peer_index = selected_torrent_peer_count - 1;
+                }
+            }
+        },
         KeyCode::Left | KeyCode::Char('h') => {
             app_state.ui.selected_header = match app_state.ui.selected_header {
                 SelectedHeader::Torrent(column_id) => {
@@ -6701,6 +6763,10 @@ pub(crate) fn handle_navigation_with_layout_mode(
         }
         _ => {}
     }
+}
+
+fn normal_torrent_page_rows(area_height: u16) -> usize {
+    area_height.saturating_sub(3).max(1) as usize
 }
 
 fn handle_search_key(key_code: KeyCode, app: &mut App) -> bool {
