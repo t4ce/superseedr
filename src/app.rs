@@ -3609,15 +3609,6 @@ impl App {
             }
         };
 
-        if self.is_current_shared_follower()
-            && is_host_watch_path
-            && matches!(source, IngestSource::TorrentPathFile)
-        {
-            return AddIngressAction::Fail {
-                message: "Follower .path ingest requires a default download folder so the referenced torrent can be staged for leader processing.".to_string(),
-            };
-        }
-
         if self.is_current_shared_follower() && !is_shared_inbox_path {
             let Some(default_download_folder) = self.client_configs.default_download_folder.clone()
             else {
