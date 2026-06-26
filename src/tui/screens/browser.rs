@@ -159,6 +159,7 @@ pub fn draw(
             use_container,
             ..
         } => {
+            let edit_locked = pending_magnet_metadata_editing_locked(browser_mode);
             if !existing_priority_only {
                 footer_spans.push(Span::styled(
                     "[Tab]",
@@ -196,7 +197,7 @@ pub fn draw(
                 footer_spans.push(Span::raw(" Collapse | "));
             }
 
-            if !existing_priority_only {
+            if !existing_priority_only && !edit_locked {
                 footer_spans.push(Span::styled(
                     "[x]",
                     footer_key_style(ctx, ActionTone::Toggle),
@@ -1335,10 +1336,23 @@ fn map_download_name_edit_key_to_action(key_code: KeyCode) -> BrowserDownloadEdi
     }
 }
 
+fn pending_magnet_metadata_editing_locked(browser_mode: &FileBrowserMode) -> bool {
+    matches!(
+        browser_mode,
+        FileBrowserMode::DownloadLocSelection {
+            target: DownloadSelectionTarget::PendingAdd,
+            preview_tree,
+            container_name,
+            ..
+        } if preview_tree.is_empty() && container_name == AWAITING_MAGNET_METADATA_LABEL
+    )
+}
+
 pub fn map_download_key_to_action(
     key_code: KeyCode,
     browser_mode: &FileBrowserMode,
 ) -> Option<BrowserDownloadAction> {
+    let edit_locked = pending_magnet_metadata_editing_locked(browser_mode);
     if let FileBrowserMode::DownloadLocSelection {
         is_editing_name,
         use_container,
@@ -1346,6 +1360,15 @@ pub fn map_download_key_to_action(
         ..
     } = browser_mode
     {
+        if edit_locked {
+            if key_code == KeyCode::Tab {
+                return Some(BrowserDownloadAction::Shortcut(
+                    BrowserDownloadShortcutAction::TogglePane,
+                ));
+            }
+            return None;
+        }
+
         if *is_editing_name {
             return Some(BrowserDownloadAction::Edit(
                 map_download_name_edit_key_to_action(key_code),
@@ -1501,6 +1524,7 @@ pub fn reduce_browser_download_action(
     action: BrowserDownloadAction,
     browser_mode: &mut FileBrowserMode,
 ) -> BrowserDownloadReduceResult {
+    let edit_locked = pending_magnet_metadata_editing_locked(browser_mode);
     if let FileBrowserMode::DownloadLocSelection {
         container_name,
         use_container,
@@ -1511,6 +1535,15 @@ pub fn reduce_browser_download_action(
         ..
     } = browser_mode
     {
+        if edit_locked
+            && !matches!(
+                action,
+                BrowserDownloadAction::Shortcut(BrowserDownloadShortcutAction::TogglePane)
+            )
+        {
+            return BrowserDownloadReduceResult { consumed: false };
+        }
+
         let consumed = match action {
             BrowserDownloadAction::Edit(edit_action) => {
                 reduce_download_name_edit_action(
@@ -2177,9 +2210,7 @@ pub fn build_download_confirm_payload(
     } = browser_mode
     {
         let base_path = state.current_path.clone();
-        let is_unhydrated_pending_magnet = matches!(target, DownloadSelectionTarget::PendingAdd)
-            && preview_tree.is_empty()
-            && container_name == AWAITING_MAGNET_METADATA_LABEL;
+        let is_unhydrated_pending_magnet = pending_magnet_metadata_editing_locked(browser_mode);
         let container_name_to_use = if *use_container {
             if is_unhydrated_pending_magnet {
                 None
@@ -2690,6 +2721,123 @@ mod tests {
             action,
             Some(BrowserDownloadAction::Edit(BrowserDownloadEditAction::Noop))
         ));
+    }
+
+    #[test]
+    fn map_download_key_locks_awaiting_magnet_metadata_edits() {
+        let mode = FileBrowserMode::DownloadLocSelection {
+            target: DownloadSelectionTarget::PendingAdd,
+            torrent_files: vec![],
+            container_name: AWAITING_MAGNET_METADATA_LABEL.to_string(),
+            use_container: true,
+            is_editing_name: false,
+            focused_pane: BrowserPane::FileSystem,
+            preview_tree: vec![],
+            preview_state: TreeViewState::default(),
+            cursor_pos: AWAITING_MAGNET_METADATA_LABEL.len(),
+            original_name_backup: AWAITING_MAGNET_METADATA_LABEL.to_string(),
+        };
+
+        assert!(map_download_key_to_action(KeyCode::Char('r'), &mode).is_none());
+        assert!(map_download_key_to_action(KeyCode::Char('x'), &mode).is_none());
+        assert!(matches!(
+            map_download_key_to_action(KeyCode::Tab, &mode),
+            Some(BrowserDownloadAction::Shortcut(
+                BrowserDownloadShortcutAction::TogglePane
+            ))
+        ));
+    }
+
+    #[test]
+    fn map_download_key_locks_active_name_edit_while_awaiting_magnet_metadata() {
+        let mode = FileBrowserMode::DownloadLocSelection {
+            target: DownloadSelectionTarget::PendingAdd,
+            torrent_files: vec![],
+            container_name: AWAITING_MAGNET_METADATA_LABEL.to_string(),
+            use_container: true,
+            is_editing_name: true,
+            focused_pane: BrowserPane::TorrentPreview,
+            preview_tree: vec![],
+            preview_state: TreeViewState::default(),
+            cursor_pos: AWAITING_MAGNET_METADATA_LABEL.len(),
+            original_name_backup: AWAITING_MAGNET_METADATA_LABEL.to_string(),
+        };
+
+        assert!(map_download_key_to_action(KeyCode::Char('c'), &mode).is_none());
+        assert!(map_download_key_to_action(KeyCode::Backspace, &mode).is_none());
+    }
+
+    #[test]
+    fn map_download_key_allows_pending_magnet_edits_after_hydration() {
+        let mode = FileBrowserMode::DownloadLocSelection {
+            target: DownloadSelectionTarget::PendingAdd,
+            torrent_files: vec![],
+            container_name: "Sample Files".to_string(),
+            use_container: true,
+            is_editing_name: false,
+            focused_pane: BrowserPane::TorrentPreview,
+            preview_tree: vec![RawNode {
+                name: "item.bin".to_string(),
+                full_path: PathBuf::from("item.bin"),
+                children: vec![],
+                payload: TorrentPreviewPayload::default(),
+                is_dir: false,
+            }],
+            preview_state: TreeViewState::default(),
+            cursor_pos: 0,
+            original_name_backup: "Sample Files".to_string(),
+        };
+
+        assert!(matches!(
+            map_download_key_to_action(KeyCode::Char('r'), &mode),
+            Some(BrowserDownloadAction::Shortcut(
+                BrowserDownloadShortcutAction::StartRename
+            ))
+        ));
+        assert!(matches!(
+            map_download_key_to_action(KeyCode::Char('x'), &mode),
+            Some(BrowserDownloadAction::Shortcut(
+                BrowserDownloadShortcutAction::ToggleUseContainer
+            ))
+        ));
+    }
+
+    #[test]
+    fn reduce_browser_download_action_ignores_locked_awaiting_magnet_edits() {
+        let mut mode = FileBrowserMode::DownloadLocSelection {
+            target: DownloadSelectionTarget::PendingAdd,
+            torrent_files: vec![],
+            container_name: AWAITING_MAGNET_METADATA_LABEL.to_string(),
+            use_container: true,
+            is_editing_name: false,
+            focused_pane: BrowserPane::FileSystem,
+            preview_tree: vec![],
+            preview_state: TreeViewState::default(),
+            cursor_pos: AWAITING_MAGNET_METADATA_LABEL.len(),
+            original_name_backup: AWAITING_MAGNET_METADATA_LABEL.to_string(),
+        };
+
+        let toggle_out = reduce_browser_download_action(
+            BrowserDownloadAction::Shortcut(BrowserDownloadShortcutAction::ToggleUseContainer),
+            &mut mode,
+        );
+        assert!(!toggle_out.consumed);
+        let edit_out = reduce_browser_download_action(
+            BrowserDownloadAction::Edit(BrowserDownloadEditAction::Insert('x')),
+            &mut mode,
+        );
+        assert!(!edit_out.consumed);
+
+        let FileBrowserMode::DownloadLocSelection {
+            container_name,
+            use_container,
+            ..
+        } = mode
+        else {
+            panic!("expected DownloadLocSelection");
+        };
+        assert_eq!(container_name, AWAITING_MAGNET_METADATA_LABEL);
+        assert!(use_container);
     }
 
     #[test]
