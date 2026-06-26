@@ -500,6 +500,69 @@ pub enum FileBrowserMode {
     },
 }
 
+fn merge_file_browser_mode_for_fetch(
+    current: &FileBrowserMode,
+    incoming: FileBrowserMode,
+) -> FileBrowserMode {
+    match (current, incoming) {
+        (
+            FileBrowserMode::DownloadLocSelection {
+                target: current_target,
+                torrent_files: current_torrent_files,
+                container_name: current_container_name,
+                use_container: current_use_container,
+                is_editing_name: current_is_editing_name,
+                focused_pane: current_focused_pane,
+                preview_tree: current_preview_tree,
+                preview_state: current_preview_state,
+                cursor_pos: current_cursor_pos,
+                original_name_backup: current_original_name_backup,
+            },
+            FileBrowserMode::DownloadLocSelection {
+                target,
+                torrent_files,
+                container_name,
+                use_container,
+                is_editing_name,
+                focused_pane,
+                preview_tree,
+                preview_state,
+                cursor_pos,
+                original_name_backup,
+            },
+        ) => {
+            if current_target == &target {
+                FileBrowserMode::DownloadLocSelection {
+                    target: current_target.clone(),
+                    torrent_files: current_torrent_files.clone(),
+                    container_name: current_container_name.clone(),
+                    use_container: *current_use_container,
+                    is_editing_name: *current_is_editing_name,
+                    focused_pane: current_focused_pane.clone(),
+                    preview_tree: current_preview_tree.clone(),
+                    preview_state: current_preview_state.clone(),
+                    cursor_pos: *current_cursor_pos,
+                    original_name_backup: current_original_name_backup.clone(),
+                }
+            } else {
+                FileBrowserMode::DownloadLocSelection {
+                    target,
+                    torrent_files,
+                    container_name,
+                    use_container,
+                    is_editing_name,
+                    focused_pane,
+                    preview_tree,
+                    preview_state,
+                    cursor_pos,
+                    original_name_backup,
+                }
+            }
+        }
+        (_, incoming) => incoming,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FileMetadata {
     pub size: u64,
@@ -6251,7 +6314,10 @@ impl App {
 
         if matches!(self.app_state.mode, AppMode::FileBrowser) {
             self.app_state.ui.file_browser.state.current_path = path.clone();
-            self.app_state.ui.file_browser.browser_mode = browser_mode;
+            self.app_state.ui.file_browser.browser_mode = merge_file_browser_mode_for_fetch(
+                &self.app_state.ui.file_browser.browser_mode,
+                browser_mode,
+            );
         } else {
             let mut tree_state = crate::tui::tree::TreeViewState::new();
             tree_state.current_path = path.clone();
@@ -13635,6 +13701,85 @@ mod tests {
             app.app_state.ui.file_browser.fetch_request_id,
             initial_request_id
         );
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn file_browser_fetch_preserves_hydrated_pending_magnet_preview() {
+        let current_dir = tempfile::tempdir().expect("create current dir");
+        let next_dir = tempfile::tempdir().expect("create next dir");
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        app.app_state.mode = AppMode::FileBrowser;
+        app.app_state.ui.file_browser.browser_generation = 1;
+        app.app_state.ui.file_browser.state.current_path = current_dir.path().to_path_buf();
+        app.app_state.ui.file_browser.browser_mode = FileBrowserMode::DownloadLocSelection {
+            target: DownloadSelectionTarget::PendingAdd,
+            torrent_files: vec![],
+            container_name: "Hydrated Magnet [abcd]".to_string(),
+            use_container: true,
+            is_editing_name: false,
+            preview_tree: vec![RawNode {
+                name: "hydrated.bin".to_string(),
+                full_path: PathBuf::from("hydrated.bin"),
+                children: vec![],
+                payload: TorrentPreviewPayload {
+                    size: 10,
+                    priority: FilePriority::Normal,
+                    file_index: Some(0),
+                },
+                is_dir: false,
+            }],
+            preview_state: TreeViewState::default(),
+            focused_pane: BrowserPane::TorrentPreview,
+            cursor_pos: 0,
+            original_name_backup: "Hydrated Magnet [abcd]".to_string(),
+        };
+
+        app.handle_app_command(AppCommand::FetchFileTree {
+            browser_generation: 1,
+            path: next_dir.path().to_path_buf(),
+            browser_mode: FileBrowserMode::DownloadLocSelection {
+                target: DownloadSelectionTarget::PendingAdd,
+                torrent_files: vec![],
+                container_name: AWAITING_MAGNET_METADATA_LABEL.to_string(),
+                use_container: true,
+                is_editing_name: false,
+                preview_tree: Vec::new(),
+                preview_state: TreeViewState::default(),
+                focused_pane: BrowserPane::FileSystem,
+                cursor_pos: 0,
+                original_name_backup: AWAITING_MAGNET_METADATA_LABEL.to_string(),
+            },
+            highlight_path: None,
+        })
+        .await;
+
+        assert_eq!(
+            app.app_state.ui.file_browser.state.current_path,
+            next_dir.path()
+        );
+        let FileBrowserMode::DownloadLocSelection {
+            container_name,
+            original_name_backup,
+            preview_tree,
+            focused_pane,
+            ..
+        } = &app.app_state.ui.file_browser.browser_mode
+        else {
+            panic!("expected download selection browser");
+        };
+        assert_eq!(container_name, "Hydrated Magnet [abcd]");
+        assert_eq!(original_name_backup, "Hydrated Magnet [abcd]");
+        assert_eq!(*focused_pane, BrowserPane::TorrentPreview);
+        assert_eq!(preview_tree.len(), 1);
+        assert_eq!(preview_tree[0].name, "hydrated.bin");
+
         let _ = app.shutdown_tx.send(());
     }
 
