@@ -857,6 +857,7 @@ pub enum AppCommand {
     MarkPortOpen(SocketAddr),
     ReloadClusterState(PathBuf),
     SubmitControlRequest(ControlRequest),
+    SubmitManualAddRequest(ControlRequest),
     ControlRequest {
         path: PathBuf,
         request: ControlRequest,
@@ -3900,6 +3901,7 @@ impl App {
             }
             ResolvedAddPayload::MagnetLink { magnet_link } => {
                 self.cleanup_pending_magnet_preview_runtime();
+                self.app_state.pending_torrent_path = None;
                 self.app_state.pending_torrent_link = magnet_link.clone();
                 let (btih, btmh) = parse_hybrid_hashes(&magnet_link);
                 let pending_info_hash = btih.or(btmh);
@@ -4018,9 +4020,12 @@ impl App {
             .or_else(|| self.client_configs.default_download_folder.clone())
             .unwrap_or_else(|| self.get_initial_destination_path());
 
+        let should_abandon_pending_magnet_preview = !self.app_state.pending_torrent_link.is_empty();
         self.app_state.pending_torrent_path = None;
         self.app_state.pending_torrent_link.clear();
-        self.app_state.pending_magnet_preview_info_hash = None;
+        if should_abandon_pending_magnet_preview {
+            self.cleanup_pending_magnet_preview_runtime();
+        }
         self.app_state
             .ui
             .file_browser
@@ -5614,6 +5619,36 @@ impl App {
         self.app_state.ui.needs_redraw = true;
     }
 
+    async fn handle_submit_control_request(
+        &mut self,
+        request: ControlRequest,
+        archive_pending_manual_ingest: bool,
+    ) {
+        let should_archive_pending_manual_ingest = archive_pending_manual_ingest
+            && matches!(
+                &request,
+                ControlRequest::AddTorrentFile { .. } | ControlRequest::AddMagnet { .. }
+            );
+
+        match self
+            .dispatch_cluster_control_request(request, ControlOrigin::CliOnline)
+            .await
+        {
+            Ok(_message) => {
+                if should_archive_pending_manual_ingest {
+                    if let Some(pending) = self.app_state.pending_manual_ingest.take() {
+                        self.archive_processed_ingest(pending.source, &pending.path);
+                        self.save_state_to_disk();
+                    }
+                }
+            }
+            Err(error) => {
+                self.app_state.system_error = Some(error);
+                self.app_state.ui.needs_redraw = true;
+            }
+        }
+    }
+
     async fn handle_app_command(&mut self, command: AppCommand) {
         match command {
             AppCommand::AddTorrentFromFile(path) => {
@@ -5635,21 +5670,10 @@ impl App {
                 self.mark_peer_port_open(peer_addr);
             }
             AppCommand::SubmitControlRequest(request) => {
-                match self
-                    .dispatch_cluster_control_request(request, ControlOrigin::CliOnline)
-                    .await
-                {
-                    Ok(_message) => {
-                        if let Some(pending) = self.app_state.pending_manual_ingest.take() {
-                            self.archive_processed_ingest(pending.source, &pending.path);
-                            self.save_state_to_disk();
-                        }
-                    }
-                    Err(error) => {
-                        self.app_state.system_error = Some(error);
-                        self.app_state.ui.needs_redraw = true;
-                    }
-                }
+                self.handle_submit_control_request(request, false).await;
+            }
+            AppCommand::SubmitManualAddRequest(request) => {
+                self.handle_submit_control_request(request, true).await;
             }
             AppCommand::ControlRequest { path, request } => {
                 if self.is_current_shared_follower() && self.is_host_watch_path(&path) {
@@ -9278,8 +9302,8 @@ mod tests {
         DhtWaveTargets, DhtWaveUiState, DiskBackpressureDecision, DiskBackpressureDownloadThrottle,
         DiskBackpressureSample, DownloadSelectionTarget, FileBrowserMode, FileMetadata,
         FilePriority, IngestSource, ListenerSet, LogCooldown, PeerInfo, PeerListenerTransportMode,
-        PeerSortColumn, PersistPayload, ResolvedAddPayload, SelectedHeader, SortDirection,
-        SwarmAvailabilityFlashState, TorrentControlState, TorrentDisplayState,
+        PeerSortColumn, PendingManualIngest, PersistPayload, ResolvedAddPayload, SelectedHeader,
+        SortDirection, SwarmAvailabilityFlashState, TorrentControlState, TorrentDisplayState,
         TorrentIntegritySnapshot, TorrentMetrics, TorrentPreviewPayload, TorrentSortColumn,
         UiState, WakeLagPeerThrottle, AWAITING_MAGNET_METADATA_LABEL, BITTORRENT_PROTOCOL_STR,
         DHT_WAVE_PHASE_WRAP_PERIOD, DISK_WRITE_THROTTLE_MIN_BYTES_PER_SEC,
@@ -9306,7 +9330,7 @@ mod tests {
     };
     use crate::tui::screens::browser::{
         build_download_confirm_payload, execute_browser_dialog_effects, execute_confirm_decision,
-        reduce_browser_dialog_action, BrowserDialogAction,
+        reduce_browser_dialog_action, BrowserDialogAction, BrowserDialogEffect,
     };
     use crate::tui::tree::{RawNode, TreeViewState};
     use std::collections::{HashMap, VecDeque};
@@ -13113,6 +13137,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn magnet_add_replacing_pending_path_clears_stale_path() {
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let default_download_folder = temp_dir.path().join("downloads");
+        std::fs::create_dir_all(&default_download_folder).expect("create default download folder");
+        let settings = crate::config::Settings {
+            client_port: 0,
+            default_download_folder: Some(default_download_folder),
+            always_show_add_location_prompt: true,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        while app.app_command_rx.try_recv().is_ok() {}
+
+        app.app_state.pending_torrent_path = Some(temp_dir.path().join("stale-input.torrent"));
+        let magnet_link = "magnet:?xt=urn:btih:6666666666666666666666666666666666666666";
+        app.open_manual_browser_for_payload(
+            IngestSource::MagnetFile,
+            ResolvedAddPayload::MagnetLink {
+                magnet_link: magnet_link.to_string(),
+            },
+        )
+        .await
+        .expect("replace pending path add with magnet add");
+
+        assert!(app.app_state.pending_torrent_path.is_none());
+        assert_eq!(app.app_state.pending_torrent_link, magnet_link);
+        assert_eq!(
+            app.app_state.pending_magnet_preview_info_hash,
+            Some(vec![0x66; 20])
+        );
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
     async fn pending_magnet_escape_shuts_down_and_removes_all_preview_runtime_state() {
         let temp_dir = tempfile::tempdir().expect("create tempdir");
         let settings = crate::config::Settings {
@@ -13422,16 +13483,16 @@ mod tests {
         let command = time::timeout(Duration::from_secs(1), async {
             loop {
                 if let Some(command) = app.app_command_rx.recv().await {
-                    if matches!(command, AppCommand::SubmitControlRequest(_)) {
+                    if matches!(command, AppCommand::SubmitManualAddRequest(_)) {
                         break command;
                     }
                 }
             }
         })
         .await
-        .expect("queued submit control request");
+        .expect("queued manual add request");
 
-        let AppCommand::SubmitControlRequest(ControlRequest::AddMagnet {
+        let AppCommand::SubmitManualAddRequest(ControlRequest::AddMagnet {
             magnet_link: queued_link,
             download_path,
             container_name,
@@ -13512,6 +13573,105 @@ mod tests {
         assert_eq!(
             persisted.file_priorities,
             HashMap::from([(0, FilePriority::Skip)])
+        );
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn unrelated_submit_control_request_does_not_archive_pending_manual_ingest() {
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let source_path = temp_dir.path().join("manual-input.magnet");
+        std::fs::write(
+            &source_path,
+            "magnet:?xt=urn:btih:5555555555555555555555555555555555555555",
+        )
+        .expect("write manual magnet");
+        let archived_path = source_path.with_extension("magnet.added");
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        while app.app_command_rx.try_recv().is_ok() {}
+        app.app_state.pending_manual_ingest = Some(PendingManualIngest {
+            source: IngestSource::MagnetFile,
+            path: source_path.clone(),
+        });
+
+        app.handle_app_command(AppCommand::SubmitControlRequest(ControlRequest::StatusNow))
+            .await;
+
+        let pending = app
+            .app_state
+            .pending_manual_ingest
+            .as_ref()
+            .expect("unrelated request should not consume pending manual ingest");
+        assert_eq!(pending.path, source_path);
+        assert!(source_path.exists());
+        assert!(!archived_path.exists());
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn existing_torrent_browser_preserves_confirmed_pending_magnet_preview_marker() {
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let settings = crate::config::Settings {
+            client_port: 0,
+            default_download_folder: Some(temp_dir.path().join("downloads")),
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        while app.app_command_rx.try_recv().is_ok() {}
+
+        let pending_info_hash = vec![0x55; 20];
+        let existing_info_hash = vec![0x66; 20];
+        app.app_state.pending_magnet_preview_info_hash = Some(pending_info_hash.clone());
+        app.app_state.torrents.insert(
+            existing_info_hash.clone(),
+            TorrentDisplayState {
+                latest_state: TorrentMetrics {
+                    info_hash: existing_info_hash.clone(),
+                    torrent_name: "existing-sample".to_string(),
+                    ..Default::default()
+                },
+                file_preview_tree: vec![RawNode {
+                    name: "existing.bin".to_string(),
+                    full_path: PathBuf::from("existing.bin"),
+                    children: vec![],
+                    payload: TorrentPreviewPayload {
+                        size: 10,
+                        priority: FilePriority::Normal,
+                        file_index: Some(0),
+                    },
+                    is_dir: false,
+                }],
+                ..Default::default()
+            },
+        );
+        app.app_state
+            .torrent_list_order
+            .push(existing_info_hash.clone());
+
+        app.open_existing_torrent_file_browser(existing_info_hash);
+        assert_eq!(
+            app.app_state.pending_magnet_preview_info_hash,
+            Some(pending_info_hash.clone())
+        );
+
+        execute_browser_dialog_effects(
+            &mut app,
+            vec![BrowserDialogEffect::ToNormalAndClearPending],
+        )
+        .await;
+        assert_eq!(
+            app.app_state.pending_magnet_preview_info_hash,
+            Some(pending_info_hash)
         );
 
         let _ = app.shutdown_tx.send(());

@@ -1940,9 +1940,13 @@ pub async fn execute_browser_dialog_effects(app: &mut App, effects: Vec<BrowserD
             }
             BrowserDialogEffect::ToNormalAndClearPending => {
                 apply_browser_close_transition(app);
+                let should_clear_pending_magnet_preview =
+                    !app.app_state.pending_torrent_link.is_empty();
                 app.app_state.pending_torrent_path = None;
                 app.app_state.pending_torrent_link.clear();
-                app.app_state.pending_magnet_preview_info_hash = None;
+                if should_clear_pending_magnet_preview {
+                    app.app_state.pending_magnet_preview_info_hash = None;
+                }
                 app.app_state.pending_manual_ingest = None;
             }
             BrowserDialogEffect::ClearSearch => {
@@ -2129,7 +2133,7 @@ pub async fn execute_confirm_decision(
                             spawn_app_command_sender(
                                 app.app_command_tx.clone(),
                                 app.shutdown_tx.subscribe(),
-                                AppCommand::SubmitControlRequest(request),
+                                AppCommand::SubmitManualAddRequest(request),
                             );
                         }
                         Err(error) => {
@@ -2146,7 +2150,7 @@ pub async fn execute_confirm_decision(
                     spawn_app_command_sender(
                         app.app_command_tx.clone(),
                         app.shutdown_tx.subscribe(),
-                        AppCommand::SubmitControlRequest(request),
+                        AppCommand::SubmitManualAddRequest(request),
                     );
                     app.app_state.pending_torrent_link.clear();
                 } else {
