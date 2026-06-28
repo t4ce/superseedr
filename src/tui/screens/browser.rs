@@ -4,11 +4,10 @@
 use crate::app::{
     refresh_torrent_preview_directory_priorities, App, AppCommand, AppMode, BrowserPane,
     BrowserSearchState, ConfigItem, ConfigUiState, DownloadSelectionTarget, FileBrowserMode,
-    FileMetadata, FilePriority, SearchMode, TorrentDisplayState, TorrentPreviewPayload,
+    FileMetadata, FilePriority, SearchMode, TorrentPreviewPayload, AWAITING_MAGNET_METADATA_LABEL,
 };
 use crate::integrations::control::{ControlFilePriorityOverride, ControlRequest};
 use crate::theme::ThemeContext;
-use crate::torrent_manager::ManagerCommand;
 use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::app_command::spawn_app_command_sender;
 use crate::tui::formatters::{centered_rect, format_bytes, sanitize_text, truncate_with_ellipsis};
@@ -27,10 +26,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
-use tokio::sync::{
-    broadcast,
-    mpsc::{self, Sender},
-};
+use tokio::sync::{broadcast, mpsc};
 
 const ASCII_TREE_DIR_ICON: &str = "> ";
 const ASCII_TREE_FILE_ICON: &str = "  ";
@@ -163,6 +159,7 @@ pub fn draw(
             use_container,
             ..
         } => {
+            let edit_locked = pending_magnet_metadata_editing_locked(browser_mode);
             if !existing_priority_only {
                 footer_spans.push(Span::styled(
                     "[Tab]",
@@ -200,7 +197,7 @@ pub fn draw(
                 footer_spans.push(Span::raw(" Collapse | "));
             }
 
-            if !existing_priority_only {
+            if !existing_priority_only && !edit_locked {
                 footer_spans.push(Span::styled(
                     "[x]",
                     footer_key_style(ctx, ActionTone::Toggle),
@@ -1123,7 +1120,7 @@ pub enum BrowserDialogAction {
 pub enum BrowserDialogEffect {
     ExecuteConfirmDecision(ConfirmDecision),
     ToConfig(ConfigUiState),
-    CleanupPendingLink { async_delete: bool },
+    CleanupPendingLink,
     ToNormalAndClearPending,
     ClearSearch,
 }
@@ -1339,10 +1336,23 @@ fn map_download_name_edit_key_to_action(key_code: KeyCode) -> BrowserDownloadEdi
     }
 }
 
+fn pending_magnet_metadata_editing_locked(browser_mode: &FileBrowserMode) -> bool {
+    matches!(
+        browser_mode,
+        FileBrowserMode::DownloadLocSelection {
+            target: DownloadSelectionTarget::PendingAdd,
+            preview_tree,
+            container_name,
+            ..
+        } if preview_tree.is_empty() && container_name == AWAITING_MAGNET_METADATA_LABEL
+    )
+}
+
 pub fn map_download_key_to_action(
     key_code: KeyCode,
     browser_mode: &FileBrowserMode,
 ) -> Option<BrowserDownloadAction> {
+    let edit_locked = pending_magnet_metadata_editing_locked(browser_mode);
     if let FileBrowserMode::DownloadLocSelection {
         is_editing_name,
         use_container,
@@ -1350,6 +1360,15 @@ pub fn map_download_key_to_action(
         ..
     } = browser_mode
     {
+        if edit_locked {
+            if key_code == KeyCode::Tab {
+                return Some(BrowserDownloadAction::Shortcut(
+                    BrowserDownloadShortcutAction::TogglePane,
+                ));
+            }
+            return None;
+        }
+
         if *is_editing_name {
             return Some(BrowserDownloadAction::Edit(
                 map_download_name_edit_key_to_action(key_code),
@@ -1505,6 +1524,7 @@ pub fn reduce_browser_download_action(
     action: BrowserDownloadAction,
     browser_mode: &mut FileBrowserMode,
 ) -> BrowserDownloadReduceResult {
+    let edit_locked = pending_magnet_metadata_editing_locked(browser_mode);
     if let FileBrowserMode::DownloadLocSelection {
         container_name,
         use_container,
@@ -1515,6 +1535,15 @@ pub fn reduce_browser_download_action(
         ..
     } = browser_mode
     {
+        if edit_locked
+            && !matches!(
+                action,
+                BrowserDownloadAction::Shortcut(BrowserDownloadShortcutAction::TogglePane)
+            )
+        {
+            return BrowserDownloadReduceResult { consumed: false };
+        }
+
         let consumed = match action {
             BrowserDownloadAction::Edit(edit_action) => {
                 reduce_download_name_edit_action(
@@ -1828,6 +1857,7 @@ pub fn handle_filesystem_navigation(
                             browser_generation: ctx.browser_generation,
                             path,
                             browser_mode,
+                            preserve_browser_mode: true,
                             highlight_path,
                         },
                     );
@@ -1871,11 +1901,7 @@ pub fn reduce_browser_dialog_action(
             if matches!(browser_mode, FileBrowserMode::DownloadLocSelection { .. })
                 && has_pending_torrent_link
             {
-                result
-                    .effects
-                    .push(BrowserDialogEffect::CleanupPendingLink {
-                        async_delete: false,
-                    });
+                result.effects.push(BrowserDialogEffect::CleanupPendingLink);
             }
 
             result.effects.push(BrowserDialogEffect::ClearSearch);
@@ -1885,9 +1911,7 @@ pub fn reduce_browser_dialog_action(
         }
         BrowserDialogAction::CancelDownloadSelection => {
             if has_pending_torrent_link {
-                result
-                    .effects
-                    .push(BrowserDialogEffect::CleanupPendingLink { async_delete: true });
+                result.effects.push(BrowserDialogEffect::CleanupPendingLink);
             }
             result.effects.push(BrowserDialogEffect::ClearSearch);
             result
@@ -1911,21 +1935,19 @@ pub async fn execute_browser_dialog_effects(app: &mut App, effects: Vec<BrowserD
                 app.app_state.ui.config = config_ui;
                 apply_browser_transition(app, BrowserTransition::ToConfig);
             }
-            BrowserDialogEffect::CleanupPendingLink { async_delete } => {
-                let shutdown_tx = app.shutdown_tx.clone();
-                cleanup_pending_link_on_escape(
-                    &app.app_state.pending_torrent_link,
-                    &mut app.torrent_manager_command_txs,
-                    &mut app.app_state.torrents,
-                    &mut app.app_state.torrent_list_order,
-                    &shutdown_tx,
-                    async_delete,
-                );
+            BrowserDialogEffect::CleanupPendingLink => {
+                app.cleanup_pending_magnet_preview_runtime();
             }
             BrowserDialogEffect::ToNormalAndClearPending => {
                 apply_browser_close_transition(app);
+                let should_clear_pending_magnet_preview =
+                    !app.app_state.pending_torrent_link.is_empty();
                 app.app_state.pending_torrent_path = None;
                 app.app_state.pending_torrent_link.clear();
+                if should_clear_pending_magnet_preview {
+                    app.app_state.pending_magnet_preview_info_hash = None;
+                }
+                app.app_state.pending_manual_ingest = None;
             }
             BrowserDialogEffect::ClearSearch => {
                 app.app_state.ui.file_browser.search_state = BrowserSearchState::Closed;
@@ -2100,25 +2122,32 @@ pub async fn execute_confirm_decision(
         }
         ConfirmDecision::Download(payload) => match payload.target {
             DownloadSelectionTarget::PendingAdd => {
-                if let Some(pending_path) = app.app_state.pending_torrent_path.take() {
+                if let Some(pending_path) = app.app_state.pending_torrent_path.clone() {
                     match app.prepare_add_torrent_file_request(
-                        pending_path,
+                        pending_path.clone(),
                         Some(payload.base_path.clone()),
                         payload.container_name_to_use.clone(),
                         payload.file_priorities.clone(),
                     ) {
                         Ok(request) => {
+                            app.app_state.pending_torrent_path = None;
+                            let pending_ingest = app.app_state.pending_manual_ingest.take();
                             spawn_app_command_sender(
                                 app.app_command_tx.clone(),
                                 app.shutdown_tx.subscribe(),
-                                AppCommand::SubmitControlRequest(request),
+                                AppCommand::SubmitManualAddRequest {
+                                    request,
+                                    pending_ingest,
+                                },
                             );
                         }
                         Err(error) => {
                             app.app_state.system_error = Some(error);
+                            return None;
                         }
                     }
                 } else if !app.app_state.pending_torrent_link.is_empty() {
+                    let pending_ingest = app.app_state.pending_manual_ingest.take();
                     let request = app.prepare_add_magnet_request(
                         app.app_state.pending_torrent_link.clone(),
                         Some(payload.base_path),
@@ -2128,7 +2157,10 @@ pub async fn execute_confirm_decision(
                     spawn_app_command_sender(
                         app.app_command_tx.clone(),
                         app.shutdown_tx.subscribe(),
-                        AppCommand::SubmitControlRequest(request),
+                        AppCommand::SubmitManualAddRequest {
+                            request,
+                            pending_ingest,
+                        },
                     );
                     app.app_state.pending_torrent_link.clear();
                 } else {
@@ -2194,8 +2226,13 @@ pub fn build_download_confirm_payload(
     } = browser_mode
     {
         let base_path = state.current_path.clone();
+        let is_unhydrated_pending_magnet = pending_magnet_metadata_editing_locked(browser_mode);
         let container_name_to_use = if *use_container {
-            Some(container_name.clone())
+            if is_unhydrated_pending_magnet {
+                None
+            } else {
+                Some(container_name.clone())
+            }
         } else {
             Some(String::new())
         };
@@ -2216,56 +2253,13 @@ pub fn build_download_confirm_payload(
     None
 }
 
+#[cfg(test)]
 pub fn pending_link_info_hash(pending_torrent_link: &str) -> Option<Vec<u8>> {
     if pending_torrent_link.is_empty() {
         return None;
     }
-    crate::app::parse_hybrid_hashes(pending_torrent_link).0
-}
-
-pub fn cleanup_pending_link_on_escape(
-    pending_torrent_link: &str,
-    torrent_manager_command_txs: &mut HashMap<Vec<u8>, Sender<ManagerCommand>>,
-    torrents: &mut HashMap<Vec<u8>, TorrentDisplayState>,
-    torrent_list_order: &mut Vec<Vec<u8>>,
-    shutdown_tx: &broadcast::Sender<()>,
-    async_delete: bool,
-) {
-    if let Some(info_hash) = pending_link_info_hash(pending_torrent_link) {
-        if async_delete {
-            if let Some(manager_tx) = torrent_manager_command_txs.get(&info_hash) {
-                spawn_manager_delete_until_shutdown(manager_tx.clone(), shutdown_tx.subscribe());
-            }
-            torrent_manager_command_txs.remove(&info_hash);
-        } else if let Some(manager_tx) = torrent_manager_command_txs.remove(&info_hash) {
-            spawn_manager_delete_until_shutdown(manager_tx, shutdown_tx.subscribe());
-        }
-
-        torrents.remove(&info_hash);
-        torrent_list_order.retain(|h| h != &info_hash);
-    }
-}
-
-fn spawn_manager_delete_until_shutdown(
-    manager_tx: Sender<ManagerCommand>,
-    mut shutdown_rx: broadcast::Receiver<()>,
-) {
-    tokio::spawn(async move {
-        tokio::select! {
-            result = manager_tx.send(ManagerCommand::DeleteFile) => {
-                if let Err(error) = result {
-                    tracing::error!("Failed to send DeleteFile to cancelled manager: {}", error);
-                }
-            }
-            shutdown = shutdown_rx.recv() => {
-                match shutdown {
-                    Ok(())
-                    | Err(broadcast::error::RecvError::Closed)
-                    | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                }
-            }
-        }
-    });
+    let (btih, btmh) = crate::app::parse_hybrid_hashes(pending_torrent_link);
+    btih.or(btmh)
 }
 
 pub fn apply_priority_cycle(
@@ -2368,7 +2362,8 @@ pub fn apply_priority_cycle_to_all(nodes: &mut [RawNode<TorrentPreviewPayload>])
 mod tests {
     use super::*;
     use crate::app::{
-        AppRuntimeMode, BrowserPane, ConfigItem, TorrentMetrics, TorrentPreviewPayload,
+        AppRuntimeMode, BrowserPane, ConfigItem, TorrentDisplayState, TorrentMetrics,
+        TorrentPreviewPayload,
     };
     use crate::config::Settings;
     use crate::tui::tree::{RawNode, TreeViewState};
@@ -2742,6 +2737,123 @@ mod tests {
             action,
             Some(BrowserDownloadAction::Edit(BrowserDownloadEditAction::Noop))
         ));
+    }
+
+    #[test]
+    fn map_download_key_locks_awaiting_magnet_metadata_edits() {
+        let mode = FileBrowserMode::DownloadLocSelection {
+            target: DownloadSelectionTarget::PendingAdd,
+            torrent_files: vec![],
+            container_name: AWAITING_MAGNET_METADATA_LABEL.to_string(),
+            use_container: true,
+            is_editing_name: false,
+            focused_pane: BrowserPane::FileSystem,
+            preview_tree: vec![],
+            preview_state: TreeViewState::default(),
+            cursor_pos: AWAITING_MAGNET_METADATA_LABEL.len(),
+            original_name_backup: AWAITING_MAGNET_METADATA_LABEL.to_string(),
+        };
+
+        assert!(map_download_key_to_action(KeyCode::Char('r'), &mode).is_none());
+        assert!(map_download_key_to_action(KeyCode::Char('x'), &mode).is_none());
+        assert!(matches!(
+            map_download_key_to_action(KeyCode::Tab, &mode),
+            Some(BrowserDownloadAction::Shortcut(
+                BrowserDownloadShortcutAction::TogglePane
+            ))
+        ));
+    }
+
+    #[test]
+    fn map_download_key_locks_active_name_edit_while_awaiting_magnet_metadata() {
+        let mode = FileBrowserMode::DownloadLocSelection {
+            target: DownloadSelectionTarget::PendingAdd,
+            torrent_files: vec![],
+            container_name: AWAITING_MAGNET_METADATA_LABEL.to_string(),
+            use_container: true,
+            is_editing_name: true,
+            focused_pane: BrowserPane::TorrentPreview,
+            preview_tree: vec![],
+            preview_state: TreeViewState::default(),
+            cursor_pos: AWAITING_MAGNET_METADATA_LABEL.len(),
+            original_name_backup: AWAITING_MAGNET_METADATA_LABEL.to_string(),
+        };
+
+        assert!(map_download_key_to_action(KeyCode::Char('c'), &mode).is_none());
+        assert!(map_download_key_to_action(KeyCode::Backspace, &mode).is_none());
+    }
+
+    #[test]
+    fn map_download_key_allows_pending_magnet_edits_after_hydration() {
+        let mode = FileBrowserMode::DownloadLocSelection {
+            target: DownloadSelectionTarget::PendingAdd,
+            torrent_files: vec![],
+            container_name: "Sample Files".to_string(),
+            use_container: true,
+            is_editing_name: false,
+            focused_pane: BrowserPane::TorrentPreview,
+            preview_tree: vec![RawNode {
+                name: "item.bin".to_string(),
+                full_path: PathBuf::from("item.bin"),
+                children: vec![],
+                payload: TorrentPreviewPayload::default(),
+                is_dir: false,
+            }],
+            preview_state: TreeViewState::default(),
+            cursor_pos: 0,
+            original_name_backup: "Sample Files".to_string(),
+        };
+
+        assert!(matches!(
+            map_download_key_to_action(KeyCode::Char('r'), &mode),
+            Some(BrowserDownloadAction::Shortcut(
+                BrowserDownloadShortcutAction::StartRename
+            ))
+        ));
+        assert!(matches!(
+            map_download_key_to_action(KeyCode::Char('x'), &mode),
+            Some(BrowserDownloadAction::Shortcut(
+                BrowserDownloadShortcutAction::ToggleUseContainer
+            ))
+        ));
+    }
+
+    #[test]
+    fn reduce_browser_download_action_ignores_locked_awaiting_magnet_edits() {
+        let mut mode = FileBrowserMode::DownloadLocSelection {
+            target: DownloadSelectionTarget::PendingAdd,
+            torrent_files: vec![],
+            container_name: AWAITING_MAGNET_METADATA_LABEL.to_string(),
+            use_container: true,
+            is_editing_name: false,
+            focused_pane: BrowserPane::FileSystem,
+            preview_tree: vec![],
+            preview_state: TreeViewState::default(),
+            cursor_pos: AWAITING_MAGNET_METADATA_LABEL.len(),
+            original_name_backup: AWAITING_MAGNET_METADATA_LABEL.to_string(),
+        };
+
+        let toggle_out = reduce_browser_download_action(
+            BrowserDownloadAction::Shortcut(BrowserDownloadShortcutAction::ToggleUseContainer),
+            &mut mode,
+        );
+        assert!(!toggle_out.consumed);
+        let edit_out = reduce_browser_download_action(
+            BrowserDownloadAction::Edit(BrowserDownloadEditAction::Insert('x')),
+            &mut mode,
+        );
+        assert!(!edit_out.consumed);
+
+        let FileBrowserMode::DownloadLocSelection {
+            container_name,
+            use_container,
+            ..
+        } = mode
+        else {
+            panic!("expected DownloadLocSelection");
+        };
+        assert_eq!(container_name, AWAITING_MAGNET_METADATA_LABEL);
+        assert!(use_container);
     }
 
     #[test]
@@ -3528,9 +3640,7 @@ mod tests {
         assert_eq!(out.effects.len(), 3);
         assert!(matches!(
             out.effects[0],
-            BrowserDialogEffect::CleanupPendingLink {
-                async_delete: false
-            }
+            BrowserDialogEffect::CleanupPendingLink
         ));
         assert!(matches!(out.effects[1], BrowserDialogEffect::ClearSearch));
         assert!(matches!(
@@ -3565,7 +3675,7 @@ mod tests {
         assert_eq!(out.effects.len(), 3);
         assert!(matches!(
             out.effects[0],
-            BrowserDialogEffect::CleanupPendingLink { async_delete: true }
+            BrowserDialogEffect::CleanupPendingLink
         ));
         assert!(matches!(out.effects[1], BrowserDialogEffect::ClearSearch));
         assert!(matches!(
@@ -3580,22 +3690,62 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_pending_link_is_noop_for_empty() {
-        let mut txs: HashMap<Vec<u8>, Sender<ManagerCommand>> = HashMap::new();
-        let mut torrents: HashMap<Vec<u8>, TorrentDisplayState> = HashMap::new();
-        let mut order = vec![];
-        let (shutdown_tx, _) = broadcast::channel(1);
-        cleanup_pending_link_on_escape(
-            "",
-            &mut txs,
-            &mut torrents,
-            &mut order,
-            &shutdown_tx,
-            false,
+    fn awaiting_magnet_metadata_confirms_without_placeholder_container_name() {
+        let mode = FileBrowserMode::DownloadLocSelection {
+            target: DownloadSelectionTarget::PendingAdd,
+            torrent_files: vec![],
+            container_name: AWAITING_MAGNET_METADATA_LABEL.to_string(),
+            use_container: true,
+            is_editing_name: false,
+            focused_pane: BrowserPane::FileSystem,
+            preview_tree: vec![],
+            preview_state: TreeViewState::default(),
+            cursor_pos: 1,
+            original_name_backup: AWAITING_MAGNET_METADATA_LABEL.to_string(),
+        };
+        let state = TreeViewState::default();
+
+        let payload = build_download_confirm_payload(&state, &mode)
+            .expect("unhydrated magnet can still be confirmed");
+
+        assert_eq!(payload.container_name_to_use, None);
+        assert!(payload.file_priorities.is_empty());
+        assert!(!payload.has_preview_files);
+    }
+
+    #[test]
+    fn awaiting_magnet_metadata_confirm_keeps_disabled_container_empty() {
+        let mode = FileBrowserMode::DownloadLocSelection {
+            target: DownloadSelectionTarget::PendingAdd,
+            torrent_files: vec![],
+            container_name: AWAITING_MAGNET_METADATA_LABEL.to_string(),
+            use_container: false,
+            is_editing_name: false,
+            focused_pane: BrowserPane::FileSystem,
+            preview_tree: vec![],
+            preview_state: TreeViewState::default(),
+            cursor_pos: 1,
+            original_name_backup: AWAITING_MAGNET_METADATA_LABEL.to_string(),
+        };
+        let state = TreeViewState::default();
+
+        let payload = build_download_confirm_payload(&state, &mode)
+            .expect("unhydrated magnet can be confirmed without a container");
+
+        assert_eq!(payload.container_name_to_use, Some(String::new()));
+    }
+
+    #[test]
+    fn pending_link_info_hash_falls_back_to_btmh_only_magnet() {
+        let pending_link = concat!(
+            "magnet:?xt=urn:btmh:1220",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
-        assert!(txs.is_empty());
-        assert!(torrents.is_empty());
-        assert!(order.is_empty());
+
+        let info_hash = pending_link_info_hash(pending_link).expect("btmh-only info hash");
+
+        assert_eq!(info_hash.len(), 20);
+        assert!(info_hash.iter().all(|byte| *byte == 0xaa));
     }
 
     #[test]

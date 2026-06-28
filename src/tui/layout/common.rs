@@ -4,7 +4,10 @@
 use crate::app::torrent_is_effectively_incomplete;
 use crate::app::AppState;
 use crate::config::{PeerSortColumn, TorrentSortColumn};
+use crate::tui::formatters::format_speed;
 use ratatui::prelude::Constraint;
+
+const SPEED_COLUMN_MIN_WIDTH: u16 = 11;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ColumnId {
@@ -44,17 +47,17 @@ pub fn get_torrent_columns() -> Vec<ColumnDefinition> {
         ColumnDefinition {
             id: ColumnId::UpSpeed,
             header: "UL",
-            min_width: 10,
+            min_width: SPEED_COLUMN_MIN_WIDTH,
             priority: 1,
-            default_constraint: Constraint::Length(10),
+            default_constraint: Constraint::Length(SPEED_COLUMN_MIN_WIDTH),
             sort_enum: Some(TorrentSortColumn::Up),
         },
         ColumnDefinition {
             id: ColumnId::DownSpeed,
             header: "DL",
-            min_width: 10,
+            min_width: SPEED_COLUMN_MIN_WIDTH,
             priority: 1,
-            default_constraint: Constraint::Length(10),
+            default_constraint: Constraint::Length(SPEED_COLUMN_MIN_WIDTH),
             sort_enum: Some(TorrentSortColumn::Down),
         },
     ]
@@ -109,6 +112,23 @@ pub fn active_torrent_column_indices(app_state: &AppState) -> Vec<usize> {
         .collect()
 }
 
+fn torrent_speed_column_width(app_state: &AppState, column_id: ColumnId) -> u16 {
+    let max_label_width = app_state
+        .torrents
+        .values()
+        .map(|torrent| match column_id {
+            ColumnId::DownSpeed => torrent.smoothed_download_speed_bps,
+            ColumnId::UpSpeed => torrent.smoothed_upload_speed_bps,
+            ColumnId::Status | ColumnId::Name => 0,
+        })
+        .map(format_speed)
+        .map(|label| label.len() as u16)
+        .max()
+        .unwrap_or(0);
+
+    max_label_width.max(SPEED_COLUMN_MIN_WIDTH)
+}
+
 pub fn compute_visible_torrent_columns(
     app_state: &AppState,
     available_width: u16,
@@ -120,10 +140,18 @@ pub fn compute_visible_torrent_columns(
         .iter()
         .map(|&idx| {
             let c = &all_cols[idx];
+            let speed_width = match c.id {
+                ColumnId::DownSpeed | ColumnId::UpSpeed => {
+                    Some(torrent_speed_column_width(app_state, c.id))
+                }
+                ColumnId::Status | ColumnId::Name => None,
+            };
             SmartCol {
-                min_width: c.min_width,
+                min_width: speed_width.unwrap_or(c.min_width),
                 priority: c.priority,
-                constraint: c.default_constraint,
+                constraint: speed_width
+                    .map(Constraint::Length)
+                    .unwrap_or(c.default_constraint),
             }
         })
         .collect();
@@ -187,7 +215,7 @@ pub fn get_peer_columns() -> Vec<PeerColumnDefinition> {
         PeerColumnDefinition {
             id: PeerColumnId::UpSpeed,
             header: "Upload",
-            min_width: 10,
+            min_width: SPEED_COLUMN_MIN_WIDTH,
             priority: 1,
             default_constraint: Constraint::Fill(1),
             sort_enum: Some(PeerSortColumn::UL),
@@ -195,7 +223,7 @@ pub fn get_peer_columns() -> Vec<PeerColumnDefinition> {
         PeerColumnDefinition {
             id: PeerColumnId::DownSpeed,
             header: "Download",
-            min_width: 10,
+            min_width: SPEED_COLUMN_MIN_WIDTH,
             priority: 1,
             default_constraint: Constraint::Fill(1),
             sort_enum: Some(PeerSortColumn::DL),
@@ -360,9 +388,10 @@ pub fn compute_smart_table_layout(
 mod tests {
     use super::{
         compute_visible_peer_columns, compute_visible_torrent_columns, get_peer_columns,
-        PeerColumnId,
+        get_torrent_columns, ColumnId, PeerColumnId,
     };
     use crate::app::{AppState, PeerInfo, TorrentDisplayState, TorrentMetrics};
+    use crate::tui::formatters::format_speed;
     use ratatui::layout::Constraint;
 
     fn peer_test_app_state() -> AppState {
@@ -403,6 +432,54 @@ mod tests {
 
         assert_eq!(address.min_width, 25);
         assert_eq!(address.default_constraint, Constraint::Fill(2));
+    }
+
+    #[test]
+    fn speed_columns_fit_three_digit_mbps_labels() {
+        assert_eq!(format_speed(999_990_000), "999.99 Mbps");
+        assert_eq!(format_speed(999_990_000).len(), 11);
+
+        let torrent_columns = get_torrent_columns();
+        for column_id in [ColumnId::UpSpeed, ColumnId::DownSpeed] {
+            let column = torrent_columns
+                .iter()
+                .find(|column| column.id == column_id)
+                .expect("torrent speed column");
+            assert_eq!(column.min_width, 11);
+            assert_eq!(column.default_constraint, Constraint::Length(11));
+        }
+
+        let peer_columns = get_peer_columns();
+        for column_id in [PeerColumnId::UpSpeed, PeerColumnId::DownSpeed] {
+            let column = peer_columns
+                .iter()
+                .find(|column| column.id == column_id)
+                .expect("peer speed column");
+            assert_eq!(column.min_width, 11);
+        }
+    }
+
+    #[test]
+    fn torrent_speed_columns_expand_to_current_rate_label() {
+        let mut app_state = peer_test_app_state();
+        let info_hash = app_state.torrent_list_order[0].clone();
+        let speed_bps = 1_000_000_000_000;
+        if let Some(torrent) = app_state.torrents.get_mut(&info_hash) {
+            torrent.smoothed_download_speed_bps = speed_bps;
+        }
+
+        let (constraints, visible) = compute_visible_torrent_columns(&app_state, 120);
+        let all_columns = get_torrent_columns();
+        let dl_pos = visible
+            .iter()
+            .position(|&idx| all_columns[idx].id == ColumnId::DownSpeed)
+            .expect("download column should be visible");
+
+        assert_eq!(format_speed(speed_bps), "1000.00 Gbps");
+        assert_eq!(
+            constraints[dl_pos],
+            Constraint::Length(format_speed(speed_bps).len() as u16)
+        );
     }
 
     #[test]

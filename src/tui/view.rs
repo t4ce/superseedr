@@ -111,7 +111,12 @@ pub fn draw(
     }
 
     apply_theme_particles_background_to_frame(f, &ctx);
-    let layout_ctx = LayoutContext::new(area, app_state, DEFAULT_SIDEBAR_PERCENT);
+    let layout_ctx = LayoutContext::new(
+        area,
+        app_state,
+        settings.ui_layout_mode,
+        DEFAULT_SIDEBAR_PERCENT,
+    );
     let plan = calculate_layout(area, &layout_ctx);
 
     normal::draw(f, &screen, &plan);
@@ -198,9 +203,18 @@ mod tests {
     /// Helper to create a LayoutContext manually since we don't want to mock AppState.
     /// Accessing the struct fields directly allows us to bypass `LayoutContext::new`.
     fn create_ctx(width: u16, height: u16) -> LayoutContext {
+        create_ctx_with_mode(width, height, crate::config::UiLayoutMode::Auto)
+    }
+
+    fn create_ctx_with_mode(
+        width: u16,
+        height: u16,
+        layout_mode: crate::config::UiLayoutMode,
+    ) -> LayoutContext {
         LayoutContext {
             width,
             height,
+            layout_mode,
             settings_sidebar_percent: DEFAULT_SIDEBAR_PERCENT,
         }
     }
@@ -320,6 +334,44 @@ mod tests {
         assert!(
             plan.block_stream.is_none(),
             "Standard width < 135 should hide block stream"
+        );
+    }
+
+    #[test]
+    fn test_layout_mode_forces_vertical_on_wide_area() {
+        let width = 120;
+        let height = 40;
+        let area = Rect::new(0, 0, width, height);
+        let ctx = create_ctx_with_mode(width, height, crate::config::UiLayoutMode::Vertical);
+
+        let plan = calculate_layout(area, &ctx);
+
+        assert!(
+            plan.chart.is_some(),
+            "forced vertical layout should show chart"
+        );
+        assert!(
+            plan.block_stream.is_some(),
+            "forced vertical layout should keep the vertical information band"
+        );
+    }
+
+    #[test]
+    fn test_layout_mode_forces_horizontal_on_tall_area() {
+        let width = 100;
+        let height = 80;
+        let area = Rect::new(0, 0, width, height);
+        let ctx = create_ctx_with_mode(width, height, crate::config::UiLayoutMode::Horizontal);
+
+        let plan = calculate_layout(area, &ctx);
+
+        assert!(
+            plan.peer_stream.is_some(),
+            "forced horizontal layout should use the wide header stream"
+        );
+        assert!(
+            plan.block_stream.is_none(),
+            "width <= 135 in horizontal layout hides block stream"
         );
     }
 

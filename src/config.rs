@@ -173,6 +173,46 @@ pub struct FeedSyncError {
     pub occurred_at_iso: String,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, EnumIter)]
+#[serde(rename_all = "lowercase")]
+pub enum UiLayoutMode {
+    #[default]
+    Auto,
+    #[serde(alias = "veritical")]
+    Vertical,
+    Square,
+    Horizontal,
+}
+
+impl UiLayoutMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Vertical => "vertical",
+            Self::Square => "square",
+            Self::Horizontal => "horizontal",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Auto => Self::Vertical,
+            Self::Vertical => Self::Square,
+            Self::Square => Self::Horizontal,
+            Self::Horizontal => Self::Auto,
+        }
+    }
+
+    pub fn previous(self) -> Self {
+        match self {
+            Self::Auto => Self::Horizontal,
+            Self::Vertical => Self::Auto,
+            Self::Square => Self::Vertical,
+            Self::Horizontal => Self::Square,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
 pub struct Settings {
@@ -189,6 +229,8 @@ pub struct Settings {
     pub peer_sort_direction: SortDirection,
     pub peer_sort_pinned: bool,
     pub ui_theme: ThemeName,
+    #[serde(alias = "layout")]
+    pub ui_layout_mode: UiLayoutMode,
     pub ui_refresh_rate: DataRate,
     pub watch_folder: Option<PathBuf>,
     pub default_download_folder: Option<PathBuf>,
@@ -228,6 +270,7 @@ impl Default for Settings {
             peer_sort_direction: PeerSortColumn::default().default_direction(),
             peer_sort_pinned: false,
             ui_theme: ThemeName::default(),
+            ui_layout_mode: UiLayoutMode::default(),
             ui_refresh_rate: DataRate::default(),
             always_show_add_location_prompt: false,
             max_connected_peers: 2000,
@@ -406,6 +449,8 @@ struct SharedSettingsConfig {
     pub peer_sort_direction: SortDirection,
     pub peer_sort_pinned: bool,
     pub ui_theme: ThemeName,
+    #[serde(alias = "layout")]
+    pub ui_layout_mode: UiLayoutMode,
     pub ui_refresh_rate: DataRate,
     pub default_download_folder: Option<PathBuf>,
     pub max_connected_peers: usize,
@@ -438,6 +483,7 @@ impl Default for SharedSettingsConfig {
             peer_sort_direction: settings.peer_sort_direction,
             peer_sort_pinned: settings.peer_sort_pinned,
             ui_theme: settings.ui_theme,
+            ui_layout_mode: settings.ui_layout_mode,
             ui_refresh_rate: settings.ui_refresh_rate,
             default_download_folder: None,
             max_connected_peers: settings.max_connected_peers,
@@ -864,6 +910,7 @@ impl SharedSettingsConfig {
             peer_sort_direction: settings.peer_sort_direction,
             peer_sort_pinned: settings.peer_sort_pinned,
             ui_theme: settings.ui_theme,
+            ui_layout_mode: settings.ui_layout_mode,
             ui_refresh_rate: settings.ui_refresh_rate,
             default_download_folder: settings
                 .default_download_folder
@@ -902,6 +949,7 @@ impl SharedSettingsConfig {
         settings.peer_sort_direction = self.peer_sort_direction;
         settings.peer_sort_pinned = self.peer_sort_pinned;
         settings.ui_theme = self.ui_theme;
+        settings.ui_layout_mode = self.ui_layout_mode;
         settings.ui_refresh_rate = self.ui_refresh_rate;
         settings.default_download_folder = self
             .default_download_folder
@@ -3126,6 +3174,7 @@ mod tests {
             torrent_sort_direction = "Descending"
             peer_sort_column = "Address"
             peer_sort_direction = "Ascending"
+            ui_layout_mode = "horizontal"
             ui_refresh_rate = "Rate20s"
 
             watch_folder = "/path/to/watch"
@@ -3174,6 +3223,7 @@ mod tests {
         assert_eq!(settings.torrent_sort_column, TorrentSortColumn::Name);
         assert_eq!(settings.torrent_sort_direction, SortDirection::Descending);
         assert_eq!(settings.peer_sort_column, PeerSortColumn::Address);
+        assert_eq!(settings.ui_layout_mode, UiLayoutMode::Horizontal);
         assert_eq!(settings.ui_refresh_rate, DataRate::Rate20s);
         assert_eq!(settings.watch_folder, Some(PathBuf::from("/path/to/watch")));
         assert_eq!(settings.resource_limit_override, Some(1024));
@@ -3251,11 +3301,20 @@ mod tests {
         assert_eq!(settings.global_upload_limit_bps, UNLIMITED_RATE_LIMIT_BPS);
         assert_eq!(settings.torrent_sort_column, TorrentSortColumn::Up);
         assert_eq!(settings.peer_sort_direction, SortDirection::Descending);
+        assert_eq!(settings.ui_layout_mode, UiLayoutMode::Auto);
         assert_eq!(settings.ui_refresh_rate, DataRate::Rate1s);
         assert!(settings.watch_folder.is_none());
         assert_eq!(settings.max_connected_peers, 2000);
         assert_eq!(settings.bootstrap_nodes, default_settings.bootstrap_nodes);
         assert!(settings.torrents.is_empty());
+    }
+
+    #[test]
+    fn test_layout_setting_accepts_layout_alias_and_veritical_typo() {
+        let settings: Settings = deserialize_versioned_toml(r#"layout = "veritical""#)
+            .expect("layout alias should parse");
+
+        assert_eq!(settings.ui_layout_mode, UiLayoutMode::Vertical);
     }
 
     #[test]

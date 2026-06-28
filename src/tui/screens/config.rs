@@ -144,6 +144,9 @@ pub fn reduce_config_action(
                     settings_edit.always_show_add_location_prompt =
                         !settings_edit.always_show_add_location_prompt;
                 }
+                ConfigItem::UiLayoutMode => {
+                    settings_edit.ui_layout_mode = settings_edit.ui_layout_mode.next();
+                }
                 ConfigItem::DefaultDownloadFolder | ConfigItem::WatchFolder => {
                     if shared_path_is_manual(selected_item) {
                         return result;
@@ -169,6 +172,7 @@ pub fn reduce_config_action(
                                 selected_index: *selected_index,
                                 items: items.to_vec(),
                             },
+                            preserve_browser_mode: false,
                             highlight_path: None,
                         },
                     )));
@@ -219,6 +223,9 @@ pub fn reduce_config_action(
                     settings_edit.always_show_add_location_prompt =
                         default_settings.always_show_add_location_prompt;
                 }
+                ConfigItem::UiLayoutMode => {
+                    settings_edit.ui_layout_mode = default_settings.ui_layout_mode;
+                }
                 ConfigItem::GlobalDownloadLimit => {
                     settings_edit.global_download_limit_bps =
                         default_settings.global_download_limit_bps;
@@ -243,6 +250,9 @@ pub fn reduce_config_action(
                     settings_edit.global_upload_limit_bps = new_rate;
                     result.effects.push(ConfigEffect::SetUploadRate(new_rate));
                 }
+                ConfigItem::UiLayoutMode => {
+                    settings_edit.ui_layout_mode = settings_edit.ui_layout_mode.next();
+                }
                 _ => {}
             }
         }
@@ -259,6 +269,9 @@ pub fn reduce_config_action(
                     let new_rate = decrease_rate_limit_bps(settings_edit.global_upload_limit_bps);
                     settings_edit.global_upload_limit_bps = new_rate;
                     result.effects.push(ConfigEffect::SetUploadRate(new_rate));
+                }
+                ConfigItem::UiLayoutMode => {
+                    settings_edit.ui_layout_mode = settings_edit.ui_layout_mode.previous();
                 }
                 _ => {}
             }
@@ -375,6 +388,7 @@ pub fn draw(
                     "[ ] false".to_string()
                 },
             ),
+            ConfigItem::UiLayoutMode => ("Layout", settings.ui_layout_mode.label().to_string()),
             ConfigItem::GlobalDownloadLimit => (
                 "Global DL Limit",
                 format_limit_bps(settings.global_download_limit_bps),
@@ -453,6 +467,17 @@ pub fn draw(
             Span::raw(" false, "),
             Span::styled("[Enter]|[Space]", footer_key_style(ctx, ActionTone::Toggle)),
             Span::raw(" toggle. "),
+            Span::styled("[Esc]|[Q]", footer_key_style(ctx, ActionTone::Confirm)),
+            Span::raw(" to Save & Exit."),
+        ])
+    } else if items.get(selected_index) == Some(&ConfigItem::UiLayoutMode) {
+        Line::from(vec![
+            Span::styled("←/→/h/l", footer_key_style(ctx, ActionTone::Toggle)),
+            Span::raw(" cycle layout. "),
+            Span::styled("[Enter]", footer_key_style(ctx, ActionTone::Toggle)),
+            Span::raw(" next. "),
+            Span::styled("[r]", footer_key_style(ctx, ActionTone::Clear)),
+            Span::raw("eset to auto. "),
             Span::styled("[Esc]|[Q]", footer_key_style(ctx, ActionTone::Confirm)),
             Span::raw(" to Save & Exit."),
         ])

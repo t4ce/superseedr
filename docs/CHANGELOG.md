@@ -1,5 +1,21 @@
 # Changelog
 
+## Release v1.0.11
+### New Features
+- **Configurable TUI Layout Modes**: Added a `ui_layout_mode` setting, with `layout` accepted as an alias, so the main TUI can stay in automatic mode or be forced into vertical or horizontal layouts.
+- **Always-Show Add Location Prompt**: Added `always_show_add_location_prompt` so magnet and torrent adds can consistently open the location browser instead of silently using a default path, while preserving shared-mode fast paths where they are still required.
+- **Torrent List Page Navigation**: Added page-up/page-down style movement for torrent and peer lists so longer sessions are easier to scan from the keyboard.
+
+### Improvements
+- **Responsive Torrent Table Columns**: Sized torrent-list speed columns dynamically so longer units such as Mbps remain visible instead of being clipped in tighter layouts.
+- **Add Browser State Handling**: Improved manual add and pending magnet browser flows so prompt state survives metadata hydration, stale preview state is replaced cleanly, and pending entries are not editable while their real metadata is still loading.
+- **Shared Add Flow Consistency**: Routed shared follower manual magnets through the leader, kept follower-local prompt state from leaking into shared adds, and preserved queued follower paths when the leader applies the request.
+
+### Bug Fixes
+- **Pending Magnet Preview Finalization**: Fixed direct magnet and torrent-file duplicates for the same info hash so they apply to an open pending preview, clear the pending-preview marker, and persist as real torrents instead of being removed by a later cancel.
+- **Deferred Ingest Archive Correctness**: Keyed deferred shared-inbox archives to the submitted manual add, cleared stale deferred records when prompts are replaced or fail, and retired ingest journal entries after successful deferred archive.
+- **Fictional Test Fixtures**: Updated torrent fixture names used by tests to avoid real media titles while keeping the coverage shape intact.
+
 ## Release v1.0.10
 ### New Features
 - **Torrent Management Workspace**: Added a dedicated torrent-management screen for reviewing active torrents, searching/filtering the list, staging batch pause/resume/delete actions, and confirming changes before they are applied.

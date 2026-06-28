@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::app::AppState;
+use crate::config::UiLayoutMode;
 use ratatui::prelude::{Constraint, Layout, Rect};
 
 pub const MIN_SIDEBAR_WIDTH: u16 = 25;
@@ -24,14 +25,21 @@ pub struct LayoutPlan {
 pub struct LayoutContext {
     pub width: u16,
     pub height: u16,
+    pub layout_mode: UiLayoutMode,
     pub settings_sidebar_percent: u16,
 }
 
 impl LayoutContext {
-    pub fn new(area: Rect, _app_state: &AppState, sidebar_pct: u16) -> Self {
+    pub fn new(
+        area: Rect,
+        _app_state: &AppState,
+        layout_mode: UiLayoutMode,
+        sidebar_pct: u16,
+    ) -> Self {
         Self {
             width: area.width,
             height: area.height,
+            layout_mode,
             settings_sidebar_percent: sidebar_pct,
         }
     }
@@ -48,9 +56,16 @@ pub fn calculate_layout(area: Rect, ctx: &LayoutContext) -> LayoutPlan {
         return plan;
     }
 
-    let is_narrow = ctx.width < 100;
-    let is_vertical_aspect = ctx.height as f32 > (ctx.width as f32 * 0.6);
     let is_short = ctx.height < 30;
+    let use_vertical_layout = match ctx.layout_mode {
+        UiLayoutMode::Auto => {
+            let is_narrow = ctx.width < 100;
+            let is_vertical_aspect = ctx.height as f32 > (ctx.width as f32 * 0.6);
+            is_narrow || is_vertical_aspect
+        }
+        UiLayoutMode::Vertical | UiLayoutMode::Square => true,
+        UiLayoutMode::Horizontal => false,
+    };
 
     if is_short {
         let main = Layout::vertical([
@@ -72,7 +87,7 @@ pub fn calculate_layout(area: Rect, ctx: &LayoutContext) -> LayoutPlan {
         plan.peers = detail_chunks[1];
 
         plan.footer = main[2];
-    } else if is_narrow || is_vertical_aspect {
+    } else if use_vertical_layout {
         let (chart_height, info_height) = if ctx.height < 50 {
             (10, MIN_DETAILS_HEIGHT)
         } else {
