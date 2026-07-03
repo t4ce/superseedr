@@ -872,7 +872,7 @@ impl TorrentState {
                 }
                 let mut available_slots = max_depth - current_inflight;
                 let is_endgame = self.torrent_status == TorrentStatus::Endgame;
-                let mut rng = rand::rng();
+                let mut rng = rand::thread_rng();
 
                 let mut pending_pieces: Vec<u32> = peer.pending_requests.iter().cloned().collect();
                 pending_pieces.sort();
@@ -8979,7 +8979,7 @@ mod prop_tests {
     const MAX_BLOCK: u32 = 131_072;
 
     use rand::rngs::StdRng;
-    use rand::{RngExt, SeedableRng};
+    use rand::{Rng, SeedableRng};
 
     #[derive(Clone, Debug)]
     enum TorrentVariant {
@@ -9210,7 +9210,7 @@ mod prop_tests {
                             data: vec![piece_index as u8; length as usize],
                         });
 
-                        if rng.random_bool(duplicate_probability) {
+                        if rng.gen_bool(duplicate_probability) {
                             pending_actions.push(Action::IncomingBlock {
                                 peer_id: peer_id.clone(),
                                 piece_index,
@@ -9232,7 +9232,7 @@ mod prop_tests {
                 data,
                 ..
             } => {
-                let valid = !rng.random_bool(invalid_verify_probability);
+                let valid = !rng.gen_bool(invalid_verify_probability);
                 pending_actions.push(Action::PieceVerified {
                     peer_id,
                     piece_index,
@@ -9291,7 +9291,7 @@ mod prop_tests {
         }
 
         let mut rng = StdRng::seed_from_u64(random_seed);
-        let peer_count = rng.random_range(cfg.peer_count_range.0..=cfg.peer_count_range.1);
+        let peer_count = rng.gen_range(cfg.peer_count_range.0..=cfg.peer_count_range.1);
 
         let mut peer_ids = Vec::with_capacity(peer_count);
         for i in 0..peer_count {
@@ -9320,19 +9320,19 @@ mod prop_tests {
             for (peer_idx, peer_id) in peer_ids.iter().enumerate() {
                 if let Some(bits) = peer_bitfields_bool.get_mut(peer_id) {
                     for has_piece in bits.iter_mut().take(num_pieces) {
-                        *has_piece = peer_idx == 0 || rng.random_bool(0.5);
+                        *has_piece = peer_idx == 0 || rng.gen_bool(0.5);
                     }
                 }
             }
         } else {
             for piece_idx in 0..num_pieces {
-                let primary = rng.random_range(0..peer_count);
+                let primary = rng.gen_range(0..peer_count);
                 peer_bitfields_bool
                     .get_mut(&peer_ids[primary])
                     .expect("primary peer must exist")[piece_idx] = true;
 
                 for peer_id in peer_ids.iter().take(peer_count) {
-                    if rng.random_bool(0.2) {
+                    if rng.gen_bool(0.2) {
                         peer_bitfields_bool
                             .get_mut(peer_id)
                             .expect("peer must exist")[piece_idx] = true;
@@ -9409,12 +9409,12 @@ mod prop_tests {
 
             if cfg.churn_choke_prob > 0.0 || cfg.churn_unchoke_prob > 0.0 {
                 for peer_id in &peer_ids {
-                    if rng.random_bool(cfg.churn_choke_prob) {
+                    if rng.gen_bool(cfg.churn_choke_prob) {
                         let _ = state.update(Action::PeerChoked {
                             peer_id: peer_id.clone(),
                         });
                     }
-                    if rng.random_bool(cfg.churn_unchoke_prob) {
+                    if rng.gen_bool(cfg.churn_unchoke_prob) {
                         let effects = state.update(Action::PeerUnchoked {
                             peer_id: peer_id.clone(),
                         });
@@ -9464,10 +9464,10 @@ mod prop_tests {
                 progressed = true;
                 let budget = usize::min(
                     pending_actions.len(),
-                    rng.random_range(1..=cfg.delivery_batch_max.max(1)),
+                    rng.gen_range(1..=cfg.delivery_batch_max.max(1)),
                 );
                 for _ in 0..budget {
-                    let idx = rng.random_range(0..pending_actions.len());
+                    let idx = rng.gen_range(0..pending_actions.len());
                     let action = pending_actions.swap_remove(idx);
                     let follow_up = state.update(action);
                     if !follow_up.is_empty() {
@@ -9496,10 +9496,10 @@ mod prop_tests {
                 progressed = true;
                 let budget = usize::min(
                     pending_manager_commands.len(),
-                    rng.random_range(1..=cfg.manager_delivery_batch_max.max(1)),
+                    rng.gen_range(1..=cfg.manager_delivery_batch_max.max(1)),
                 );
                 for _ in 0..budget {
-                    let idx = rng.random_range(0..pending_manager_commands.len());
+                    let idx = rng.gen_range(0..pending_manager_commands.len());
                     let cmd = pending_manager_commands.swap_remove(idx);
                     let follow_up = match cmd {
                         SimulatedManagerCommand::Disconnect(peer_id) => {
@@ -9705,18 +9705,18 @@ mod prop_tests {
 
         for action in actions {
             // 2% Packet Loss
-            if rng.random_bool(0.02) {
+            if rng.gen_bool(0.02) {
                 continue;
             }
 
             // 1% Duplication (Clone creates the "Ghost Packet")
-            if rng.random_bool(0.01) {
-                let delay = rng.random_range(10..400);
+            if rng.gen_bool(0.01) {
+                let delay = rng.gen_range(10..400);
                 pending.push((delay, action.clone()));
             }
 
             // Normal Delivery (random delay 10ms - 400ms)
-            let delay = rng.random_range(10..400);
+            let delay = rng.gen_range(10..400);
             pending.push((delay, action));
         }
 

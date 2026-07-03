@@ -34,7 +34,7 @@ mod tuning;
 mod watch_inbox;
 
 use app::{App, AppRuntimeMode};
-use rand::{Rng, RngExt};
+use rand::Rng;
 
 use std::fs;
 use std::fs::File;
@@ -2492,7 +2492,7 @@ fn stage_shared_control_torrent_file(source_path: &Path) -> io::Result<PathBuf> 
         .unwrap_or_default()
         .as_millis();
     let mut random_bytes = [0_u8; 8];
-    rand::rng().fill_bytes(&mut random_bytes);
+    rand::thread_rng().fill(&mut random_bytes);
     let staged_path = staging_dir.join(format!(
         "staged-{}-{}.torrent",
         now_ms,
@@ -3456,12 +3456,12 @@ fn generate_client_id_string() -> String {
     const CLIENT_PREFIX: &str = "-SS1000-";
     const RANDOM_LEN: usize = 12;
 
-    let mut rng = rand::rng();
+    let mut rng = rand::thread_rng();
     let random_chars: String = (0..RANDOM_LEN)
         .map(|_| {
             const CHARSET: &[u8] =
                 b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-            let idx = rng.random_range(0..CHARSET.len());
+            let idx = rng.gen_range(0..CHARSET.len());
             CHARSET[idx] as char
         })
         .collect();

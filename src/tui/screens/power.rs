@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
+use rand::{Rng, SeedableRng};
 use ratatui::{prelude::*, widgets::*};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -176,7 +176,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
         .as_secs();
     let seed = seconds_since_epoch / MESSAGE_INTERVAL_SECONDS;
     let mut rng = StdRng::seed_from_u64(seed);
-    let message_index = rng.random_range(0..TRANQUIL_MESSAGES.len());
+    let message_index = rng.gen_range(0..TRANQUIL_MESSAGES.len());
     let current_message = TRANQUIL_MESSAGES[message_index];
 
     let main_content_lines = vec![

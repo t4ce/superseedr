@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use rand::seq::SliceRandom;
-use rand::{Rng, RngExt};
+use rand::Rng;
 
 use crate::app::CalculatedLimits;
 use crate::resource_manager::ResourceType;
@@ -491,7 +491,7 @@ pub(crate) fn make_random_adjustment(
     limits: CalculatedLimits,
     is_seeding: bool,
 ) -> (CalculatedLimits, String) {
-    let mut rng = rand::rng();
+    let mut rng = rand::thread_rng();
     make_random_adjustment_with_rng(limits, is_seeding, &mut rng)
 }
 
@@ -536,7 +536,7 @@ pub(crate) fn make_random_adjustment_with_rng<R: Rng + ?Sized>(
             ResourceType::Reserve => MIN_RESERVE,
         };
 
-        let step_rate = rng.random_range(MIN_STEP_RATE..=MAX_STEP_RATE);
+        let step_rate = rng.gen_range(MIN_STEP_RATE..=MAX_STEP_RATE);
         let amount_to_trade = ((source_val as f64 * step_rate).ceil() as usize).max(1);
         let can_give = source_val >= source_min.saturating_add(amount_to_trade);
 

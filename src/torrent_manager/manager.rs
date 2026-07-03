@@ -58,7 +58,7 @@ use crate::tracker::client::{
 };
 use crate::tracker::normalize_tracker_urls;
 
-use rand::RngExt;
+use rand::Rng;
 
 use crate::torrent_file::Torrent;
 
@@ -2017,7 +2017,7 @@ impl TorrentManager {
             }
 
             let backoff = BASE_BACKOFF_MS.saturating_mul(2u64.pow(attempt));
-            let jitter = rand::rng().random_range(0..=JITTER_MS);
+            let jitter = rand::thread_rng().gen_range(0..=JITTER_MS);
             let duration = Duration::from_millis(backoff + jitter);
             event!(
                 Level::WARN,
@@ -2111,7 +2111,7 @@ impl TorrentManager {
             }
 
             let backoff = BASE_BACKOFF_MS.saturating_mul(2u64.pow(attempt));
-            let jitter = rand::rng().random_range(0..=JITTER_MS);
+            let jitter = rand::thread_rng().gen_range(0..=JITTER_MS);
             let duration = Duration::from_millis(backoff + jitter);
 
             event!(
@@ -3135,7 +3135,7 @@ impl TorrentManager {
 
                 _ = choke_timer.tick(), if !self.state.is_paused => {
                     self.apply_action(Action::RecalculateChokes {
-                        random_seed: rand::rng().random()
+                        random_seed: rand::thread_rng().gen()
                     });
                 }
 

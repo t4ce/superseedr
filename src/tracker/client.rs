@@ -7,7 +7,7 @@ use crate::tracker::RawTrackerResponse;
 use crate::tracker::TrackerEvent;
 use crate::tracker::TrackerResponse;
 
-use rand::RngExt;
+use rand::Rng;
 use reqwest::header;
 use reqwest::Client;
 use reqwest::StatusCode;
@@ -476,7 +476,7 @@ async fn try_udp_announce_once(
 }
 
 async fn send_udp_connect_request(socket: &UdpSocket) -> Result<u64, TrackerError> {
-    let transaction_id = rand::rng().random::<u32>();
+    let transaction_id = rand::thread_rng().gen::<u32>();
     let mut request = [0u8; 16];
     request[..8].copy_from_slice(&UDP_PROTOCOL_ID.to_be_bytes());
     request[8..12].copy_from_slice(&UDP_CONNECT_ACTION.to_be_bytes());
@@ -526,7 +526,7 @@ async fn send_udp_announce_request(
     params: &AnnounceParams,
     tracker_addr: SocketAddr,
 ) -> Result<TrackerResponse, TrackerError> {
-    let transaction_id = rand::rng().random::<u32>();
+    let transaction_id = rand::thread_rng().gen::<u32>();
     let mut request = [0u8; 98];
     request[..8].copy_from_slice(&connection_id.to_be_bytes());
     request[8..12].copy_from_slice(&UDP_ANNOUNCE_ACTION.to_be_bytes());
@@ -538,7 +538,7 @@ async fn send_udp_announce_request(
     request[72..80].copy_from_slice(&(params.uploaded as u64).to_be_bytes());
     request[80..84].copy_from_slice(&udp_event_code(params.event).to_be_bytes());
     request[84..88].copy_from_slice(&0u32.to_be_bytes());
-    request[88..92].copy_from_slice(&rand::rng().random::<u32>().to_be_bytes());
+    request[88..92].copy_from_slice(&rand::thread_rng().gen::<u32>().to_be_bytes());
     request[92..96].copy_from_slice(&(params.num_peers_want as i32).to_be_bytes());
     request[96..98].copy_from_slice(&params.client_port.to_be_bytes());
 

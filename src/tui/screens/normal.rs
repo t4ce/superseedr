@@ -47,7 +47,7 @@ use crate::tui::screen_context::ScreenContext;
 use crate::tui::tree::{TreeFilter, TreeMathHelper, TreeViewState};
 use chrono::{DateTime, Utc};
 use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
+use rand::{Rng, SeedableRng};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -3948,8 +3948,8 @@ pub fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &T
             let y_intensity = (intensity * 0.65).max(0.015);
 
             for _ in 0..small_dot_count {
-                let x_jitter = rng.random_range(-x_intensity..x_intensity);
-                let y_jitter = rng.random_range(-y_intensity..y_intensity);
+                let x_jitter = rng.gen_range(-x_intensity..x_intensity);
+                let y_jitter = rng.gen_range(-y_intensity..y_intensity);
                 small_points.push((
                     i as f64 + x_jitter,
                     (wave_center + y_jitter).clamp(0.6, 3.4),
@@ -3957,8 +3957,8 @@ pub fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &T
             }
 
             if is_heavy {
-                let heavy_x_jitter = rng.random_range(-0.08..0.08);
-                let heavy_y_jitter = rng.random_range(-0.05..0.05);
+                let heavy_x_jitter = rng.gen_range(-0.08..0.08);
+                let heavy_y_jitter = rng.gen_range(-0.05..0.05);
                 large_points.push((
                     i as f64 + heavy_x_jitter,
                     (wave_center + heavy_y_jitter).clamp(0.6, 3.4),
@@ -4694,7 +4694,7 @@ fn draw_vertical_block_stream_content(
             );
             let total_scaled_blocks_f64 = (larger_stream_count + smaller_stream_count) as f64;
             let ratio_smaller = smaller_stream_count as f64 / total_scaled_blocks_f64;
-            let smaller_first: bool = order_rng.random_bool(1.0 - ratio_smaller);
+            let smaller_first: bool = order_rng.gen_bool(1.0 - ratio_smaller);
             let smaller_stay_probability = (idle_slow_probability * 3.0_f64).clamp(0.0, 1.0);
             let larger_stay_probability = (idle_slow_probability * 0.35_f64).clamp(0.0, 1.0);
             let mut slow_rng = StdRng::seed_from_u64(
@@ -4703,12 +4703,12 @@ fn draw_vertical_block_stream_content(
                     ^ (ul_slice_index as u64).rotate_right(11)
                     ^ 0xAC71_4D2F,
             );
-            let smaller_seed = if slow_rng.random_bool(smaller_stay_probability) {
+            let smaller_seed = if slow_rng.gen_bool(smaller_stay_probability) {
                 smaller_seed_salt
             } else {
                 frame_seed ^ smaller_seed_salt
             };
-            let larger_seed = if slow_rng.random_bool(larger_stay_probability) {
+            let larger_seed = if slow_rng.gen_bool(larger_stay_probability) {
                 larger_seed_salt
             } else {
                 frame_seed ^ larger_seed_salt
@@ -4768,7 +4768,7 @@ fn render_sparkles<'a>(
 ) {
     let mut rng = StdRng::seed_from_u64(seed);
     for _ in 0..count {
-        let is_bold: bool = rng.random();
+        let is_bold: bool = rng.gen();
         let mut style = Style::default().fg(color);
         style = if is_bold {
             style.add_modifier(Modifier::BOLD)

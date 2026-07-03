@@ -13,7 +13,7 @@ use magnet_url::Magnet;
 
 use fuzzy_matcher::FuzzyMatcher;
 
-use rand::RngExt;
+use rand::Rng;
 
 use strum_macros::EnumIter;
 
@@ -2406,7 +2406,7 @@ fn configured_upload_bucket_rate(configured_upload_limit_bps: u64) -> f64 {
 }
 
 fn random_disk_throttle_step_factor() -> f64 {
-    rand::rng().random_range(DISK_WRITE_THROTTLE_STEP_MIN..=DISK_WRITE_THROTTLE_STEP_MAX)
+    rand::thread_rng().gen_range(DISK_WRITE_THROTTLE_STEP_MIN..=DISK_WRITE_THROTTLE_STEP_MAX)
 }
 
 fn normalize_disk_throttle_step(step_factor: f64) -> f64 {

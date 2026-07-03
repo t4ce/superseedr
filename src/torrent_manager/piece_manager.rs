@@ -7,7 +7,7 @@ use crate::torrent_manager::block_manager::{BlockAddress, BlockManager};
 use crate::torrent_manager::state::TorrentStatus;
 
 #[cfg(test)]
-use rand::prelude::IndexedRandom;
+use rand::seq::SliceRandom;
 
 #[cfg(test)]
 use std::collections::HashSet;
@@ -289,7 +289,7 @@ impl PieceManager {
                     .filter(|&&p| !peer_pending.contains(&p))
                     .copied()
                     .collect();
-                return candidates.choose(&mut rand::rng()).copied();
+                return candidates.choose(&mut rand::thread_rng()).copied();
             }
         }
 

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use super::types::{Bep42State, NodeId};
-use rand::RngExt;
+use rand::Rng;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const IPV4_MASK: u32 = 0x030f3fff;
@@ -34,7 +34,7 @@ pub fn classify_ipv4(ip: Ipv4Addr, node_id: NodeId) -> Bep42State {
 
 pub fn random_secure_node_id_for_ipv4(ip: Ipv4Addr) -> Option<NodeId> {
     let mut entropy = [0u8; NodeId::LEN];
-    rand::rng().fill(&mut entropy);
+    rand::thread_rng().fill(&mut entropy);
     secure_node_id_for_ipv4(ip, entropy)
 }
 
