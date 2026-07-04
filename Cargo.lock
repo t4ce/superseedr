@@ -3178,6 +3178,9 @@ dependencies = [
 name = "trueos"
 version = "0.1.0"
 dependencies = [
+ "mio",
+ "socket2",
+ "tokio",
  "v",
 ]
 

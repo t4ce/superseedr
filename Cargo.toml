@@ -60,6 +60,7 @@ trueos-blueprint = [
     "ratatui/macros",
     "ratatui/std",
     "ratatui/underline-color",
+    "trueos/tokio-net-probe",
 ]
 
 

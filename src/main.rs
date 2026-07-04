@@ -15,7 +15,9 @@ fn blueprint_main() {
         format_args!("superseedr: trueos blueprint shell ready"),
     );
     shell_line("superseedr: trueos blueprint shell ready");
-    shell_line("superseedr: commands: help add <magnet> list status remove <id|all> clear exit");
+    shell_line(
+        "superseedr: commands: help add <magnet> announce <id> [tracker] list status remove <id|all> clear exit",
+    );
     shell_prompt();
 
     let mut shell = BlueprintShellInput::new();
@@ -42,8 +44,20 @@ fn blueprint_main() {
 struct BlueprintTorrent {
     id: usize,
     source: String,
-    info_hash: Option<String>,
+    info_hash: String,
     name: Option<String>,
+    trackers: Vec<String>,
+    last_announce: Option<BlueprintAnnounceSummary>,
+}
+
+#[cfg(feature = "trueos-blueprint")]
+#[derive(Clone)]
+struct BlueprintAnnounceSummary {
+    tracker: String,
+    interval: i64,
+    complete: i64,
+    incomplete: i64,
+    peers: usize,
 }
 
 #[cfg(feature = "trueos-blueprint")]
@@ -78,6 +92,7 @@ impl BlueprintApp {
             "help" | "?" => self.help(),
             "status" => self.status(),
             "add" => self.add(rest.trim()),
+            "announce" => self.announce(rest.trim()),
             "list" | "ls" => self.list(),
             "remove" | "rm" => self.remove(rest.trim()),
             "clear" => self.clear(),
@@ -91,6 +106,7 @@ impl BlueprintApp {
     fn help(&self) {
         shell_line("commands:");
         shell_line("  add <magnet>       queue a magnet link");
+        shell_line("  announce <id> [tr] run one tracker started announce");
         shell_line("  list               show queued torrents");
         shell_line("  status             show blueprint-side queue status");
         shell_line("  remove <id|all>    drop queued torrents");
@@ -103,7 +119,33 @@ impl BlueprintApp {
             "superseedr: queued={} active=0",
             self.torrents.len()
         ));
-        shell_line("superseedr: swarm engine not attached yet; shell2 control path is live");
+        for torrent in &self.torrents {
+            let label = torrent
+                .name
+                .as_deref()
+                .unwrap_or(torrent.info_hash.as_str());
+            shell_line(&format!(
+                "  #{} queued {} {} trackers={}",
+                torrent.id,
+                torrent.info_hash,
+                label,
+                torrent.trackers.len()
+            ));
+            if let Some(summary) = &torrent.last_announce {
+                shell_line(&format!(
+                    "     last tracker={} interval={} complete={} incomplete={} peers={}",
+                    summary.tracker,
+                    summary.interval,
+                    summary.complete,
+                    summary.incomplete,
+                    summary.peers
+                ));
+            }
+        }
+        shell_line(
+            "superseedr: shell2 control path, identity parser, and tracker announce are live",
+        );
+        shell_line("superseedr: swarm engine not attached yet");
     }
 
     fn add(&mut self, source: &str) {
@@ -112,25 +154,87 @@ impl BlueprintApp {
             return;
         }
 
+        let Some(info_hash) = torrent_identity::info_hash_from_torrent_source(source) else {
+            shell_line("magnet rejected: missing or invalid btih/btmh info hash");
+            return;
+        };
+        let info_hash = hex::encode(info_hash);
+
         let torrent = BlueprintTorrent {
             id: self.next_id,
             source: source.to_string(),
-            info_hash: magnet_field(source, "xt")
-                .and_then(|xt| xt.strip_prefix("urn:btih:").map(str::to_ascii_lowercase)),
+            info_hash,
             name: magnet_field(source, "dn"),
+            trackers: magnet_fields(source, "tr")
+                .into_iter()
+                .flat_map(|tracker| tracker::normalize_tracker_urls([tracker]))
+                .collect(),
+            last_announce: None,
         };
         self.next_id += 1;
 
         shell_line(&format!(
-            "queued #{} {}",
+            "queued #{} {} trackers={}",
             torrent.id,
             torrent
                 .name
                 .as_deref()
-                .or(torrent.info_hash.as_deref())
-                .unwrap_or("magnet")
+                .unwrap_or(torrent.info_hash.as_str()),
+            torrent.trackers.len()
         ));
         self.torrents.push(torrent);
+    }
+
+    fn announce(&mut self, args: &str) {
+        let mut parts = args.split_whitespace();
+        let Some(id_text) = parts.next() else {
+            shell_line("announce expects: announce <id> [tracker-url]");
+            return;
+        };
+        let Ok(id) = id_text.parse::<usize>() else {
+            shell_line("announce expects a numeric queue id");
+            return;
+        };
+        let requested_tracker = parts.next().map(str::to_string);
+        if parts.next().is_some() {
+            shell_line("announce expects at most one tracker URL");
+            return;
+        }
+
+        let Some(torrent) = self.torrents.iter_mut().find(|torrent| torrent.id == id) else {
+            shell_line("no queued torrent matched that id");
+            return;
+        };
+
+        let tracker = match requested_tracker {
+            Some(tracker) => {
+                let mut normalized = tracker::normalize_tracker_urls([tracker]);
+                let Some(tracker) = normalized.pop() else {
+                    shell_line("tracker URL must use http, https, or udp");
+                    return;
+                };
+                tracker
+            }
+            None => {
+                let Some(tracker) = torrent.trackers.first().cloned() else {
+                    shell_line("queued magnet has no tracker; pass announce <id> <tracker-url>");
+                    return;
+                };
+                tracker
+            }
+        };
+
+        shell_line(&format!("announce #{} {}", torrent.id, tracker));
+        match announce_started_blocking(&tracker, &torrent.info_hash) {
+            Ok(summary) => {
+                shell_line(&format!(
+                    "tracker ok interval={} complete={} incomplete={} peers={}",
+                    summary.interval, summary.complete, summary.incomplete, summary.peers
+                ));
+                torrent.last_announce = Some(summary);
+            }
+            Err(error) => shell_line(&format!("tracker error: {}", error)),
+        }
     }
 
     fn list(&self) {
@@ -143,10 +247,15 @@ impl BlueprintApp {
             let label = torrent
                 .name
                 .as_deref()
-                .or(torrent.info_hash.as_deref())
+                .or(Some(torrent.info_hash.as_str()))
                 .unwrap_or(torrent.source.as_str());
-            let hash = torrent.info_hash.as_deref().unwrap_or("no-info-hash");
-            shell_line(&format!("#{} queued {} {}", torrent.id, hash, label));
+            shell_line(&format!(
+                "#{} queued {} {} trackers={}",
+                torrent.id,
+                torrent.info_hash,
+                label,
+                torrent.trackers.len()
+            ));
         }
     }
 
@@ -225,29 +334,76 @@ impl BlueprintShellInput {
 
 #[cfg(feature = "trueos-blueprint")]
 fn magnet_field(source: &str, key: &str) -> Option<String> {
-    let query = source.strip_prefix("magnet:?")?;
+    magnet_fields(source, key).into_iter().next()
+}
+
+#[cfg(feature = "trueos-blueprint")]
+fn magnet_fields(source: &str, key: &str) -> Vec<String> {
+    let Some(query) = source.strip_prefix("magnet:?") else {
+        return Vec::new();
+    };
+    let mut values = Vec::new();
     for pair in query.split('&') {
         let (field, value) = pair.split_once('=').unwrap_or((pair, ""));
         if field == key {
-            return urlencoding::decode(value)
-                .ok()
-                .map(|value| value.into_owned());
+            if let Ok(value) = urlencoding::decode(value) {
+                values.push(value.into_owned());
+            }
         }
     }
-    None
+    values
+}
+
+#[cfg(feature = "trueos-blueprint")]
+fn announce_started_blocking(
+    tracker: &str,
+    info_hash_hex: &str,
+) -> Result<BlueprintAnnounceSummary, String> {
+    use trueos::t;
+
+    let info_hash = hex::decode(info_hash_hex).map_err(|error| error.to_string())?;
+    let runtime = t::runtime::current_thread_net()
+        .build()
+        .map_err(|error| format!("runtime build failed: {}", error))?;
+    runtime.block_on(async {
+        let response = tracker::client::announce_started(
+            tracker.to_string(),
+            &info_hash,
+            "-SS0111-TRUEOSBP0001".to_string(),
+            6881,
+            1,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+        Ok(BlueprintAnnounceSummary {
+            tracker: tracker.to_string(),
+            interval: response.interval,
+            complete: response.complete,
+            incomplete: response.incomplete,
+            peers: response.peers.len(),
+        })
+    })
 }
 
 #[cfg(feature = "trueos-blueprint")]
 fn shell_line(text: &str) {
     use trueos::vshell;
 
+    vshell::attached_write(b"\r");
+    vshell::attached_write(vshell::CLEAR_LINE.as_bytes());
     vshell::attached_write(text.as_bytes());
+    vshell::attached_write(vshell::CLEAR_TO_EOL.as_bytes());
     vshell::attached_write(b"\r\n");
 }
 
 #[cfg(feature = "trueos-blueprint")]
 fn shell_prompt() {
-    trueos::vshell::attached_write(b"superseedr> ");
+    use trueos::vshell;
+
+    vshell::attached_write(b"\r");
+    vshell::attached_write(vshell::CLEAR_LINE.as_bytes());
+    vshell::attached_write(b"superseedr> ");
 }
 
 #[cfg(not(feature = "trueos-blueprint"))]
@@ -265,7 +421,7 @@ mod dht;
 mod dht;
 #[cfg(not(feature = "trueos-blueprint"))]
 mod dht_service;
-#[cfg(not(feature = "trueos-blueprint"))]
+#[cfg_attr(feature = "trueos-blueprint", allow(dead_code))]
 mod errors;
 #[cfg(not(feature = "trueos-blueprint"))]
 mod fs_atomic;
@@ -293,11 +449,10 @@ mod theme;
 mod token_bucket;
 #[cfg(not(feature = "trueos-blueprint"))]
 mod torrent_file;
-#[cfg(not(feature = "trueos-blueprint"))]
 mod torrent_identity;
 #[cfg(not(feature = "trueos-blueprint"))]
 mod torrent_manager;
-#[cfg(not(feature = "trueos-blueprint"))]
+#[cfg_attr(feature = "trueos-blueprint", allow(dead_code))]
 mod tracker;
 #[cfg(not(feature = "trueos-blueprint"))]
 mod tui;

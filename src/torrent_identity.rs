@@ -1,12 +1,16 @@
 // SPDX-FileCopyrightText: 2026 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::torrent_file::parser::from_bytes;
 use data_encoding::BASE32;
 use magnet_url::Magnet;
+#[cfg(not(feature = "trueos-blueprint"))]
 use sha1::Digest;
+#[cfg(not(feature = "trueos-blueprint"))]
 use sha2::Sha256;
 use std::path::Path;
+
+#[cfg(not(feature = "trueos-blueprint"))]
+use crate::torrent_file::parser::from_bytes;
 
 pub fn decode_info_hash(hash_string: &str) -> Result<Vec<u8>, String> {
     if let Ok(bytes) = hex::decode(hash_string) {
@@ -93,6 +97,7 @@ pub fn info_hash_from_torrent_source(source: &str) -> Option<Vec<u8>> {
     }
 }
 
+#[cfg(not(feature = "trueos-blueprint"))]
 pub fn info_hash_from_torrent_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
     let torrent = from_bytes(bytes).ok()?;
 
