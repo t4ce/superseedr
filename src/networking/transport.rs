@@ -2,10 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::fmt;
-use std::io;
 use std::net::SocketAddr;
 
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{self, AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -1,15 +1,18 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#[cfg(not(feature = "trueos-blueprint"))]
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::HashMap;
-use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
+#[cfg(not(feature = "trueos-blueprint"))]
+use std::net::UdpSocket as StdUdpSocket;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, LazyLock, Mutex as StdMutex, Weak,
 };
 use std::time::Duration;
+use tokio::io;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -107,7 +110,7 @@ impl SharedUdpHandle {
                     return Ok(handle);
                 }
 
-                match bind_udp_socket(requested_key.bind_addr, requested_key.family) {
+                match bind_udp_socket(requested_key.bind_addr, requested_key.family).await {
                     Ok(socket) => break Arc::new(socket),
                     Err(error)
                         if error.kind() == io::ErrorKind::AddrInUse
@@ -220,7 +223,7 @@ impl SharedUdpHandle {
         if guard.as_ref().is_some_and(|sender| !sender.is_closed()) {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
-                format!("{protocol:?} UDP subscriber already registered"),
+                "UDP subscriber already registered",
             ));
         }
         *guard = Some(tx);
@@ -542,7 +545,13 @@ fn normalize_bind_addr(bind_addr: SocketAddr, family: SharedUdpFamily) -> Socket
     }
 }
 
-fn bind_udp_socket(bind_addr: SocketAddr, family: SharedUdpFamily) -> io::Result<UdpSocket> {
+#[cfg(feature = "trueos-blueprint")]
+async fn bind_udp_socket(bind_addr: SocketAddr, _family: SharedUdpFamily) -> io::Result<UdpSocket> {
+    UdpSocket::bind(bind_addr).await
+}
+
+#[cfg(not(feature = "trueos-blueprint"))]
+async fn bind_udp_socket(bind_addr: SocketAddr, family: SharedUdpFamily) -> io::Result<UdpSocket> {
     let domain = match family {
         SharedUdpFamily::Ipv4 => Domain::IPV4,
         SharedUdpFamily::Ipv6 => Domain::IPV6,

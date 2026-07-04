@@ -9,7 +9,7 @@ pub enum TrackerError {
     Request(#[from] reqwest::Error),
 
     #[error("Tracker I/O error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[from] tokio::io::Error),
 
     #[error("Failed to parse bencoded tracker response")]
     Bencode(#[from] serde_bencode::Error),

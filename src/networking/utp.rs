@@ -3,7 +3,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    future, io,
+    future,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
     sync::{
@@ -16,7 +16,8 @@ use std::{
 
 use tokio::{
     io::{
-        self as tokio_io, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf,
+        self, self as tokio_io, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream,
+        ReadBuf,
     },
     sync::{mpsc, watch},
     time::{self, Instant},
