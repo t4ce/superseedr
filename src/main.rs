@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #[cfg(feature = "trueos-blueprint")]
+use std::net::SocketAddr;
+
+#[cfg(feature = "trueos-blueprint")]
 fn main() {
     blueprint_main();
 }
@@ -15,13 +18,10 @@ fn blueprint_main() {
         format_args!("superseedr: trueos blueprint shell ready"),
     );
     shell_line("superseedr: trueos blueprint shell ready");
-    shell_line(
-        "superseedr: commands: help add <magnet> announce <id> [tracker] list status remove <id|all> clear exit",
-    );
-    shell_prompt();
-
+    shell_line("superseedr: commands: help add <magnet> announce <id> [tracker] peers <id> [limit] peer-test <id> [index] list status save load queue-path remove <id|all> clear exit");
     let mut shell = BlueprintShellInput::new();
     let mut app = BlueprintApp::new();
+    shell_prompt();
     loop {
         if let Some(command) = shell.poll() {
             let action = app.run_command(command.trim());
@@ -38,6 +38,15 @@ fn blueprint_main() {
         vsys::sleep_ms(32);
     }
 }
+
+#[cfg(feature = "trueos-blueprint")]
+const BLUEPRINT_QUEUE_DIR: &str = "state";
+
+#[cfg(feature = "trueos-blueprint")]
+const BLUEPRINT_QUEUE_PATH: &str = "state/queue.txt";
+
+#[cfg(feature = "trueos-blueprint")]
+const TRUEOS_FS_ERR_NOT_FOUND: i32 = -8;
 
 #[cfg(feature = "trueos-blueprint")]
 #[derive(Clone)]
@@ -57,7 +66,7 @@ struct BlueprintAnnounceSummary {
     interval: i64,
     complete: i64,
     incomplete: i64,
-    peers: usize,
+    peers: Vec<SocketAddr>,
 }
 
 #[cfg(feature = "trueos-blueprint")]
@@ -76,10 +85,19 @@ struct BlueprintApp {
 #[cfg(feature = "trueos-blueprint")]
 impl BlueprintApp {
     fn new() -> Self {
-        Self {
+        let mut app = Self {
             torrents: Vec::new(),
             next_id: 1,
+        };
+        match app.load_queue_from_fs() {
+            Ok(loaded) if loaded > 0 => shell_line(&format!(
+                "superseedr: loaded {} queued torrent(s) from {}",
+                loaded, BLUEPRINT_QUEUE_PATH
+            )),
+            Ok(_) => {}
+            Err(error) => shell_line(&format!("superseedr: queue load skipped: {}", error)),
         }
+        app
     }
 
     fn run_command(&mut self, command: &str) -> BlueprintAction {
@@ -92,8 +110,14 @@ impl BlueprintApp {
             "help" | "?" => self.help(),
             "status" => self.status(),
             "add" => self.add(rest.trim()),
-            "announce" => self.announce(rest.trim()),
+            "announce" => self.announce(rest.trim(), false),
+            "announce-insecure" => self.announce(rest.trim(), true),
+            "peers" => self.peers(rest.trim()),
+            "peer-test" => self.peer_test(rest.trim()),
             "list" | "ls" => self.list(),
+            "save" => self.save(),
+            "load" => self.load(),
+            "queue-path" => self.queue_path(),
             "remove" | "rm" => self.remove(rest.trim()),
             "clear" => self.clear(),
             "exit" | "quit" => return BlueprintAction::Exit,
@@ -107,8 +131,14 @@ impl BlueprintApp {
         shell_line("commands:");
         shell_line("  add <magnet>       queue a magnet link");
         shell_line("  announce <id> [tr] run one tracker started announce");
+        shell_line("  announce-insecure <id> [tr] diagnose TLS trust only");
+        shell_line("  peers <id> [limit] show peers from the last announce");
+        shell_line("  peer-test <id> [i] TCP connect and BitTorrent-handshake peers");
         shell_line("  list               show queued torrents");
         shell_line("  status             show blueprint-side queue status");
+        shell_line("  save               persist queue to the app fs");
+        shell_line("  load               reload queue from the app fs");
+        shell_line("  queue-path         show the persisted queue path");
         shell_line("  remove <id|all>    drop queued torrents");
         shell_line("  clear              clear the queue");
         shell_line("  exit               leave the shell");
@@ -138,40 +168,33 @@ impl BlueprintApp {
                     summary.interval,
                     summary.complete,
                     summary.incomplete,
-                    summary.peers
+                    summary.peers.len()
                 ));
             }
         }
         shell_line(
             "superseedr: shell2 control path, identity parser, and tracker announce are live",
         );
+        shell_line(&format!("superseedr: queue path {}", BLUEPRINT_QUEUE_PATH));
         shell_line("superseedr: swarm engine not attached yet");
     }
 
     fn add(&mut self, source: &str) {
-        if !source.starts_with("magnet:?") {
-            shell_line("add expects a magnet:? link for this bootstrap surface");
+        let torrent = match self.torrent_from_source(source) {
+            Ok(torrent) => torrent,
+            Err(error) => {
+                shell_line(error.as_str());
+                return;
+            }
+        };
+        if let Some(existing) = self
+            .torrents
+            .iter()
+            .find(|existing| existing.info_hash == torrent.info_hash)
+        {
+            shell_line(&format!("already queued #{}", existing.id));
             return;
         }
-
-        let Some(info_hash) = torrent_identity::info_hash_from_torrent_source(source) else {
-            shell_line("magnet rejected: missing or invalid btih/btmh info hash");
-            return;
-        };
-        let info_hash = hex::encode(info_hash);
-
-        let torrent = BlueprintTorrent {
-            id: self.next_id,
-            source: source.to_string(),
-            info_hash,
-            name: magnet_field(source, "dn"),
-            trackers: magnet_fields(source, "tr")
-                .into_iter()
-                .flat_map(|tracker| tracker::normalize_tracker_urls([tracker]))
-                .collect(),
-            last_announce: None,
-        };
-        self.next_id += 1;
 
         shell_line(&format!(
             "queued #{} {} trackers={}",
@@ -183,9 +206,10 @@ impl BlueprintApp {
             torrent.trackers.len()
         ));
         self.torrents.push(torrent);
+        self.persist_queue_after_change();
     }
 
-    fn announce(&mut self, args: &str) {
+    fn announce(&mut self, args: &str, accept_invalid_certs: bool) {
         let mut parts = args.split_whitespace();
         let Some(id_text) = parts.next() else {
             shell_line("announce expects: announce <id> [tracker-url]");
@@ -224,16 +248,125 @@ impl BlueprintApp {
             }
         };
 
-        shell_line(&format!("announce #{} {}", torrent.id, tracker));
-        match announce_started_blocking(&tracker, &torrent.info_hash) {
+        let announce_label = if accept_invalid_certs {
+            "announce-insecure"
+        } else {
+            "announce"
+        };
+        shell_line(&format!("{} #{} {}", announce_label, torrent.id, tracker));
+        match announce_started_blocking(&tracker, &torrent.info_hash, accept_invalid_certs) {
             Ok(summary) => {
                 shell_line(&format!(
                     "tracker ok interval={} complete={} incomplete={} peers={}",
-                    summary.interval, summary.complete, summary.incomplete, summary.peers
+                    summary.interval,
+                    summary.complete,
+                    summary.incomplete,
+                    summary.peers.len()
                 ));
                 torrent.last_announce = Some(summary);
             }
             Err(error) => shell_line(&format!("tracker error: {}", error)),
+        }
+    }
+
+    fn peers(&self, args: &str) {
+        let mut parts = args.split_whitespace();
+        let Some(id_text) = parts.next() else {
+            shell_line("peers expects: peers <id> [limit]");
+            return;
+        };
+        let Ok(id) = id_text.parse::<usize>() else {
+            shell_line("peers expects a numeric queue id");
+            return;
+        };
+        let limit = match parts.next() {
+            Some(text) => match text.parse::<usize>() {
+                Ok(limit) => limit,
+                Err(_) => {
+                    shell_line("peers limit must be numeric");
+                    return;
+                }
+            },
+            None => 20,
+        };
+        if parts.next().is_some() {
+            shell_line("peers expects at most one limit");
+            return;
+        }
+
+        let Some(torrent) = self.torrents.iter().find(|torrent| torrent.id == id) else {
+            shell_line("no queued torrent matched that id");
+            return;
+        };
+        let Some(summary) = &torrent.last_announce else {
+            shell_line("no announced peers yet; run announce first");
+            return;
+        };
+
+        shell_line(&format!(
+            "peers #{} total={} showing={}",
+            torrent.id,
+            summary.peers.len(),
+            summary.peers.len().min(limit)
+        ));
+        for (index, peer) in summary.peers.iter().take(limit).enumerate() {
+            shell_line(&format!("  [{}] {}", index, peer));
+        }
+    }
+
+    fn peer_test(&self, args: &str) {
+        let mut parts = args.split_whitespace();
+        let Some(id_text) = parts.next() else {
+            shell_line("peer-test expects: peer-test <id> [index]");
+            return;
+        };
+        let Ok(id) = id_text.parse::<usize>() else {
+            shell_line("peer-test expects a numeric queue id");
+            return;
+        };
+        let index = match parts.next() {
+            Some(text) => match text.parse::<usize>() {
+                Ok(index) => Some(index),
+                Err(_) => {
+                    shell_line("peer-test index must be numeric");
+                    return;
+                }
+            },
+            None => None,
+        };
+        if parts.next().is_some() {
+            shell_line("peer-test expects at most one peer index");
+            return;
+        }
+
+        let Some(torrent) = self.torrents.iter().find(|torrent| torrent.id == id) else {
+            shell_line("no queued torrent matched that id");
+            return;
+        };
+        let Some(summary) = &torrent.last_announce else {
+            shell_line("no announced peers yet; run announce first");
+            return;
+        };
+        if summary.peers.is_empty() {
+            shell_line("last announce had no peers");
+            return;
+        }
+
+        let info_hash = match hex::decode(torrent.info_hash.as_str()) {
+            Ok(info_hash) => info_hash,
+            Err(error) => {
+                shell_line(&format!("info hash decode failed: {}", error));
+                return;
+            }
+        };
+
+        match peer_test_blocking(&info_hash, &summary.peers, index) {
+            Ok(lines) => {
+                for line in lines {
+                    shell_line(line.as_str());
+                }
+            }
+            Err(error) => shell_line(&format!("peer-test failed: {}", error)),
         }
     }
 
@@ -275,6 +408,7 @@ impl BlueprintApp {
             shell_line("no queued torrent matched that id");
         } else {
             shell_line(&format!("removed #{}", id));
+            self.persist_queue_after_change();
         }
     }
 
@@ -282,6 +416,121 @@ impl BlueprintApp {
         let removed = self.torrents.len();
         self.torrents.clear();
         shell_line(&format!("cleared {} queued torrent(s)", removed));
+        self.persist_queue_after_change();
+    }
+
+    fn save(&self) {
+        match self.save_queue_to_fs() {
+            Ok(()) => shell_line(&format!(
+                "saved {} queued torrent(s) to {}",
+                self.torrents.len(),
+                BLUEPRINT_QUEUE_PATH
+            )),
+            Err(error) => shell_line(&format!("queue save failed: {}", error)),
+        }
+    }
+
+    fn load(&mut self) {
+        match self.load_queue_from_fs() {
+            Ok(loaded) => shell_line(&format!(
+                "loaded {} queued torrent(s) from {}",
+                loaded, BLUEPRINT_QUEUE_PATH
+            )),
+            Err(error) => shell_line(&format!("queue load failed: {}", error)),
+        }
+    }
+
+    fn queue_path(&self) {
+        shell_line(&format!("queue path {}", BLUEPRINT_QUEUE_PATH));
+    }
+
+    fn torrent_from_source(&mut self, source: &str) -> Result<BlueprintTorrent, String> {
+        if !source.starts_with("magnet:?") {
+            return Err("add expects a magnet:? link for this bootstrap surface".to_string());
+        }
+
+        let Some(info_hash) = torrent_identity::info_hash_from_torrent_source(source) else {
+            return Err("magnet rejected: missing or invalid btih/btmh info hash".to_string());
+        };
+
+        let torrent = BlueprintTorrent {
+            id: self.next_id,
+            source: source.to_string(),
+            info_hash: hex::encode(info_hash),
+            name: magnet_field(source, "dn"),
+            trackers: magnet_fields(source, "tr")
+                .into_iter()
+                .flat_map(|tracker| tracker::normalize_tracker_urls([tracker]))
+                .collect(),
+            last_announce: None,
+        };
+        self.next_id += 1;
+        Ok(torrent)
+    }
+
+    fn persist_queue_after_change(&self) {
+        if let Err(error) = self.save_queue_to_fs() {
+            shell_line(&format!("queue save failed: {}", error));
+        }
+    }
+
+    fn save_queue_to_fs(&self) -> Result<(), String> {
+        use trueos::vfs;
+
+        vfs::create_dir_all(BLUEPRINT_QUEUE_DIR.as_bytes())
+            .map_err(|rc| format!("create {} rc={}", BLUEPRINT_QUEUE_DIR, rc))?;
+
+        let mut data = String::new();
+        for torrent in &self.torrents {
+            data.push_str(torrent.source.as_str());
+            data.push('\n');
+        }
+
+        vfs::write_file(BLUEPRINT_QUEUE_PATH.as_bytes(), data.as_bytes())
+            .map_err(|rc| format!("write {} rc={}", BLUEPRINT_QUEUE_PATH, rc))
+    }
+
+    fn load_queue_from_fs(&mut self) -> Result<usize, String> {
+        use trueos::vfs;
+
+        let bytes = match vfs::read_file(BLUEPRINT_QUEUE_PATH.as_bytes()) {
+            Ok(bytes) => bytes,
+            Err(TRUEOS_FS_ERR_NOT_FOUND) => {
+                self.torrents.clear();
+                self.next_id = 1;
+                return Ok(0);
+            }
+            Err(rc) => return Err(format!("read {} rc={}", BLUEPRINT_QUEUE_PATH, rc)),
+        };
+        let text = String::from_utf8(bytes).map_err(|_| "queue is not valid utf-8".to_string())?;
+
+        let old_torrents = core::mem::take(&mut self.torrents);
+        let old_next_id = self.next_id;
+        self.next_id = 1;
+
+        let mut loaded = Vec::new();
+        for line in text.lines() {
+            let source = line.trim();
+            if source.is_empty() || source.starts_with('#') {
+                continue;
+            }
+            match self.torrent_from_source(source) {
+                Ok(torrent) => loaded.push(torrent),
+                Err(error) => shell_line(&format!("queue skipped entry: {}", error)),
+            }
+        }
+
+        if loaded.is_empty() && !text.trim().is_empty() {
+            self.torrents = old_torrents;
+            self.next_id = old_next_id;
+            return Err("queue had no valid magnets; kept current in-memory queue".to_string());
+        }
+
+        self.torrents = loaded;
+        if self.torrents.is_empty() {
+            self.next_id = 1;
+        }
+        Ok(self.torrents.len())
     }
 }
 
@@ -358,6 +607,7 @@ fn magnet_fields(source: &str, key: &str) -> Vec<String> {
 fn announce_started_blocking(
     tracker: &str,
     info_hash_hex: &str,
+    accept_invalid_certs: bool,
 ) -> Result<BlueprintAnnounceSummary, String> {
     use trueos::t;
 
@@ -366,24 +616,187 @@ fn announce_started_blocking(
         .build()
         .map_err(|error| format!("runtime build failed: {}", error))?;
     runtime.block_on(async {
-        let response = tracker::client::announce_started(
-            tracker.to_string(),
-            &info_hash,
-            "-SS0111-TRUEOSBP0001".to_string(),
-            6881,
-            1,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
+        let response = if accept_invalid_certs {
+            tracker::client::announce_started_insecure(
+                tracker.to_string(),
+                &info_hash,
+                "-SS0111-TRUEOSBP0001".to_string(),
+                6881,
+                1,
+            )
+            .await
+        } else {
+            tracker::client::announce_started(
+                tracker.to_string(),
+                &info_hash,
+                "-SS0111-TRUEOSBP0001".to_string(),
+                6881,
+                1,
+            )
+            .await
+        };
+        let response = response.map_err(|error| format_tracker_error(&error))?;
 
         Ok(BlueprintAnnounceSummary {
             tracker: tracker.to_string(),
             interval: response.interval,
             complete: response.complete,
             incomplete: response.incomplete,
-            peers: response.peers.len(),
+            peers: response.peers,
         })
     })
+}
+
+#[cfg(feature = "trueos-blueprint")]
+fn peer_test_blocking(
+    info_hash: &[u8],
+    peers: &[SocketAddr],
+    index: Option<usize>,
+) -> Result<Vec<String>, String> {
+    use trueos::t;
+
+    if info_hash.len() != 20 {
+        return Err(format!(
+            "info hash must be 20 bytes, got {}",
+            info_hash.len()
+        ));
+    }
+
+    let runtime = t::runtime::current_thread_net()
+        .build()
+        .map_err(|error| format!("runtime build failed: {}", error))?;
+    runtime.block_on(async { peer_test_async(info_hash, peers, index).await })
+}
+
+#[cfg(feature = "trueos-blueprint")]
+async fn peer_test_async(
+    info_hash: &[u8],
+    peers: &[SocketAddr],
+    index: Option<usize>,
+) -> Result<Vec<String>, String> {
+    const DEFAULT_SCAN_LIMIT: usize = 10;
+
+    let peer_id = b"-SS0111-TRUEOSBP0001";
+    let mut lines = Vec::new();
+
+    if let Some(index) = index {
+        let Some(peer) = peers.get(index).copied() else {
+            return Err(format!("peer index {} out of range", index));
+        };
+        lines.push(format!("peer-test #{} {}", index, peer));
+        let result = bit_torrent_handshake(peer, info_hash, peer_id).await;
+        lines.push(format_peer_probe_result(index, peer, result));
+        return Ok(lines);
+    }
+
+    let limit = peers.len().min(DEFAULT_SCAN_LIMIT);
+    lines.push(format!(
+        "peer-test scanning {} of {} peers",
+        limit,
+        peers.len()
+    ));
+    for (index, peer) in peers.iter().copied().take(limit).enumerate() {
+        let result = bit_torrent_handshake(peer, info_hash, peer_id).await;
+        let ok = result.is_ok();
+        lines.push(format_peer_probe_result(index, peer, result));
+        if ok {
+            break;
+        }
+    }
+    Ok(lines)
+}
+
+#[cfg(feature = "trueos-blueprint")]
+fn format_peer_probe_result(
+    index: usize,
+    peer: SocketAddr,
+    result: Result<PeerHandshakeResult, String>,
+) -> String {
+    match result {
+        Ok(result) => format!(
+            "  [{}] {} handshake ok peer_id={}",
+            index,
+            peer,
+            hex::encode(result.peer_id)
+        ),
+        Err(error) => format!("  [{}] {} {}", index, peer, error),
+    }
+}
+
+#[cfg(feature = "trueos-blueprint")]
+struct PeerHandshakeResult {
+    peer_id: [u8; 20],
+}
+
+#[cfg(feature = "trueos-blueprint")]
+async fn bit_torrent_handshake(
+    peer: SocketAddr,
+    info_hash: &[u8],
+    peer_id: &[u8; 20],
+) -> Result<PeerHandshakeResult, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    use tokio::time::{timeout, Duration};
+
+    const CONNECT_TIMEOUT: Duration = Duration::from_millis(1_500);
+    const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(2_000);
+
+    let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(peer))
+        .await
+        .map_err(|_| "connect timeout".to_string())?
+        .map_err(|error| format!("connect failed: {}", error))?;
+
+    let mut request = [0u8; 68];
+    request[0] = 19;
+    request[1..20].copy_from_slice(b"BitTorrent protocol");
+    request[28..48].copy_from_slice(info_hash);
+    request[48..68].copy_from_slice(peer_id);
+
+    timeout(HANDSHAKE_TIMEOUT, stream.write_all(&request))
+        .await
+        .map_err(|_| "handshake write timeout".to_string())?
+        .map_err(|error| format!("handshake write failed: {}", error))?;
+
+    let mut response = [0u8; 68];
+    timeout(HANDSHAKE_TIMEOUT, stream.read_exact(&mut response))
+        .await
+        .map_err(|_| "handshake read timeout".to_string())?
+        .map_err(|error| format!("handshake read failed: {}", error))?;
+
+    if response[0] != 19 || &response[1..20] != b"BitTorrent protocol" {
+        return Err("handshake rejected: bad protocol".to_string());
+    }
+    if &response[28..48] != info_hash {
+        return Err("handshake rejected: info hash mismatch".to_string());
+    }
+
+    let mut response_peer_id = [0u8; 20];
+    response_peer_id.copy_from_slice(&response[48..68]);
+    Ok(PeerHandshakeResult {
+        peer_id: response_peer_id,
+    })
+}
+
+#[cfg(feature = "trueos-blueprint")]
+fn format_tracker_error(error: &errors::TrackerError) -> String {
+    use std::error::Error;
+
+    let mut message = error.to_string();
+    message.push_str(&format!("; debug={:?}", error));
+
+    let mut source = error.source();
+    let mut depth = 0;
+    while let Some(next) = source {
+        if depth >= 4 {
+            message.push_str("; source-more=...");
+            break;
+        }
+        message.push_str(&format!("; source{}={}", depth + 1, next));
+        source = next.source();
+        depth += 1;
+    }
+
+    message
 }
 
 #[cfg(feature = "trueos-blueprint")]

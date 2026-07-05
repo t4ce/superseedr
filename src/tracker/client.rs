@@ -50,6 +50,29 @@ pub async fn announce_started(
         left: torrent_size_left,
         num_peers_want: 50,
         event: Some(TrackerEvent::Started),
+        accept_invalid_certs: false,
+    })
+    .await
+}
+
+pub async fn announce_started_insecure(
+    announce_link: String,
+    hashed_info_dict: &[u8],
+    client_id: String,
+    client_port: u16,
+    torrent_size_left: usize,
+) -> Result<TrackerResponse, TrackerError> {
+    make_announce_request(AnnounceParams {
+        announce_link,
+        hashed_info_dict: hashed_info_dict.to_vec(),
+        client_id,
+        client_port,
+        uploaded: 0,
+        downloaded: 0,
+        left: torrent_size_left,
+        num_peers_want: 50,
+        event: Some(TrackerEvent::Started),
+        accept_invalid_certs: true,
     })
     .await
 }
@@ -73,6 +96,7 @@ pub async fn announce_periodic(
         left: torrent_size_left,
         num_peers_want: 50,
         event: None,
+        accept_invalid_certs: false,
     })
     .await
 }
@@ -95,6 +119,7 @@ pub async fn announce_completed(
         left: 0,
         num_peers_want: 0,
         event: Some(TrackerEvent::Completed),
+        accept_invalid_certs: false,
     })
     .await
 }
@@ -118,6 +143,7 @@ pub async fn announce_stopped(
         left: torrent_size_left,
         num_peers_want: 0,
         event: Some(TrackerEvent::Stopped),
+        accept_invalid_certs: false,
     })
     .await;
 }
@@ -132,6 +158,7 @@ struct AnnounceParams {
     left: usize,
     num_peers_want: usize,
     event: Option<TrackerEvent>,
+    accept_invalid_certs: bool,
 }
 
 async fn make_announce_request(params: AnnounceParams) -> Result<TrackerResponse, TrackerError> {
@@ -166,10 +193,7 @@ async fn make_http_announce_request(
         header::HeaderValue::from_static(APP_USER_AGENT),
     );
 
-    let client = Client::builder()
-        .default_headers(headers)
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+    let client = http_tracker_client(headers, params.accept_invalid_certs)?;
     let response = client.get(link).send().await?;
     let status = response.status();
     let content_type = response
@@ -190,6 +214,17 @@ async fn make_http_announce_request(
         .map_err(|error| {
             classify_http_tracker_error(error, &response, status, content_type.as_deref())
         })
+}
+
+fn http_tracker_client(
+    headers: header::HeaderMap,
+    accept_invalid_certs: bool,
+) -> Result<Client, TrackerError> {
+    let mut builder = Client::builder().default_headers(headers);
+    if accept_invalid_certs {
+        builder = builder.tls_danger_accept_invalid_certs(true);
+    }
+    Ok(builder.build()?)
 }
 
 async fn parse_http_tracker_response(response: &[u8]) -> Result<TrackerResponse, TrackerError> {

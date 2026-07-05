@@ -5,7 +5,7 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum TrackerError {
-    #[error("Request failed networking with tracker.")]
+    #[error("Request failed networking with tracker: {0}")]
     Request(#[from] reqwest::Error),
 
     #[error("Tracker I/O error: {0}")]
