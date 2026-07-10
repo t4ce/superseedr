@@ -25,13 +25,13 @@ const CHAOS_PPM_DENOMINATOR: u64 = 1_000_000;
 
 pub const SHARED_UDP_CHAOS_ENV: &str = "SUPERSEEDR_SHARED_UDP_CHAOS";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SharedUdpFamily {
     Ipv4,
     Ipv6,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SharedUdpKey {
     family: SharedUdpFamily,
     bind_addr: SocketAddr,
