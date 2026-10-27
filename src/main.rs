@@ -475,9 +475,9 @@ impl BlueprintApp {
     }
 
     fn save_queue_to_fs(&self) -> Result<(), String> {
-        use trueos::vfs;
+        use trueos::async_fs as vfs;
 
-        vfs::create_dir_all(BLUEPRINT_QUEUE_DIR.as_bytes())
+        vfs::block_on(vfs::create_dir_all(BLUEPRINT_QUEUE_DIR.as_bytes()))
             .map_err(|rc| format!("create {} rc={}", BLUEPRINT_QUEUE_DIR, rc))?;
 
         let mut data = String::new();
@@ -486,14 +486,14 @@ impl BlueprintApp {
             data.push('\n');
         }
 
-        vfs::write_file(BLUEPRINT_QUEUE_PATH.as_bytes(), data.as_bytes())
+        vfs::block_on(vfs::write_file(BLUEPRINT_QUEUE_PATH.as_bytes(), data.as_bytes()))
             .map_err(|rc| format!("write {} rc={}", BLUEPRINT_QUEUE_PATH, rc))
     }
 
     fn load_queue_from_fs(&mut self) -> Result<usize, String> {
-        use trueos::vfs;
+        use trueos::async_fs as vfs;
 
-        let bytes = match vfs::read_file(BLUEPRINT_QUEUE_PATH.as_bytes()) {
+        let bytes = match vfs::block_on(vfs::read_file(BLUEPRINT_QUEUE_PATH.as_bytes())) {
             Ok(bytes) => bytes,
             Err(TRUEOS_FS_ERR_NOT_FOUND) => {
                 self.torrents.clear();

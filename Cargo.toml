@@ -70,12 +70,12 @@ proptest = "=1.11.0"
 proptest-state-machine = "=0.8.0"
 
 [dependencies]
-reqwest = { path = "../../vendor/reqwest-0.13.3", version = "=0.13.3", default-features = false, features = ["json", "rustls", "http2"] }
+reqwest = { path = "../../../TRUEOS-Buildins/vendor/reqwest-0.13.3", version = "=0.13.3", default-features = false, features = ["json", "rustls", "http2"] }
 sha1 = "=0.10.6"
 sha2 = "=0.10.9"
 socket2 = "=0.6.3"
-tokio = { version = "=1.52.3", default-features = false, features = ["full", "test-util"] }
-tokio-stream = { version = "=0.1.17", features = ["sync"] }
+tokio = { version = "=1.54.1", default-features = false, features = ["full", "test-util"] }
+tokio-stream = { version = "=0.1.19", features = ["sync"] }
 thiserror = "=2.0.18"
 tracing = "=0.1.44"
 tracing-subscriber = "=0.3.23"
@@ -103,3 +103,6 @@ serde_json = "=1.0.150"
 feed-rs = "=2.3.1"
 regex = "=1.12.3"
 trueos = { path = "../../api", optional = true }
+
+[patch.crates-io]
+hyper = { path = "../../../TRUEOS/vendor/hyper-1.10.0" }
