@@ -105,4 +105,11 @@ regex = "=1.12.3"
 trueos = { path = "../../api", optional = true }
 
 [patch.crates-io]
+# Cargo resolves target-specific features on the host too.
+tokio = { path = "../../../TRUEOS-Buildins/vendor/tokio-1.54.1" }
+mio = { path = "../../../TRUEOS/vendor/mio-1.2.0" }
 hyper = { path = "../../../TRUEOS/vendor/hyper-1.10.0" }
+
+[target.'cfg(any(target_os = "trueos", target_os = "zkvm"))'.dependencies]
+# Keep std-facing I/O types while selecting native socket IDs and readiness.
+tokio = { version = "=1.54.1", default-features = false, features = ["native-net"] }
