@@ -26,7 +26,7 @@ use chrono::Local;
 use serde::Serialize;
 use serde_bencode::value::Value;
 use sha1::{Digest, Sha1};
-use sha2::Sha256;
+use sha2::{Digest as _, Sha256};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::File;

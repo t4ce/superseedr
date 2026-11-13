@@ -5,6 +5,7 @@ use data_encoding::BASE32;
 use magnet_url::Magnet;
 #[cfg(not(feature = "trueos-blueprint"))]
 use sha1::Digest;
+use sha2::Digest as _;
 #[cfg(not(feature = "trueos-blueprint"))]
 use sha2::Sha256;
 use std::path::Path;
