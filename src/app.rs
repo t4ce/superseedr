@@ -102,7 +102,6 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use sha1::Digest;
-use sha2::Digest as _;
 use sha2::Sha256;
 
 use notify::{Error as NotifyError, Event, RecommendedWatcher, RecursiveMode, Watcher};

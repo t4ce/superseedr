@@ -75,7 +75,6 @@ use magnet_url::Magnet;
 use urlencoding::decode;
 
 use sha1::Digest;
-use sha2::Digest as _;
 use tokio::fs;
 use tokio::signal;
 use tokio::sync::broadcast;
